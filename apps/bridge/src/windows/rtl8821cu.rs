@@ -157,8 +157,9 @@ impl Helper {
         let child = command
             .current_dir(folder)
             .args([channel.to_string(), "20".into(), port.to_string()])
-            .env("AIRBRIDGE_VID", "0bda")
-            .env("AIRBRIDGE_PID", "c820")
+            // radio_link's helper parses these with strtoul base 0.
+            .env("AIRBRIDGE_VID", "0x0bda")
+            .env("AIRBRIDGE_PID", "0xc820")
             .env("AIRBRIDGE_LOG_LEVEL", "warn")
             .env("AIRBRIDGE_PARENT_PID", std::process::id().to_string())
             .stdin(Stdio::null())

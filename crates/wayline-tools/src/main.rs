@@ -587,12 +587,15 @@ fn service_install(args: &[String]) {
         account_name: None,
         account_password: None,
     };
-    let access = ServiceAccess::QUERY_STATUS
+    let access = ServiceAccess::QUERY_CONFIG
+        | ServiceAccess::QUERY_STATUS
         | ServiceAccess::START
         | ServiceAccess::STOP
         | ServiceAccess::CHANGE_CONFIG
         | ServiceAccess::DELETE;
-    let (service, existed, old_config, was_running) = match manager.create_service(&info, access) {
+    let (service, existed, old_config, was_running) = match manager
+        .create_service(&info, access | ServiceAccess::WRITE_DAC)
+    {
         Ok(service) => (service, false, None, false),
         Err(_) => {
             let service = manager
