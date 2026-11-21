@@ -2,7 +2,7 @@ use crate::{
     config::{
         Config, RadioBackend, RTL8821CU_DEFAULT_WIDTH_MHZ, RTL8821CU_PORT, SET_RTL8821CU_WIDTH,
     },
-    protocol::{Request, Status},
+    protocol::{Request, Rtl8821cuStartup, Rtl8821cuStartupPhase, Status, SET_RADIO},
 };
 use std::{io, path::PathBuf, time::Duration};
 
@@ -20,6 +20,9 @@ pub trait ManagedProcess {
     }
     fn ready_channel(&self) -> io::Result<Option<u8>> {
         Ok(None)
+    }
+    fn startup_checkpoint(&self) -> Option<Rtl8821cuStartupPhase> {
+        None
     }
 }
 
@@ -61,6 +64,7 @@ impl<B: Backend> Supervisor<B> {
             channel: config.channel,
             rtl8821cu_width_mhz: (config.radio_backend == RadioBackend::Rtl8821cu)
                 .then_some(config.rtl8821cu_width_mhz),
+            rtl8821cu_startup: None,
             target: None,
             awdl0: false,
             error: None,
@@ -108,6 +112,23 @@ impl<B: Backend> Supervisor<B> {
                     validate_target_channel(&self.status, channel)?;
                     next.channel = channel;
                 }
+            }
+            SET_RADIO => {
+                if next.radio_backend != RadioBackend::Rtl8821cu
+                    || req.port.is_some()
+                    || req.exe.is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "combined channel and monitor width changes require RTL8821CU",
+                    ));
+                }
+                next.channel = req.channel.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "channel is required")
+                })?;
+                next.rtl8821cu_width_mhz = req.rtl8821cu_width_mhz.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "monitor width is required")
+                })?;
             }
             SET_RTL8821CU_WIDTH => {
                 if next.radio_backend != RadioBackend::Rtl8821cu
@@ -169,6 +190,7 @@ impl<B: Backend> Supervisor<B> {
                 self.width_trial = self.config.rtl8821cu_width_mhz != RTL8821CU_DEFAULT_WIDTH_MHZ;
             }
             if hot_switch {
+                self.status.rtl8821cu_startup = None;
                 self.switching_channel = Some(now + CHANNEL_SWITCH_TIMEOUT);
             } else if port_changed || channel_changed || width_changed || !self.config.enabled {
                 self.begin_stop(now);
@@ -206,6 +228,7 @@ impl<B: Backend> Supervisor<B> {
 
     fn begin_stop(&mut self, now: Duration) {
         self.switching_channel = None;
+        self.status.rtl8821cu_startup = None;
         if self.stopping.is_none() {
             if let Some(child) = &mut self.child {
                 self.stopping = Some(now + self.config.radio_backend.stop_grace());
@@ -223,6 +246,33 @@ impl<B: Backend> Supervisor<B> {
         self.status.error = Some(error.to_string());
         self.retry_at = now + self.retry_delay;
         self.retry_delay = (self.retry_delay * 2).min(RETRY_MAX);
+    }
+
+    fn update_startup(&mut self, now: Duration) {
+        let Some(progress) = self.status.rtl8821cu_startup else {
+            return;
+        };
+        if progress.phase == Rtl8821cuStartupPhase::Ready {
+            // Freeze the successful startup duration. If the interface drops,
+            // readiness ends even though the original child is still alive.
+            if !self.status.awdl0 {
+                self.status.rtl8821cu_startup = None;
+            }
+            return;
+        }
+        let phase = if self.status.awdl0 {
+            Rtl8821cuStartupPhase::Ready
+        } else {
+            self.child
+                .as_ref()
+                .and_then(ManagedProcess::startup_checkpoint)
+                .filter(|phase| *phase < Rtl8821cuStartupPhase::Ready)
+                .map_or(progress.phase, |phase| phase.max(progress.phase))
+        };
+        self.status.rtl8821cu_startup = Some(Rtl8821cuStartup::new(
+            phase,
+            now.saturating_sub(self.started_at).as_secs(),
+        ));
     }
 
     fn fallback_after_width_start_failure(&mut self) {
@@ -256,7 +306,8 @@ impl<B: Backend> Supervisor<B> {
                 // verified HELLO and opened the Wintun session.
                 self.status.awdl0 = up
                     && (self.config.radio_backend != RadioBackend::Rtl8821cu
-                        || self.status.target.as_deref() == Some("rtl8821cu"));
+                        || (self.child.is_some()
+                            && self.status.target.as_deref() == Some("rtl8821cu")));
                 None
             }
             Err(e) => {
@@ -269,6 +320,7 @@ impl<B: Backend> Supervisor<B> {
                 Ok(Some(code)) => {
                     self.child = None;
                     self.status.awdl0 = false;
+                    self.status.rtl8821cu_startup = None;
                     if self.switching_channel.take().is_some() {
                         // Recovery uses the requested channel already persisted by configure().
                         self.retry_at = now;
@@ -352,6 +404,7 @@ impl<B: Backend> Supervisor<B> {
                     "starting"
                 }
                 .into();
+                self.update_startup(now);
                 // Short-lived processes must not reset an exponentially increasing
                 // crash delay just because an adapter appeared briefly.
                 if now.saturating_sub(self.started_at) >= RETRY_MAX {
@@ -405,6 +458,10 @@ impl<B: Backend> Supervisor<B> {
                     // spawn clears the prior bridge's target marker before launch.
                     self.status.target = None;
                     self.status.awdl0 = false;
+                    self.status.rtl8821cu_startup = Some(Rtl8821cuStartup::new(
+                        Rtl8821cuStartupPhase::BridgeLaunch,
+                        0,
+                    ));
                 }
                 self.status.state = "starting".into();
                 self.status.error = None;
@@ -475,6 +532,7 @@ mod tests {
         channels: Vec<u8>,
         ready_channel: Option<u8>,
         usb_target_pending: bool,
+        startup_checkpoint: Option<Rtl8821cuStartupPhase>,
     }
     struct Fake(Rc<RefCell<Observed>>);
     impl ManagedProcess for Fake {
@@ -499,6 +557,9 @@ mod tests {
         }
         fn ready_channel(&self) -> io::Result<Option<u8>> {
             Ok(self.0.borrow().ready_channel)
+        }
+        fn startup_checkpoint(&self) -> Option<Rtl8821cuStartupPhase> {
+            self.0.borrow().startup_checkpoint
         }
     }
     impl Backend for Fake {
@@ -531,6 +592,7 @@ mod tests {
             o.starts.push((p.into(), c.channel));
             if c.radio_backend == RadioBackend::Rtl8821cu {
                 o.usb_start_widths.push(c.rtl8821cu_width_mhz);
+                o.startup_checkpoint = None;
             }
             o.exited = false;
             Ok(Fake(self.0.clone()))
@@ -550,6 +612,7 @@ mod tests {
             port: Some("COM4".into()),
             channel: 6,
             rtl8821cu_width_mhz: None,
+            rtl8821cu_startup: None,
             target: target.map(str::to_owned),
             awdl0,
             error: None,
@@ -604,6 +667,86 @@ mod tests {
     }
 
     #[test]
+    fn rtl8821cu_cold_start_reports_only_observed_checkpoints_and_fresh_readiness() {
+        use Rtl8821cuStartupPhase::{
+            BridgeLaunch, HelloVerification, Ready, UsbHelperInitialization, WintunSetup,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let obs = Rc::new(RefCell::new(Observed {
+            adapter_up: true,
+            usb_target_pending: true,
+            ..Default::default()
+        }));
+        let mut s = Supervisor::new(
+            Fake(obs.clone()),
+            Config {
+                radio_backend: RadioBackend::Rtl8821cu,
+                ..Config::default()
+            },
+            dir.path().join("config.json"),
+        );
+        assert_eq!(s.status().rtl8821cu_startup, None);
+        s.tick(secs(10));
+        assert_eq!(
+            s.status().rtl8821cu_startup,
+            Some(Rtl8821cuStartup::new(BridgeLaunch, 0))
+        );
+        s.tick(secs(35));
+        assert_eq!(
+            s.status().rtl8821cu_startup,
+            Some(Rtl8821cuStartup::new(BridgeLaunch, 25))
+        );
+        assert!(!s.status().awdl0, "an existing interface is insufficient");
+        assert!(
+            s.status().error.is_none(),
+            "missing telemetry must be optional"
+        );
+
+        for (now, phase) in [
+            (40, UsbHelperInitialization),
+            (75, HelloVerification),
+            (80, WintunSetup),
+        ] {
+            obs.borrow_mut().startup_checkpoint = Some(phase);
+            s.tick(secs(now));
+            assert_eq!(
+                s.status().rtl8821cu_startup,
+                Some(Rtl8821cuStartup::new(phase, now - 10))
+            );
+        }
+        for (now, sample) in [
+            (81, None),
+            (82, Some(UsbHelperInitialization)),
+            (83, Some(Ready)),
+        ] {
+            obs.borrow_mut().startup_checkpoint = sample;
+            s.tick(secs(now));
+            assert_eq!(
+                s.status().rtl8821cu_startup,
+                Some(Rtl8821cuStartup::new(WintunSetup, now - 10))
+            );
+        }
+
+        obs.borrow_mut().usb_target_pending = false;
+        obs.borrow_mut().adapter_up = false;
+        s.tick(secs(84));
+        assert_eq!(s.status().state, "starting");
+        obs.borrow_mut().adapter_up = true;
+        s.tick(secs(85));
+        assert_eq!(s.status().state, "running");
+        s.tick(secs(120));
+        assert_eq!(
+            s.status().rtl8821cu_startup,
+            Some(Rtl8821cuStartup::new(Ready, 75))
+        );
+
+        obs.borrow_mut().adapter_up = false;
+        s.tick(secs(121));
+        assert_eq!(s.status().rtl8821cu_startup, None);
+    }
+
+    #[test]
     fn rtl8821cu_shutdown_leaves_time_for_in_progress_usb_initialization() {
         let dir = tempfile::tempdir().unwrap();
         let obs = Rc::new(RefCell::new(Observed::default()));
@@ -653,9 +796,13 @@ mod tests {
         s.tick(secs(0));
         s.tick(secs(1));
         assert_eq!(s.status().state, "running");
-        let status = s.command(request(r#"{"cmd":"set","channel":44}"#), secs(2));
+        let status = s.command(
+            request(r#"{"cmd":"set-radio","channel":44,"rtl8821cuWidthMhz":20}"#),
+            secs(2),
+        );
         assert_eq!(status.state, "starting");
         assert!(!status.awdl0);
+        assert_eq!(status.rtl8821cu_startup, None);
         assert_eq!(obs.borrow().channels, vec![44]);
         s.tick(secs(3));
         assert_eq!(s.status().state, "starting");
@@ -740,6 +887,118 @@ mod tests {
     }
 
     #[test]
+    fn rtl8821cu_combined_settings_apply_both_values_with_one_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = Config {
+            radio_backend: RadioBackend::Rtl8821cu,
+            ..Config::default()
+        };
+        original.save(&path).unwrap();
+        let obs = Rc::new(RefCell::new(Observed {
+            adapter_up: true,
+            ready_channel: Some(6),
+            ..Default::default()
+        }));
+        let mut s = Supervisor::new(Fake(obs.clone()), original.clone(), path.clone());
+        s.tick(secs(0));
+        s.tick(secs(1));
+        assert_eq!(s.status().state, "running");
+
+        let invalid = s.command(
+            request(r#"{"cmd":"set-radio","channel":6,"rtl8821cuWidthMhz":40}"#),
+            secs(2),
+        );
+        assert!(invalid.error.is_some());
+        assert_eq!(Config::load(&path).unwrap(), original);
+        assert_eq!(obs.borrow().stops, 0);
+
+        for (at, channel, width) in [(3, 149, 40), (7, 6, 20)] {
+            let request = Request {
+                cmd: SET_RADIO.into(),
+                channel: Some(channel),
+                rtl8821cu_width_mhz: Some(width),
+                ..Request::default()
+            };
+            let status = s.command(request.clone(), secs(at));
+            assert_eq!(status.state, "stopping");
+            assert_eq!(
+                (status.channel, status.rtl8821cu_width_mhz),
+                (channel, Some(width))
+            );
+            let saved = Config::load(&path).unwrap();
+            assert_eq!((saved.channel, saved.rtl8821cu_width_mhz), (channel, width));
+            let starts = obs.borrow().starts.len();
+            s.tick(secs(at + 1));
+            assert_eq!(obs.borrow().starts.len(), starts);
+            obs.borrow_mut().exited = true;
+            s.tick(secs(at + 2));
+            s.tick(secs(at + 3));
+            assert_eq!(s.command(request, secs(at + 3)).state, "running");
+            assert_eq!(obs.borrow().starts.len(), starts + 1);
+        }
+        assert_eq!(
+            obs.borrow().starts,
+            vec![
+                (RTL8821CU_PORT.into(), 6),
+                (RTL8821CU_PORT.into(), 149),
+                (RTL8821CU_PORT.into(), 6),
+            ]
+        );
+        assert_eq!(obs.borrow().usb_start_widths, vec![20, 40, 20]);
+        assert_eq!(obs.borrow().stops, 2);
+        assert!(obs.borrow().channels.is_empty());
+    }
+
+    #[test]
+    fn rtl8821cu_failed_combined_wide_start_recovers_at_twenty_mhz() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let obs = Rc::new(RefCell::new(Observed {
+            adapter_up: true,
+            ..Default::default()
+        }));
+        let mut s = Supervisor::new(
+            Fake(obs.clone()),
+            Config {
+                radio_backend: RadioBackend::Rtl8821cu,
+                ..Config::default()
+            },
+            path.clone(),
+        );
+        s.tick(secs(0));
+        s.tick(secs(1));
+        assert_eq!(s.status().state, "running");
+        let status = s.command(
+            request(r#"{"cmd":"set-radio","channel":44,"rtl8821cuWidthMhz":80}"#),
+            secs(2),
+        );
+        assert_eq!(status.state, "stopping");
+        obs.borrow_mut().exited = true;
+        obs.borrow_mut().usb_target_pending = true;
+        s.tick(secs(3));
+        assert_eq!(s.status().state, "starting");
+        let saved = Config::load(&path).unwrap();
+        assert_eq!((saved.channel, saved.rtl8821cu_width_mhz), (44, 80));
+
+        obs.borrow_mut().exited = true;
+        s.tick(secs(4));
+        let status = s.status();
+        assert_eq!(status.state, "error");
+        assert_eq!((status.channel, status.rtl8821cu_width_mhz), (44, Some(20)));
+        assert!(status.error.unwrap().contains("80 MHz startup failed"));
+        let saved = Config::load(&path).unwrap();
+        assert_eq!((saved.channel, saved.rtl8821cu_width_mhz), (44, 20));
+        obs.borrow_mut().usb_target_pending = false;
+        s.tick(secs(6));
+        s.tick(secs(7));
+        assert_eq!(s.status().state, "running");
+        assert_eq!(obs.borrow().usb_start_widths, vec![20, 80, 20]);
+        assert_eq!(obs.borrow().stops, 1);
+        assert_eq!(obs.borrow().starts[2], (RTL8821CU_PORT.into(), 44));
+    }
+
+    #[test]
     fn rtl8821cu_width_trial_rolls_back_only_after_an_explicit_start_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -804,12 +1063,19 @@ mod tests {
         s.tick(secs(0));
         assert_eq!(s.status().rtl8821cu_width_mhz, Some(80));
         assert_eq!(s.status().state, "starting");
+        obs.borrow_mut().startup_checkpoint = Some(Rtl8821cuStartupPhase::HelloVerification);
+        s.tick(secs(8));
+        assert_eq!(s.status().rtl8821cu_startup.unwrap().percent, 65);
         obs.borrow_mut().exited = true;
-        s.tick(secs(1));
+        s.tick(secs(9));
         assert_eq!(s.status().rtl8821cu_width_mhz, Some(20));
+        assert_eq!(s.status().rtl8821cu_startup, None);
         assert_eq!(Config::load(&path).unwrap().rtl8821cu_width_mhz, 20);
-        s.tick(secs(3));
+        s.tick(secs(11));
         assert_eq!(obs.borrow().usb_start_widths, vec![80, 20]);
+        assert_eq!(s.status().rtl8821cu_startup.unwrap().percent, 5);
+        s.tick(secs(25));
+        assert_eq!(s.status().rtl8821cu_startup.unwrap().percent, 5);
     }
 
     #[test]

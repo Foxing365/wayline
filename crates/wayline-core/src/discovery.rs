@@ -1,7 +1,9 @@
 //! Device discovery shared by CLI selection and future tray clients.
 
 use crate::sender::{client_config, discover, NearbyReceiver, SendError};
-use crate::{AirDropService, Identity, MdnsBrowser, NetworkInterface, SendCancellation};
+use crate::{
+    AirDropService, Identity, MdnsBrowser, NetworkInterface, SendCancellation, SenderIdentity,
+};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -23,7 +25,7 @@ pub enum DiscoveryEvent {
 
 struct Probe {
     service: AirDropService,
-    name: Option<String>,
+    receiver: Option<NearbyReceiver>,
     attempts: u8,
     next_attempt: Duration,
     finished: bool,
@@ -33,7 +35,7 @@ impl Probe {
     fn new(service: AirDropService) -> Self {
         Self {
             service,
-            name: None,
+            receiver: None,
             attempts: 0,
             next_attempt: Duration::ZERO,
             finished: false,
@@ -47,17 +49,14 @@ impl Probe {
     fn finish(
         &mut self,
         now: Duration,
-        result: Result<Option<String>, SendError>,
+        result: Result<Option<NearbyReceiver>, SendError>,
     ) -> Option<DiscoveryEvent> {
         self.attempts = self.attempts.saturating_add(1);
         match result {
-            Ok(Some(name)) => {
-                self.name = Some(name.clone());
+            Ok(Some(receiver)) => {
+                self.receiver = Some(receiver.clone());
                 self.finished = true;
-                Some(DiscoveryEvent::Found(NearbyReceiver {
-                    name,
-                    service: self.service.clone(),
-                }))
+                Some(DiscoveryEvent::Found(receiver))
             }
             Ok(None) => {
                 self.finished = true;
@@ -80,7 +79,7 @@ impl Probe {
 
     fn update(&mut self, service: AirDropService) -> Option<DiscoveryEvent> {
         if self.service.address != service.address || self.service.host != service.host {
-            let removed = self.name.take().map(|_| DiscoveryEvent::Removed {
+            let removed = self.receiver.take().map(|_| DiscoveryEvent::Removed {
                 instance: self.service.instance.clone(),
             });
             *self = Self::new(service);
@@ -90,11 +89,9 @@ impl Probe {
             return None;
         }
         self.service = service;
-        self.name.as_ref().map(|name| {
-            DiscoveryEvent::Updated(NearbyReceiver {
-                name: name.clone(),
-                service: self.service.clone(),
-            })
+        self.receiver.as_mut().map(|receiver| {
+            receiver.service = self.service.clone();
+            DiscoveryEvent::Updated(receiver.clone())
         })
     }
 }
@@ -122,7 +119,27 @@ pub fn discover_receivers_live(
 
 pub fn discover_receivers_live_cancellable(
     interface: NetworkInterface,
-    _identity: &Identity,
+    identity: &Identity,
+    timeout: Duration,
+    ble_wake: bool,
+    legacy_ble: bool,
+    cancel: &SendCancellation,
+    notify: impl FnMut(DiscoveryEvent),
+) -> Result<Vec<NearbyReceiver>, SendError> {
+    discover_receivers_live_cancellable_with_identity(
+        interface,
+        identity.into(),
+        timeout,
+        ble_wake,
+        legacy_ble,
+        cancel,
+        notify,
+    )
+}
+
+pub fn discover_receivers_live_cancellable_with_identity(
+    interface: NetworkInterface,
+    identity: SenderIdentity<'_>,
     timeout: Duration,
     ble_wake: bool,
     legacy_ble: bool,
@@ -137,11 +154,12 @@ pub fn discover_receivers_live_cancellable(
             "discovery requires a link-local address, nonzero interface index and positive timeout",
         ));
     }
+    let client = client_config(identity.apple)?;
     #[cfg(windows)]
     let mut ble_error = None;
     #[cfg(windows)]
     let mut advert = ble_wake
-        .then(|| crate::ble::AirDropAdvert::begin(legacy_ble))
+        .then(|| crate::ble::AirDropAdvert::begin_with_identity(legacy_ble, identity.apple))
         .and_then(|result| match result {
             Ok(advert) => Some(advert),
             Err(error) => {
@@ -153,7 +171,6 @@ pub fn discover_receivers_live_cancellable(
     let mut advert_started = false;
     #[cfg(not(windows))]
     let _ = (ble_wake, legacy_ble);
-    let client = client_config()?;
     let mut browser = MdnsBrowser::bind(interface.clone(), Some(interface.link_local))?;
     let start = Instant::now();
     let mut next_query = Duration::ZERO;
@@ -179,7 +196,7 @@ pub fn discover_receivers_live_cancellable(
         let services = browser.recv()?;
         probes.retain(|instance, probe| {
             let present = services.iter().any(|service| &service.instance == instance);
-            if !present && probe.name.is_some() {
+            if !present && probe.receiver.is_some() {
                 notify(DiscoveryEvent::Removed {
                     instance: instance.clone(),
                 });
@@ -204,6 +221,7 @@ pub fn discover_receivers_live_cancellable(
             let result = discover(
                 &probe.service,
                 &client,
+                identity.apple.map(crate::AppleSenderIdentity::record),
                 remaining.min(Duration::from_secs(3)),
                 cancel,
             );
@@ -221,7 +239,8 @@ pub fn discover_receivers_live_cancellable(
     // Refresh capabilities even if they arrived during the last TLS operation.
     let services = browser.recv()?;
     for (instance, probe) in &probes {
-        if probe.name.is_some() && !services.iter().any(|service| &service.instance == instance) {
+        if probe.receiver.is_some() && !services.iter().any(|service| &service.instance == instance)
+        {
             notify(DiscoveryEvent::Removed {
                 instance: instance.clone(),
             });
@@ -233,11 +252,8 @@ pub fn discover_receivers_live_cancellable(
             if let Some(event) = probe.update(service) {
                 notify(event);
             }
-            if let Some(name) = &probe.name {
-                result.push(NearbyReceiver {
-                    name: name.clone(),
-                    service: probe.service.clone(),
-                });
+            if let Some(receiver) = &probe.receiver {
+                result.push(receiver.clone());
             }
         }
     }
@@ -324,15 +340,19 @@ mod tests {
         ));
         assert!(!probe.due(Duration::from_millis(500)));
         assert!(probe.due(Duration::from_secs(1)));
+        let mut receiver = discovered_receiver();
+        receiver.receiver_certificate_sha256 = Some([3; 32]);
         assert!(matches!(
-            probe.finish(Duration::from_secs(1), Ok(Some("iPhone".into()))),
+            probe.finish(Duration::from_secs(1), Ok(Some(receiver))),
             Some(DiscoveryEvent::Found(_))
         ));
         assert!(!probe.due(Duration::from_secs(10)));
         let mut updated = service();
         updated.flags = Some(0x1b3fb);
         assert!(
-            matches!(probe.update(updated), Some(DiscoveryEvent::Updated(receiver)) if receiver.service.flags == Some(0x1b3fb))
+            matches!(probe.update(updated), Some(DiscoveryEvent::Updated(receiver))
+                if receiver.service.flags == Some(0x1b3fb)
+                    && receiver.receiver_certificate_sha256 == Some([3; 32]))
         );
         let mut moved = service();
         moved.address.set_port(8771);
@@ -340,8 +360,17 @@ mod tests {
             probe.update(moved),
             Some(DiscoveryEvent::Removed { .. })
         ));
-        assert!(probe.name.is_none() && probe.due(Duration::ZERO));
+        assert!(probe.receiver.is_none() && probe.due(Duration::ZERO));
     }
+
+    fn discovered_receiver() -> NearbyReceiver {
+        NearbyReceiver {
+            name: "iPhone".into(),
+            service: service(),
+            receiver_certificate_sha256: None,
+        }
+    }
+
     #[test]
     fn probe_retries_continue_until_timeout_and_duplicate_names_are_not_selected() {
         let mut probe = Probe::new(service());
@@ -355,14 +384,11 @@ mod tests {
         assert!(!probe.due(Duration::from_secs(14)));
         assert!(probe.due(Duration::from_secs(15)));
         assert!(matches!(
-            probe.finish(Duration::from_secs(15), Ok(Some("iPhone".into()))),
+            probe.finish(Duration::from_secs(15), Ok(Some(discovered_receiver()))),
             Some(DiscoveryEvent::Found(receiver)) if receiver.name == "iPhone"
         ));
         assert!(!probe.due(Duration::from_secs(30)));
-        let first = NearbyReceiver {
-            name: "iPhone".into(),
-            service: service(),
-        };
+        let first = discovered_receiver();
         assert!(receiver_by_name(std::slice::from_ref(&first), "iphone").is_ok());
         let mut second = first.clone();
         second.service.instance = "other._airdrop._tcp.local".into();

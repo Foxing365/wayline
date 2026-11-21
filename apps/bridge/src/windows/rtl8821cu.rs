@@ -27,6 +27,7 @@ use wayline_service::{
         Rtl8821cuRateProfile, RTL8821CU_DEFAULT_WIDTH_MHZ, RTL8821CU_HELPER_CLEANUP,
         RTL8821CU_STARTUP,
     },
+    protocol::Rtl8821cuStartupPhase,
 };
 
 pub(super) struct PerformanceOptions {
@@ -62,23 +63,27 @@ pub(super) fn run(
         channel,
         rate_profile.preferred_mcs(),
     )?;
-    let channel_dir = if managed && u16::from(width_mhz) == RTL8821CU_DEFAULT_WIDTH_MHZ {
+    let control_dir = if managed {
         std::env::var_os(channel_switch::CONTROL_DIR_ENV).map(PathBuf::from)
     } else {
         None
     };
+    let startup_dir = control_dir.as_deref();
+    let channel_dir = startup_dir.filter(|_| u16::from(width_mhz) == RTL8821CU_DEFAULT_WIDTH_MHZ);
     let mut target_file = std::env::var_os("WAYLINE_BRIDGE_TARGET_FILE").map(PathBuf::from);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
+            startup_checkpoint(startup_dir, Rtl8821cuStartupPhase::UsbHelperInitialization);
             let mut helper = Helper::start(&helper, channel, width_mhz)?;
             let stopping = wait_for_stop(&stop);
             tokio::pin!(stopping);
             let mut socket = tokio::select! {
-                result = helper.connect(channel, width_mhz, mac) => result?,
+                result = helper.connect(channel, width_mhz, mac, startup_dir) => result?,
                 result = &mut stopping => return result,
             };
+            startup_checkpoint(startup_dir, Rtl8821cuStartupPhase::WintunSetup);
             let _timer = high_resolution_timer.then(super::timer_resolution::TimerResolution::request).flatten();
             let mut poll = tokio::time::interval(Duration::from_millis(100));
             loop {
@@ -143,6 +148,14 @@ pub(super) fn run(
                 config = wayline_awdl::rtl8821cu_configuration(mac.0, "Wayline", channel, rate_profile.preferred_mcs())?;
             }
         })
+}
+
+fn startup_checkpoint(dir: Option<&Path>, phase: Rtl8821cuStartupPhase) {
+    if let Some(dir) = dir {
+        if let Err(error) = channel_switch::publish_startup_phase(dir, phase) {
+            tracing::debug!(?phase, %error, "could not publish RTL8821CU startup checkpoint");
+        }
+    }
 }
 
 fn session_mac() -> io::Result<MacAddr> {
@@ -242,12 +255,14 @@ impl Helper {
         channel: u8,
         width_mhz: u8,
         mac: MacAddr,
+        startup_dir: Option<&Path>,
     ) -> io::Result<std::net::TcpStream> {
         let deadline = self.bringup_until.expect("first helper connection");
         let mut socket = self.open_client(deadline).await?;
         // The authenticated helper starts listening only after completing USB
         // initialization. A mismatched HELLO can use the normal stop deadline.
         self.bringup_until = None;
+        startup_checkpoint(startup_dir, Rtl8821cuStartupPhase::HelloVerification);
         radio_link::handshake(&mut socket, channel, width_mhz, mac, Duration::from_secs(3)).await?;
         socket.into_std()
     }

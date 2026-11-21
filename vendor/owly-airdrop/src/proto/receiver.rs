@@ -10,6 +10,7 @@
 //! Policy is the caller's: this machine prompts for every `/Ask` and never
 //! accepts on its own (ASK-3). It serves Everyone mode only.
 
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use super::archive::extract::{self, Allowed, RelPath, Rules};
 use super::archive::{self, Unpacked, Unpacker};
 use super::http::{self, BodyDecoder, RequestHead};
 use super::messages::{
-    AskRequest, AskResponse, DiscoverRequest, DiscoverResponse, Offer, STATUS_EVERYONE,
+    AskRequest, AskResponse, DiscoverRequest, DiscoverResponse, Error as MessageError, Offer,
+    STATUS_EVERYONE,
 };
 use super::plist;
 
@@ -98,7 +100,7 @@ pub enum Event {
     /// The offer did not reach the user's consent prompt.
     AskRejected {
         status: u16,
-        reason: &'static str,
+        reason: Cow<'static, str>,
     },
     /// Ask the user. Answer with [`Connection::accept`] or
     /// [`Connection::decline`]. Every field in it is the sender's, to be
@@ -346,9 +348,12 @@ impl Connection {
         self.close();
     }
 
-    fn fail_control(&mut self, route: Route, status: u16, reason: &'static str) {
+    fn fail_control(&mut self, route: Route, status: u16, reason: impl Into<Cow<'static, str>>) {
         if route == Route::Ask {
-            self.events.push_back(Event::AskRejected { status, reason });
+            self.events.push_back(Event::AskRejected {
+                status,
+                reason: reason.into(),
+            });
         }
         self.fail(status);
     }
@@ -573,7 +578,11 @@ impl Connection {
         let request = match AskRequest::from_plist(value) {
             Ok(request) => request,
             Err(error) => {
-                self.fail_control(Route::Ask, 400, error.0);
+                let reason = match error {
+                    MessageError::Invalid(reason) => Cow::Borrowed(reason),
+                    MessageError::MixedOffer(shape) => Cow::Owned(shape.to_string()),
+                };
+                self.fail_control(Route::Ask, 400, reason);
                 return;
             }
         };

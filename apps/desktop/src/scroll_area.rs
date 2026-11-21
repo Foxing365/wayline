@@ -1,4 +1,4 @@
-//! Native scrolling with a persistent, proportional scrollbar when content overflows.
+//! Shared scroll views with smooth mouse-wheel detents and direct precision input.
 use gpui::*;
 use std::{
     cell::{Cell, RefCell},
@@ -9,20 +9,170 @@ use std::{
 const GUTTER: f32 = 12.;
 const INSET: f32 = 2.;
 const MIN_THUMB: f32 = 24.;
+const WHEEL_TRAVEL: Duration = Duration::from_millis(145);
 const WHEEL_HOLD: Duration = Duration::from_millis(90);
 const WHEEL_FADE: Duration = Duration::from_millis(210);
 const WHEEL_FEEDBACK: Duration = WHEEL_HOLD.saturating_add(WHEEL_FADE);
-
-fn wheel_moved(before: Pixels, after: Pixels, max: Pixels) -> bool {
-    before.clamp(-max, px(0.)) != after.clamp(-max, px(0.))
-}
 
 #[derive(Clone, Default)]
 pub struct ScrollState {
     handle: ScrollHandle,
     grab_offset: Rc<Cell<Option<f32>>>,
+    motion: Rc<Cell<Option<WheelMotion>>>,
     wheel_feedback: Rc<Cell<Option<WheelFeedback>>>,
     feedback_expiry: Rc<RefCell<Option<Task<()>>>>,
+}
+
+#[derive(Clone, Copy)]
+struct WheelMotion {
+    started: Instant,
+    from: Pixels,
+    target: Pixels,
+}
+
+impl ScrollState {
+    fn scroll_directly(&self, y: Pixels) {
+        self.motion.set(None);
+        self.handle.set_offset(point(self.handle.offset().x, y));
+    }
+
+    /// GPUI has already resolved axes and line height and temporarily applied the
+    /// delta. Retain that distance while making the actual content and thumb move together.
+    fn wheel(
+        &self,
+        before: Pixels,
+        delta: Pixels,
+        max: Pixels,
+        smooth: bool,
+        now: Instant,
+    ) -> bool {
+        let native = self.handle.offset();
+        if delta == px(0.) {
+            return false;
+        }
+        let visible = before.clamp(-max, px(0.));
+        if !smooth {
+            let next = (visible + delta).clamp(-max, px(0.));
+            self.scroll_directly(next);
+            return next != visible;
+        }
+
+        self.handle.set_offset(point(native.x, visible));
+        let mut base = visible;
+        if let Some(motion) = self.motion.get() {
+            let target = motion.target.clamp(-max, px(0.));
+            if (target - visible) * delta.signum() > px(0.) {
+                base = target;
+            } else {
+                // A reversal starts at the displayed position without traversing
+                // the queued distance in the previous direction.
+                self.motion.set(None);
+            }
+        }
+        let target = (base + delta).clamp(-max, px(0.));
+        if target == base {
+            return false; // The next notch belongs to the enclosing scroll area.
+        }
+        self.motion.set(Some(WheelMotion {
+            started: now,
+            from: visible,
+            target,
+        }));
+        true
+    }
+
+    fn advance(&self, now: Instant, max: Pixels, animated: bool) -> bool {
+        let Some(motion) = self.motion.get() else {
+            return false;
+        };
+        let target = motion.target.clamp(-max, px(0.));
+        let elapsed = now.saturating_duration_since(motion.started);
+        let fraction = if animated && elapsed < WHEEL_TRAVEL {
+            let remaining = 1. - elapsed.as_secs_f32() / WHEEL_TRAVEL.as_secs_f32();
+            1. - remaining * remaining * remaining
+        } else {
+            1.
+        };
+        let y = if fraction >= 1. {
+            target
+        } else {
+            (motion.from + (motion.target - motion.from) * fraction).clamp(-max, px(0.))
+        };
+        self.handle.set_offset(point(self.handle.offset().x, y));
+        if y == target {
+            self.motion.set(None);
+            return false;
+        }
+        true
+    }
+}
+
+fn wheel_lines(
+    lines: f32,
+    units_per_notch: u32,
+    native: Pixels,
+    viewport: Pixels,
+) -> (Pixels, bool) {
+    if units_per_notch == 0 {
+        return (native, false);
+    }
+    let ticks = lines / units_per_notch as f32;
+    // GPUI passes Win32's "one screen at a time" sentinel through as a line
+    // multiplier. One detent should travel one viewport in that mode.
+    let pixels = if units_per_notch == u32::MAX {
+        viewport * ticks
+    } else {
+        native
+    };
+    (
+        pixels,
+        ticks.abs() >= 1. && (ticks - ticks.round()).abs() < 0.0001,
+    )
+}
+
+fn wheel_input(delta: ScrollDelta, native: Pixels, viewport: Pixels) -> (Pixels, bool) {
+    use windows::Win32::UI::{
+        Input::{
+            GetCurrentInputMessageSource, IMDT_PEN, IMDT_TOUCH, IMDT_TOUCHPAD, INPUT_MESSAGE_SOURCE,
+        },
+        WindowsAndMessaging::{
+            SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+            SystemParametersInfoW,
+        },
+    };
+    let ScrollDelta::Lines(lines) = delta else {
+        return (native, false);
+    };
+    if native == px(0.) {
+        return (native, false);
+    }
+    let mut source = INPUT_MESSAGE_SOURCE::default();
+    // SAFETY: dispatch is synchronous on the Win32 message thread; both Win32
+    // calls below write into a live value of the type required by their API.
+    let direct = unsafe { GetCurrentInputMessageSource(&mut source) }.is_ok()
+        && matches!(source.deviceType, IMDT_TOUCHPAD | IMDT_TOUCH | IMDT_PEN);
+    // The GPUI Windows backend scales WM_MOUSE[H]WHEEL into lines, including
+    // fractional detents from devices delivered through mouse compatibility.
+    let (amount, setting) = if lines.y != 0. {
+        (lines.y, SPI_GETWHEELSCROLLLINES)
+    } else {
+        (lines.x, SPI_GETWHEELSCROLLCHARS)
+    };
+    let mut units = 0u32;
+    if unsafe {
+        SystemParametersInfoW(
+            setting,
+            0,
+            Some((&raw mut units).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_err()
+    {
+        return (native, false);
+    }
+    let (pixels, notch) = wheel_lines(amount, units, native, viewport);
+    (pixels, !direct && notch)
 }
 
 #[derive(Clone, Copy)]
@@ -103,7 +253,7 @@ impl Geometry {
     }
 }
 
-/// Keeps the original div's sizing, child layout, wheel handling and element identity.
+/// Keeps the div's layout, native wheel distance and identity across renders.
 pub struct ScrollArea {
     inner: Option<Stateful<Div>>,
 }
@@ -193,6 +343,13 @@ impl Element for ScrollArea {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        if state.1.motion.get().is_some() {
+            state.1.advance(
+                Instant::now(),
+                state.1.handle.max_offset().height,
+                client_area_animation_enabled(),
+            );
+        }
         let inner =
             self.inner
                 .as_mut()
@@ -218,6 +375,7 @@ impl Element for ScrollArea {
             )
         });
         if bar.is_none() {
+            state.1.motion.set(None);
             state.1.grab_offset.set(None);
             state.1.wheel_feedback.set(None);
             state.1.feedback_expiry.borrow_mut().take();
@@ -235,14 +393,13 @@ impl Element for ScrollArea {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Compare this area's offset before and after the native listener. An inner
-        // scroller consumes the event while it moves, then lets it reach its parent at
-        // the boundary without reimplementing GPUI's line-height-aware wheel delta.
+        // Registered before the div: capture its initial offset, then observe
+        // GPUI's native delta during reverse-order bubbling, before any frame paints.
         if let Some(hitbox) = &prepaint.0 {
             let wheel_hitbox = hitbox.clone();
             let scroll = state.1.clone();
             let previous_offset = Rc::new(Cell::new(None));
-            window.on_mouse_event(move |_event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if !wheel_hitbox.should_handle_scroll(window) {
                     return;
                 }
@@ -250,23 +407,27 @@ impl Element for ScrollArea {
                     previous_offset.set(Some(scroll.handle.offset().y));
                 } else if phase.bubble()
                     && let Some(previous) = previous_offset.take()
-                    && wheel_moved(
-                        previous,
-                        scroll.handle.offset().y,
-                        scroll.handle.max_offset().height,
-                    )
                 {
+                    let now = Instant::now();
+                    let animated = client_area_animation_enabled();
+                    let (delta, notch) = wheel_input(
+                        event.delta,
+                        scroll.handle.offset().y - previous,
+                        scroll.handle.bounds().size.height,
+                    );
+                    let smooth = animated && scroll.grab_offset.get().is_none() && notch;
+                    if !scroll.wheel(
+                        previous,
+                        delta,
+                        scroll.handle.max_offset().height,
+                        smooth,
+                        now,
+                    ) {
+                        return;
+                    }
                     if scroll.grab_offset.get().is_none() {
-                        // The wheel keeps GPUI's exact offset. Only the visible
-                        // thumb accent changes, including for touchpad input.
-                        let animated = scroll
-                            .wheel_feedback
-                            .get()
-                            .map_or_else(client_area_animation_enabled, |feedback| {
-                                feedback.animated
-                            });
                         scroll.wheel_feedback.set(Some(WheelFeedback {
-                            started: Instant::now(),
+                            started: now,
                             animated,
                         }));
                         scroll.feedback_expiry.replace((!animated).then(|| {
@@ -299,6 +460,7 @@ impl Element for ScrollArea {
         let geometry = *geometry;
         let hovered = hitbox.is_hovered(window);
         let direct = hovered || state.1.grab_offset.get().is_some();
+        let mut needs_frame = state.1.motion.get().is_some();
         let mut intensity = 0.;
         let mut width = if direct { 8. } else { 6. };
         if let Some(feedback) = state.1.wheel_feedback.get() {
@@ -307,8 +469,11 @@ impl Element for ScrollArea {
                 state.1.wheel_feedback.set(None);
             } else if feedback.animated {
                 width += (8. - width) * intensity;
-                window.request_animation_frame();
+                needs_frame = true;
             }
+        }
+        if needs_frame {
+            window.request_animation_frame();
         }
         let thumb = rgb(if direct { 0xb4b4be } else { 0x787882 }).blend(Rgba {
             a: intensity,
@@ -358,10 +523,7 @@ impl Element for ScrollArea {
             down.wheel_feedback.set(None);
             down.feedback_expiry.borrow_mut().take();
             down.grab_offset.set(Some(grab));
-            down.handle.set_offset(point(
-                down.handle.offset().x,
-                px(-geometry.scroll_at(y, grab)),
-            ));
+            down.scroll_directly(px(-geometry.scroll_at(y, grab)));
             window.refresh();
             cx.stop_propagation();
         });
@@ -380,10 +542,7 @@ impl Element for ScrollArea {
             if !event.dragging() {
                 dragging.grab_offset.set(None);
             } else {
-                dragging.handle.set_offset(point(
-                    dragging.handle.offset().x,
-                    px(-geometry.scroll_at(event.position.y.into(), grab)),
-                ));
+                dragging.scroll_directly(px(-geometry.scroll_at(event.position.y.into(), grab)));
                 cx.stop_propagation();
             }
             window.refresh();
@@ -401,9 +560,10 @@ impl Element for ScrollArea {
 #[cfg(test)]
 mod tests {
     use super::{
-        Geometry, MIN_THUMB, WHEEL_FADE, WHEEL_FEEDBACK, WHEEL_HOLD, WheelFeedback, wheel_moved,
+        Geometry, MIN_THUMB, ScrollState, WHEEL_FADE, WHEEL_FEEDBACK, WHEEL_HOLD, WHEEL_TRAVEL,
+        WheelFeedback, wheel_input, wheel_lines,
     };
-    use gpui::px;
+    use gpui::{ScrollDelta, point, px};
     use std::time::Instant;
 
     #[test]
@@ -420,16 +580,88 @@ mod tests {
         }
     }
 
+    // GPUI's native wheel listener runs before our bubble listener.
+    fn wheel(state: &ScrollState, delta: f32, max: f32, smooth: bool, now: Instant) -> bool {
+        let before = state.handle.offset();
+        state
+            .handle
+            .set_offset(point(before.x, before.y + px(delta)));
+        state.wheel(before.y, px(delta), px(max), smooth, now)
+    }
+
     #[test]
-    fn wheel_stays_inside_nested_content_until_its_boundary() {
-        assert!(
-            !wheel_moved(px(-100.), px(-140.), px(100.)),
-            "an already clamped inner scroll area must let wheel events bubble",
+    fn wheel_updates_the_actual_scroll_handle_across_frames_and_chains_at_the_edge() {
+        let start = Instant::now();
+        let inner = ScrollState::default();
+        inner.handle.set_offset(point(px(7.), px(0.)));
+        assert!(wheel(&inner, -45., 100., true, start));
+        assert_eq!(inner.handle.offset(), point(px(7.), px(0.)));
+        assert!(inner.advance(start + WHEEL_TRAVEL / 4, px(100.), true));
+        let first = inner.handle.offset().y;
+        assert!(px(-45.) < first && first < px(0.));
+        assert!(inner.advance(start + WHEEL_TRAVEL / 2, px(100.), true));
+        let halfway = inner.handle.offset().y;
+        assert!(px(-45.) < halfway && halfway < first);
+        assert!(wheel(&inner, -70., 100., true, start + WHEEL_TRAVEL / 2));
+        assert_eq!(inner.handle.offset().y, halfway);
+        // The inner area has already claimed all the remaining distance. The
+        // next notch bubbles to the parent even while the inner area settles.
+        assert!(!wheel(&inner, -45., 100., true, start + WHEEL_TRAVEL / 2));
+        let outer = ScrollState::default();
+        assert!(wheel(&outer, -45., 200., true, start + WHEEL_TRAVEL / 2));
+        assert!(!inner.advance(start + WHEEL_TRAVEL * 2, px(100.), true));
+        assert_eq!(inner.handle.offset(), point(px(7.), px(-100.)));
+        assert!(!outer.advance(start + WHEEL_TRAVEL * 2, px(200.), true));
+        assert_eq!(outer.handle.offset().y, px(-45.));
+    }
+
+    #[test]
+    fn reversal_precise_input_reduced_motion_and_resize_interrupt_travel() {
+        let start = Instant::now();
+        let state = ScrollState::default();
+        assert!(wheel(&state, -60., 200., true, start));
+        let next = start + WHEEL_TRAVEL / 4;
+        assert!(state.advance(next, px(200.), true));
+        let before = state.handle.offset().y;
+        assert!(wheel(&state, 10., 200., true, next));
+        assert!(!state.advance(next + WHEEL_TRAVEL, px(200.), true));
+        assert_eq!(state.handle.offset().y, before + px(10.));
+
+        assert!(wheel(&state, -60., 200., true, next));
+        assert!(wheel(&state, 2.5, 200., false, next));
+        assert_eq!(state.handle.offset().y, before + px(12.5));
+        assert!(!state.advance(next + WHEEL_TRAVEL, px(200.), true));
+        assert!(wheel(&state, -120., 200., true, next));
+        assert!(!state.advance(next, px(200.), false));
+        assert_eq!(state.handle.offset().y, before + px(12.5) - px(120.));
+        assert!(wheel(&state, -120., 200., true, next));
+        assert!(!state.advance(next + WHEEL_TRAVEL / 2, px(15.), true));
+        assert_eq!(state.handle.offset().y, px(-15.));
+        assert!(wheel(&state, 10., 15., true, next));
+        state.scroll_directly(px(-12.));
+        assert!(!state.advance(next + WHEEL_TRAVEL, px(15.), true));
+        assert_eq!(state.handle.offset().y, px(-12.));
+    }
+
+    #[test]
+    fn trackpad_pixels_and_partial_windows_detents_are_direct() {
+        assert_eq!(
+            wheel_input(
+                ScrollDelta::Pixels(point(px(0.), px(-24.))),
+                px(-24.),
+                px(250.)
+            ),
+            (px(-24.), false)
         );
-        assert!(wheel_moved(px(-80.), px(-120.), px(100.)));
-        assert!(!wheel_moved(px(0.), px(40.), px(100.)));
-        assert!(wheel_moved(px(-20.), px(20.), px(100.)));
-        assert!(!wheel_moved(px(-40.), px(-80.), px(0.)));
+        let lines = |amount, units| wheel_lines(amount, units, px(-42.), px(250.));
+        assert_eq!(lines(-3., 3), (px(-42.), true));
+        assert!(lines(12., 3).1);
+        assert!(lines(-1., 1).1);
+        assert!(!lines(1., 3).1);
+        assert!(!lines(1.5, 3).1);
+        assert!(!lines(0., 3).1);
+        assert!(!lines(1., 0).1);
+        assert_eq!(lines(-(u32::MAX as f32), u32::MAX), (px(-250.), true));
     }
 
     #[test]

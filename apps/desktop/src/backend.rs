@@ -10,11 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 use wayline_core::{
-    DiscoveryEvent, Identity, NearbyReceiver, SendCancellation, SendEvent, SendFormat, SendOptions,
+    AppleSenderIdentity, DiscoveryEvent, Identity, NearbyReceiver, SendCancellation, SendEvent,
+    SendFormat, SendOptions, SenderIdentity,
 };
 use wayline_service::{
     client::{Client, ClientConfig, ClientErrorKind},
-    protocol::Status,
+    protocol::{Rtl8821cuStartup, Status},
     session::{ClientLease, ReleaseOutcome, SessionKind},
 };
 
@@ -24,6 +25,7 @@ pub struct LinkStatus {
     pub port: Option<String>,
     pub channel: u16,
     pub rtl8821cu_width_mhz: Option<u16>,
+    pub rtl8821cu_startup: Option<Rtl8821cuStartup>,
     pub target: Option<String>,
     pub awdl0: bool,
     pub error: Option<String>,
@@ -35,6 +37,7 @@ impl From<Status> for LinkStatus {
             port: status.port,
             channel: status.channel,
             rtl8821cu_width_mhz: status.rtl8821cu_width_mhz,
+            rtl8821cu_startup: status.rtl8821cu_startup,
             target: status.target,
             awdl0: status.awdl0,
             error: status.error,
@@ -64,7 +67,8 @@ pub enum Event {
     HistoryDeletePreferenceSaved(Result<bool, String>),
     HistoryFlushed,
     DownloadDirectorySaved(Result<PathBuf, String>),
-    RadioChanged(RadioChange, Result<Status, String>),
+    AppleIdentityUpdated(Result<Option<bool>, String>),
+    RadioChanged(Result<Status, String>),
     Incoming(crate::receiving::IncomingRequest),
     ShutdownDone(Result<bool, String>),
     Firmware(crate::firmware::Event),
@@ -224,10 +228,19 @@ pub fn monitor(tx: Sender<Event>) -> Monitor {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum RadioChange {
-    Channel(u16),
-    MonitorWidth(u16),
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RadioChange {
+    pub channel: u16,
+    pub width_mhz: Option<u16>,
+}
+
+impl From<&LinkStatus> for RadioChange {
+    fn from(status: &LinkStatus) -> Self {
+        Self {
+            channel: status.channel,
+            width_mhz: status.rtl8821cu_width_mhz,
+        }
+    }
 }
 
 pub fn change_radio(
@@ -255,15 +268,11 @@ pub fn change_radio(
                 } else {
                     Duration::from_secs(45)
                 };
-                match change {
-                    RadioChange::Channel(channel) => client.set_channel_and_wait(channel, timeout),
-                    RadioChange::MonitorWidth(mhz) => {
-                        client.set_rtl8821cu_width_and_wait(mhz, timeout)
-                    }
-                }
-                .map_err(|error| error.to_string())
+                client
+                    .set_radio_and_wait(change.channel, change.width_mhz, timeout)
+                    .map_err(|error| error.to_string())
             });
-        let _ = tx.send(Event::RadioChanged(change, result));
+        let _ = tx.send(Event::RadioChanged(result));
     })
 }
 
@@ -422,6 +431,18 @@ pub(super) fn identity(computer_name: &str) -> Result<Identity> {
     wayline_host::load_identity(computer_name)
 }
 
+fn apple_identity(enabled: bool) -> Result<Option<AppleSenderIdentity>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let text = crate::i18n::current().strings();
+    Ok(Some(
+        wayline_host::load_apple_airdrop_identity()
+            .context(text.apple_identity_error)?
+            .context(text.apple_identity_required)?,
+    ))
+}
+
 pub(super) fn prepare_network() -> Result<()> {
     // Sending and receiving may start together, but the service serializes
     // firewall updates. Keep our requests from racing each other.
@@ -441,19 +462,24 @@ pub(super) fn prepare_network() -> Result<()> {
 pub fn scan(
     id: u64,
     sender_name: String,
+    contacts_identity: bool,
     cancel: SendCancellation,
     tx: Sender<Event>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
+            let apple = apple_identity(contacts_identity)?;
             let signal = cancel.clone();
             let _session = UsageSession::acquire(SessionKind::Client, move || signal.cancel())?;
             prepare_network()?;
             let interface = wayline_host::awdl_interface()?;
             let identity = identity(&sender_name)?;
-            wayline_core::discover_receivers_live_cancellable(
+            wayline_core::discover_receivers_live_cancellable_with_identity(
                 interface,
-                &identity,
+                SenderIdentity {
+                    local: &identity,
+                    apple: apple.as_ref(),
+                },
                 Duration::from_secs(15),
                 true,
                 false,
@@ -473,12 +499,14 @@ pub fn send(
     peer: NearbyReceiver,
     files: Vec<PathBuf>,
     sender_name: String,
+    contacts_identity: bool,
     cancel: SendCancellation,
     tx: Sender<Event>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut terminal_event = None;
         let result = (|| -> Result<()> {
+            let apple = apple_identity(contacts_identity)?;
             let signal = cancel.clone();
             let _session = UsageSession::acquire(SessionKind::Send, move || signal.cancel())?;
             prepare_network()?;
@@ -493,9 +521,12 @@ pub fn send(
                 legacy_ble: false,
             };
             let mut last = Instant::now();
-            let result = wayline_core::send_to_receiver_cancellable(
+            let result = wayline_core::send_to_receiver_cancellable_with_identity(
                 &peer,
-                &identity,
+                SenderIdentity {
+                    local: &identity,
+                    apple: apple.as_ref(),
+                },
                 &files,
                 &options,
                 &cancel,

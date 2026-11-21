@@ -1,3 +1,4 @@
+mod apple_identity;
 mod compact_send;
 mod live_transfer;
 
@@ -60,7 +61,7 @@ pub struct Capsule {
     name_input_subscription: Option<Subscription>,
     settings_open: bool,
     compact_send_view: bool,
-    saved_compact_send_view: bool,
+    pending_send_layout: Option<bool>,
     animate_send_view: bool,
     startup_prewarm: bool,
     history_open: bool,
@@ -83,6 +84,7 @@ pub struct Capsule {
     notification_duration_menu_open: bool,
     settings_error: Option<String>,
     radio_change_pending: bool,
+    radio_draft: Option<RadioChange>,
     name_saved: bool,
     device_name: String,
     receiver: crate::receiving::ReceiverHost,
@@ -95,6 +97,8 @@ pub struct Capsule {
     incoming: Option<crate::receiving::IncomingRequest>,
     trust_incoming: bool,
     trusted_senders: Vec<wayline_host::TrustedSender>,
+    apple_identity_imported: bool,
+    use_apple_identity: bool,
     drop_hovered: bool,
     opening_files: Option<u64>,
     queued_files: Vec<PathBuf>,
@@ -265,7 +269,7 @@ impl Capsule {
             name_input_subscription: None,
             settings_open: false,
             compact_send_view,
-            saved_compact_send_view: compact_send_view,
+            pending_send_layout: None,
             animate_send_view: client_area_animation_enabled(),
             startup_prewarm: crate::integration::startup_prewarm_enabled(),
             history_open: false,
@@ -288,6 +292,7 @@ impl Capsule {
             notification_duration_menu_open: false,
             settings_error,
             radio_change_pending: false,
+            radio_draft: None,
             name_saved: false,
             device_name,
             receiver,
@@ -300,6 +305,8 @@ impl Capsule {
             incoming: None,
             trust_incoming: false,
             trusted_senders,
+            apple_identity_imported: wayline_host::has_apple_airdrop_identity().unwrap_or(false),
+            use_apple_identity: false,
             drop_hovered: false,
             opening_files: None,
             queued_files: Vec::new(),
@@ -558,25 +565,34 @@ impl Capsule {
                     changed = true;
                     continue;
                 }
-                Event::RadioChanged(change, result) => {
+                Event::AppleIdentityUpdated(result) => {
+                    self.apple_identity_updated(result);
+                    changed = true;
+                    continue;
+                }
+                Event::RadioChanged(result) => {
                     self.radio_change_pending = false;
                     self.receiver = crate::receiving::ReceiverHost::new(self.tx.clone());
+                    match result {
+                        Ok(status) => {
+                            self.radio_draft = None;
+                            self.settings_error = None;
+                            self.model.apply_at(
+                                Event::Status(Ok(status.into())),
+                                event_at,
+                                event_unix_ms,
+                            );
+                        }
+                        Err(error) => {
+                            let text = self.language.strings();
+                            self.settings_error = Some(format!("{}{error}", text.err_radio_save));
+                        }
+                    }
                     self.receiver.configure(
                         self.model
                             .connection_ready()
                             .then(|| self.device_name.clone()),
                     );
-                    match result {
-                        Ok(_) => self.settings_error = None,
-                        Err(error) => {
-                            let text = self.language.strings();
-                            let prefix = match change {
-                                RadioChange::Channel(_) => text.err_channel_change,
-                                RadioChange::MonitorWidth(_) => text.err_width_change,
-                            };
-                            self.settings_error = Some(format!("{prefix}{error}"));
-                        }
-                    }
                     changed = true;
                     continue;
                 }
@@ -587,6 +603,8 @@ impl Capsule {
                         Some("download directory changed")
                     } else if self.incoming.is_some() || self.receive.active.is_some() {
                         Some("another incoming transfer is active")
+                    } else if self.radio_change_pending {
+                        Some("wireless settings are changing")
                     } else if self.firmware.busy || self.model.phase.busy() {
                         Some("firmware update or outgoing transfer is active")
                     } else if self.picker_open {
@@ -679,9 +697,11 @@ impl Capsule {
                     if let Some(shell) = self.shell.as_mut() {
                         shell.set_connected(ready);
                     }
-                    self.receiver.configure(
-                        (ready && !self.firmware.busy).then(|| self.device_name.clone()),
-                    );
+                    if !self.radio_change_pending {
+                        self.receiver.configure(
+                            (ready && !self.firmware.busy).then(|| self.device_name.clone()),
+                        );
+                    }
                     if !ready {
                         changed |= self
                             .receive
@@ -805,6 +825,10 @@ impl Capsule {
                     }
                     changed = true;
                 }
+                Action::AppleIdentityDirectoryChosen(result) => {
+                    self.apple_identity_directory_chosen(result);
+                    changed = true;
+                }
                 Action::FileDrag(active) => {
                     self.drag_active = active;
                     if !self.model.phase.busy() && !self.picker_open && self.name_input.is_none()
@@ -825,7 +849,9 @@ impl Capsule {
                     return;
                 }
                 Action::Reposition => {
-                    self.animate_send_view = client_area_animation_enabled();
+                    let animate = client_area_animation_enabled();
+                    changed |= self.animate_send_view != animate;
+                    self.animate_send_view = animate;
                     self.place();
                 }
                 Action::RestoreTray => {
@@ -1000,12 +1026,20 @@ impl Capsule {
     }
 
     fn set_compact_send_view(&mut self, compact: bool, cx: &mut Context<Self>) {
-        if compact == self.saved_compact_send_view {
-            return;
+        if compact != self.compact_send_view {
+            self.pending_send_layout = Some(compact);
+            cx.notify();
         }
+    }
+
+    fn refresh_send_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compact) = self.pending_send_layout.take() else {
+            return;
+        };
         self.settings_error = match crate::settings::save_compact_send_view(compact) {
             Ok(saved) => {
-                self.saved_compact_send_view = saved;
+                self.compact_send_view = saved;
+                self.back(window, cx);
                 None
             }
             Err(error) => {
@@ -1016,6 +1050,11 @@ impl Capsule {
                 ))
             }
         };
+        cx.notify();
+    }
+
+    fn dismiss_send_layout_refresh(&mut self, cx: &mut Context<Self>) {
+        self.pending_send_layout = None;
         cx.notify();
     }
 
@@ -1044,6 +1083,7 @@ impl Capsule {
         }
         self.drop_hovered = false;
         self.settings_open = false;
+        self.pending_send_layout = None;
         self.history_open = false;
         if !self.history_deleting {
             self.history_deletion = None;
@@ -1151,46 +1191,90 @@ impl Capsule {
             && !self.receiver.has_active_transfers()
     }
 
-    fn can_change_radio(&self, change: RadioChange) -> bool {
-        let Some(Ok(status)) = self.model.status.as_ref() else {
-            return false;
-        };
-        if self.radio_change_pending
-            || self.model.phase.busy()
-            || self.model.scanning
-            || !self.can_change_download_directory()
-        {
-            return false;
-        }
-        match change {
-            RadioChange::Channel(channel) if status.channel == channel => false,
-            RadioChange::Channel(6) => status.rtl8821cu_width_mhz.unwrap_or(20) == 20,
-            RadioChange::Channel(44 | 149) => {
-                matches!(status.target.as_deref(), Some("esp32c5" | "rtl8821cu")) && status.ready()
-            }
-            RadioChange::MonitorWidth(width) => status.rtl8821cu_width_mhz.is_some_and(|current| {
-                current != width
-                    && (width == 20
-                        || matches!(width, 40 | 80)
-                            && matches!(status.channel, 44 | 149)
-                            && status.ready())
-            }),
-            _ => false,
+    fn radio_status(&self) -> Option<&backend::LinkStatus> {
+        self.model
+            .status
+            .as_ref()
+            .and_then(|status| status.as_ref().ok())
+    }
+
+    fn can_edit_radio(&self) -> bool {
+        !self.radio_change_pending
+            && !self.model.phase.busy()
+            && !self.model.scanning
+            && self.can_change_download_directory()
+            && self.exit_state.is_none()
+    }
+
+    fn radio_selection(&self) -> Option<RadioChange> {
+        self.radio_draft
+            .or_else(|| self.radio_status().map(RadioChange::from))
+    }
+
+    fn set_radio_draft(&mut self, change: RadioChange, cx: &mut Context<Self>) {
+        if self.can_edit_radio() {
+            self.radio_draft = Some(change);
+            self.settings_error = None;
+            cx.notify();
         }
     }
 
-    fn set_radio(&mut self, change: RadioChange, cx: &mut Context<Self>) {
-        if !self.can_change_radio(change) {
-            return;
+    fn select_radio_channel(&mut self, channel: u16, cx: &mut Context<Self>) {
+        if let Some(draft) = self.radio_selection() {
+            let width_mhz = draft
+                .width_mhz
+                .map(|width| if channel == 6 { 20 } else { width });
+            self.set_radio_draft(RadioChange { channel, width_mhz }, cx);
         }
+    }
+
+    fn select_radio_width(&mut self, width: u16, cx: &mut Context<Self>) {
+        if let Some(draft) = self.radio_selection()
+            && draft.width_mhz.is_some()
+            && (width == 20 || matches!(draft.channel, 44 | 149))
+        {
+            self.set_radio_draft(
+                RadioChange {
+                    width_mhz: Some(width),
+                    ..draft
+                },
+                cx,
+            );
+        }
+    }
+
+    fn can_save_radio(&self, change: RadioChange) -> bool {
+        self.can_edit_radio()
+            && self.radio_status().is_some_and(|status| {
+                let current = RadioChange::from(status);
+                let valid_channel = match change.channel {
+                    6 => change.width_mhz.unwrap_or(20) == 20,
+                    44 | 149 => {
+                        (current.width_mhz.is_some() && change.width_mhz == Some(20))
+                            || (status.ready()
+                                && matches!(
+                                    status.target.as_deref(),
+                                    Some("esp32c5" | "rtl8821cu")
+                                ))
+                    }
+                    _ => false,
+                };
+                valid_channel
+                    && current != change
+                    && change.width_mhz.is_some() == current.width_mhz.is_some()
+            })
+    }
+
+    fn save_radio(&mut self, cx: &mut Context<Self>) {
+        let Some(change) = self
+            .radio_draft
+            .filter(|change| self.can_save_radio(*change))
+        else {
+            return;
+        };
         self.radio_change_pending = true;
         self.settings_error = None;
-        let text = self.language.strings();
-        self.receiver_status = Err(match change {
-            RadioChange::Channel(_) => text.switching_channel,
-            RadioChange::MonitorWidth(_) => text.switching_width,
-        }
-        .into());
+        self.receiver_status = Err(self.language.strings().switching_radio.into());
         let receiver_worker = self.receiver.shutdown();
         self.workers.push(backend::change_radio(
             change,
@@ -1275,7 +1359,11 @@ impl Capsule {
         {
             return;
         }
+        if !self.settings_open && !self.radio_change_pending {
+            self.radio_draft = None;
+        }
         self.settings_open = true;
+        self.pending_send_layout = None;
         self.history_open = false;
         self.language_menu_open = false;
         self.notification_position_menu_open = false;
@@ -1286,7 +1374,9 @@ impl Capsule {
         cx.notify();
     }
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.firmware.open {
+        if self.pending_send_layout.is_some() {
+            self.dismiss_send_layout_refresh(cx);
+        } else if self.firmware.open {
             self.firmware.open = false;
             self.firmware.confirm_exit = false;
             cx.notify();
@@ -1343,6 +1433,7 @@ impl Capsule {
     }
     fn scan(&mut self, cx: &mut Context<Self>) {
         if self.radio_change_pending
+            || self.picker_open
             || self.firmware.busy
             || self.model.scanning
             || self.model.phase.busy()
@@ -1362,6 +1453,7 @@ impl Capsule {
         self.workers.push(backend::scan(
             self.model.scan_id,
             self.device_name.clone(),
+            self.use_apple_identity,
             cancel,
             self.tx.clone(),
         ));
@@ -1389,6 +1481,7 @@ impl Capsule {
             peer,
             self.model.files.clone(),
             self.device_name.clone(),
+            self.use_apple_identity,
             cancel,
             self.tx.clone(),
         ));
@@ -1605,16 +1698,38 @@ impl Capsule {
                         text.quitting_title
                     }),
             )
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(rgb(MUTED))
-                    .child(error.cloned().unwrap_or_else(|| text.quit_detail.into())),
-            )
+            .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child(
+                error.cloned().unwrap_or_else(|| {
+                    if self
+                        .model
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.as_ref().ok())
+                        .is_some_and(|status| {
+                            status.rtl8821cu_width_mhz.is_some() && status.state == "starting"
+                        })
+                    {
+                        text.quit_waiting_usb.into()
+                    } else {
+                        text.quit_detail.into()
+                    }
+                }),
+            ))
             .when(error.is_some(), |panel| {
                 panel.child(
                     button("retry-quit", text.retry_quit, true)
                         .on_click(cx.listener(|this, _, window, cx| this.quit(window, cx))),
+                )
+            })
+            .when(error.is_none(), |panel| {
+                panel.child(
+                    button("quit-in-background", text.quit_in_background, false).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.visibility = Visibility::Hidden;
+                            this.place();
+                            cx.notify();
+                        }),
+                    ),
                 )
             })
             .into_any_element()
@@ -1623,6 +1738,12 @@ impl Capsule {
     fn panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
         let (status, color) = self.status_text();
+        let usb_startup = self.model.status.as_ref().and_then(|link| {
+            let link = link.as_ref().ok()?;
+            link.rtl8821cu_startup
+                .as_ref()
+                .filter(|_| link.state == "starting")
+        });
         let compact_theme = self.compact_send_view
             && !self.settings_open
             && !self.history_open
@@ -1947,6 +2068,8 @@ impl Capsule {
                     })
                     .child(if self.incoming.is_some() {
                         self.incoming_view(cx)
+                    } else if self.settings_open && self.pending_send_layout.is_some() {
+                        self.send_layout_refresh_view(cx)
                     } else if self.firmware.open {
                         self.firmware_view(cx)
                     } else if self.history_open {
@@ -1985,6 +2108,12 @@ impl Capsule {
                         )
                     })
             })
+            .when_some(
+                usb_startup.filter(|_| {
+                    !self.settings_open && !self.firmware.open && self.incoming.is_none()
+                }),
+                |panel, startup| panel.child(self.usb_startup_progress(startup, muted, surface)),
+            )
             .child(
                 div()
                     .flex()
@@ -2038,6 +2167,7 @@ impl Capsule {
         }
         self.finish_name_edit(window);
         self.settings_open = false;
+        self.pending_send_layout = None;
         self.history_open = false;
         self.language_menu_open = false;
         self.firmware.open = true;
@@ -2557,11 +2687,11 @@ impl Capsule {
 
     fn radio_settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
-        let status = self
-            .model
-            .status
-            .as_ref()
-            .and_then(|status| status.as_ref().ok());
+        let status = self.radio_status();
+        let selection = self.radio_selection();
+        let can_save = self
+            .radio_draft
+            .is_some_and(|draft| self.can_save_radio(draft));
         let channel = status.map(|status| status.channel);
         let target = status.and_then(|status| status.target.as_deref());
         let target_label = match target {
@@ -2576,7 +2706,7 @@ impl Capsule {
             149 => text.channel_149,
             _ => text.channel_unknown,
         });
-        let status_text = match (status, current_label) {
+        let mut status_text = match (status, current_label) {
             (Some(status), Some(current)) if status.ready() => {
                 format!("{target_label} · {} {current}", text.radio_current)
             }
@@ -2589,11 +2719,12 @@ impl Capsule {
             }
             _ => text.radio_reading.into(),
         };
-        let choices: &[u16] = match target {
-            Some("esp32c5" | "rtl8821cu") => &[6, 44, 149],
-            Some("esp32s3") | None => &[6],
-            _ => &[6],
-        };
+        if let Some(width) = status.and_then(|status| status.rtl8821cu_width_mhz) {
+            status_text.push_str(&format!(" · {width} MHz"));
+        }
+        let has_5ghz = matches!(target, Some("esp32c5" | "rtl8821cu"))
+            || status.is_some_and(|status| status.rtl8821cu_width_mhz.is_some());
+        let choices: &[u16] = if has_5ghz { &[6, 44, 149] } else { &[6] };
         div()
             .flex_shrink_0()
             .rounded(px(16.))
@@ -2609,14 +2740,18 @@ impl Capsule {
                     .text_color(rgb(MUTED))
                     .child(status_text),
             )
+            .when_some(
+                status.and_then(|status| status.rtl8821cu_startup.as_ref()),
+                |card, startup| card.child(self.usb_startup_progress(startup, MUTED, 0x393940)),
+            )
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .gap(px(8.))
                     .children(choices.iter().copied().map(|channel| {
-                        let selected = channel == status.map_or(0, |status| status.channel);
-                        let enabled = self.can_change_radio(RadioChange::Channel(channel));
+                        let selected = selection.is_some_and(|draft| channel == draft.channel);
+                        let enabled = self.can_edit_radio() && selection.is_some();
                         let label = match channel {
                             6 => text.channel_6,
                             44 => text.channel_44,
@@ -2642,15 +2777,35 @@ impl Capsule {
                                 button
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x484850)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_radio_channel(channel, cx);
+                                    }))
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_radio(RadioChange::Channel(channel), cx)
-                            }))
                     })),
             )
             .when_some(
-                status.and_then(|status| status.rtl8821cu_width_mhz),
-                |view, current| view.child(self.radio_width_controls(current, cx)),
+                selection.filter(|draft| draft.width_mhz.is_some()),
+                |view, draft| view.child(self.radio_width_controls(draft, cx)),
+            )
+            .when(
+                selection.is_some_and(|draft| draft.channel == 44 && draft.width_mhz.is_some()),
+                |view| {
+                    view.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(text.radio_channel_44_hint),
+                    )
+                },
+            )
+            .child(
+                button("save-radio", text.save, can_save)
+                    .when(!can_save, |button| {
+                        button.opacity(0.5).cursor(CursorStyle::Arrow)
+                    })
+                    .when(can_save, |button| {
+                        button.on_click(cx.listener(|this, _, _, cx| this.save_radio(cx)))
+                    }),
             )
             .when(self.radio_change_pending, |view| {
                 view.child(
@@ -2663,7 +2818,69 @@ impl Capsule {
             .into_any_element()
     }
 
-    fn radio_width_controls(&self, current: u16, cx: &mut Context<Self>) -> impl IntoElement {
+    fn usb_startup_progress(
+        &self,
+        startup: &wayline_service::protocol::Rtl8821cuStartup,
+        muted: u32,
+        track: u32,
+    ) -> impl IntoElement {
+        use wayline_service::protocol::Rtl8821cuStartupPhase as Phase;
+        let text = self.language.strings();
+        let label = match startup.phase {
+            Phase::BridgeLaunch => text.usb_start_bridge,
+            Phase::UsbHelperInitialization => text.usb_start_helper,
+            Phase::HelloVerification => text.usb_start_verify,
+            Phase::WintunSetup => text.usb_start_wintun,
+            Phase::Ready => text.usb_start_ready,
+        };
+        let percent = startup.percent.min(100);
+        let duration = self
+            .language
+            .transfer_elapsed(startup.elapsed_seconds.saturating_mul(1000));
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap(px(5.))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(11.))
+                    .child(div().min_w_0().flex_1().child(label))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(BLUE))
+                            .child(format!("{percent}%")),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(rgb(track))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(f32::from(percent) / 100.))
+                            .rounded_full()
+                            .bg(rgb(BLUE)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(muted))
+                    .child(duration),
+            )
+    }
+
+    fn radio_width_controls(&self, draft: RadioChange, cx: &mut Context<Self>) -> impl IntoElement {
         let text = self.language.strings();
         div()
             .flex()
@@ -2676,9 +2893,9 @@ impl Capsule {
                     .flex_wrap()
                     .gap(px(8.))
                     .children([20, 40, 80].map(|width| {
-                        let change = RadioChange::MonitorWidth(width);
-                        let selected = current == width;
-                        let enabled = self.can_change_radio(change);
+                        let selected = draft.width_mhz == Some(width);
+                        let enabled = self.can_edit_radio()
+                            && (width == 20 || matches!(draft.channel, 44 | 149));
                         div()
                             .id(("rtl8821cu-width", u32::from(width)))
                             .h(px(32.))
@@ -2694,11 +2911,9 @@ impl Capsule {
                                 button
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x484850)))
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.set_radio(change, cx)
-                                        }),
-                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_radio_width(width, cx);
+                                    }))
                             })
                     })),
             )
@@ -3341,6 +3556,7 @@ impl Capsule {
                     .child(self.notification_duration_select(cx)),
             )
             .child(self.radio_settings_view(cx))
+            .child(self.apple_identity_view(cx))
             .child(self.trusted_senders_view(cx))
             .child(
                 div()
@@ -4295,6 +4511,7 @@ impl Capsule {
                 self.receive.begin(&request.transfer, request.save_dir);
                 if matches!(answer, IncomingAnswer::Accept) {
                     self.settings_open = false;
+                    self.pending_send_layout = None;
                     self.firmware.open = false;
                 }
                 if trust_incoming

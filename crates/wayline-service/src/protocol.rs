@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const SET_RADIO: &str = "set-radio";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
@@ -24,6 +26,46 @@ impl Request {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Rtl8821cuStartupPhase {
+    BridgeLaunch,
+    UsbHelperInitialization,
+    HelloVerification,
+    WintunSetup,
+    Ready,
+}
+
+impl Rtl8821cuStartupPhase {
+    pub(crate) fn percent(self) -> u8 {
+        match self {
+            Self::BridgeLaunch => 5,
+            Self::UsbHelperInitialization => 30,
+            Self::HelloVerification => 65,
+            Self::WintunSetup => 85,
+            Self::Ready => 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rtl8821cuStartup {
+    pub phase: Rtl8821cuStartupPhase,
+    pub percent: u8,
+    pub elapsed_seconds: u64,
+}
+
+impl Rtl8821cuStartup {
+    pub(crate) fn new(phase: Rtl8821cuStartupPhase, elapsed_seconds: u64) -> Self {
+        Self {
+            phase,
+            percent: phase.percent(),
+            elapsed_seconds,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
@@ -32,6 +74,8 @@ pub struct Status {
     pub channel: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtl8821cu_width_mhz: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtl8821cu_startup: Option<Rtl8821cuStartup>,
     #[serde(default)]
     pub target: Option<String>,
     pub awdl0: bool,
@@ -69,6 +113,7 @@ mod tests {
             port: None,
             channel: 6,
             rtl8821cu_width_mhz: None,
+            rtl8821cu_startup: None,
             target: None,
             awdl0: false,
             error: None,
@@ -80,15 +125,26 @@ mod tests {
     }
 
     #[test]
-    fn monitor_width_does_not_break_older_status_messages() {
+    fn usb_status_fields_do_not_break_older_status_messages() {
         let legacy = r#"{"state":"running","port":"RTL8821CU","channel":149,"target":"rtl8821cu","awdl0":true,"error":null,"enabled":true}"#;
         let mut status: Status = serde_json::from_str(legacy).unwrap();
         assert!(status.uses_rtl8821cu());
         assert_eq!(status.rtl8821cu_width_mhz, None);
+        assert_eq!(status.rtl8821cu_startup, None);
         status.rtl8821cu_width_mhz = Some(80);
+        status.rtl8821cu_startup = Some(Rtl8821cuStartup::new(
+            Rtl8821cuStartupPhase::UsbHelperInitialization,
+            75,
+        ));
+        let status = serde_json::to_value(status).unwrap();
+        assert_eq!(status["rtl8821cuWidthMhz"], 80);
         assert_eq!(
-            serde_json::to_value(status).unwrap()["rtl8821cuWidthMhz"],
-            80
+            status["rtl8821cuStartup"],
+            serde_json::json!({
+                "phase": "usbHelperInitialization",
+                "percent": 30,
+                "elapsedSeconds": 75,
+            })
         );
 
         let mut request = Request::new(crate::config::SET_RTL8821CU_WIDTH);
@@ -97,5 +153,12 @@ mod tests {
             serde_json::to_value(request).unwrap()["rtl8821cuWidthMhz"],
             40
         );
+
+        let request: Request =
+            serde_json::from_str(r#"{"cmd":"set-radio","channel":44,"rtl8821cuWidthMhz":40}"#)
+                .unwrap();
+        assert_eq!(request.cmd, SET_RADIO);
+        assert_eq!(request.channel, Some(44));
+        assert_eq!(request.rtl8821cu_width_mhz, Some(40));
     }
 }

@@ -43,6 +43,21 @@ for 10 Minutes. The PC's built-in Wi-Fi can stay off; no shared router connectio
   The language choice is saved locally and applies immediately.
 - Error details: hover over a notice to expand it, then use Copy to get complete diagnostics.
 
+### Send to a Contacts Only device
+
+Open **Send to Contacts Only** in desktop settings and choose a folder containing your AirDrop
+identity. Put the certificate chain in `certificate.pem`, its matching unencrypted PEM private key in `key.pem`,
+and the Apple-signed DER validation record in `validation_record.cms`. Enable the identity for
+discovery and sending each time you want to use it. The recipient's Contacts app needs the email or
+phone number associated with the record. Support is experimental and requires verification on your
+devices. [Apple AirDrop identity](https://support.apple.com/en-ie/guide/security/sec2261183f4/web) ·
+[Omdrop identity files](https://github.com/netmojo-systems/omdrop-plugin#your-airdrop-identity)
+
+Wayline uses DPAPI to encrypt the imported identity for your Windows user. **Remove identity**
+deletes the copy stored by Wayline. Imports require an existing AirDrop identity. Apple has no
+documented standard export for the complete identity. Apple devices use their own contact photos
+for verified peers.
+
 × or Esc hides the card while receiving continues. Tray Quit or `Ctrl+Q` ends this client's
 tasks. The default on-demand service reclaims the radio after the last client exits;
 a standalone service deployment can remain resident.

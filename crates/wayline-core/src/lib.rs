@@ -27,7 +27,8 @@ pub(crate) fn board_feedback_enabled() -> bool {
 pub use airdrop::{IncomingFile, IncomingTransfer};
 pub use cancel::SendCancellation;
 pub use discovery::{
-    discover_receivers_live, discover_receivers_live_cancellable, receiver_by_name, DiscoveryEvent,
+    discover_receivers_live, discover_receivers_live_cancellable,
+    discover_receivers_live_cancellable_with_identity, receiver_by_name, DiscoveryEvent,
 };
 pub use identity::{Identity, IdentityError};
 pub use mdns::{AirDropService, MdnsBrowser, MdnsResponder, NetworkInterface};
@@ -35,6 +36,7 @@ pub use outcome::TransferFailureKind;
 pub use receiver::{ReceiverCore, ReceiverError, ReceiverEvent, ReceiverOptions, TransferFormat};
 pub use sender::{
     discover_receivers, send_to_name, send_to_receiver, send_to_receiver_cancellable,
-    validate_files, NearbyReceiver, SendError, SendEvent, SendFormat, SendOptions, SendReport,
+    send_to_receiver_cancellable_with_identity, validate_files, NearbyReceiver, SendError,
+    SendEvent, SendFormat, SendOptions, SendReport,
 };
-pub use tls::{server_config, TlsError};
+pub use tls::{server_config, AppleSenderIdentity, SenderIdentity, TlsError};

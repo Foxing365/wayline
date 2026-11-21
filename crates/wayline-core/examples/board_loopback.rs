@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let selected = NearbyReceiver {
         name: "本机回环测试".into(),
+        receiver_certificate_sha256: None,
         service: AirDropService {
             instance: "test._airdrop._tcp.local".into(),
             host: "localhost".into(),
@@ -154,6 +155,7 @@ fn failure_cases() -> Result<(), Box<dyn std::error::Error>> {
         });
         let selected = NearbyReceiver {
             name: "本机回环测试".into(),
+            receiver_certificate_sha256: None,
             service: AirDropService {
                 instance: "test._airdrop._tcp.local".into(),
                 host: "localhost".into(),

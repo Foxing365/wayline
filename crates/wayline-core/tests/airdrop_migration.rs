@@ -38,6 +38,7 @@ fn identity(dir: &std::path::Path) -> Identity {
 fn selected(addr: std::net::SocketAddrV6) -> NearbyReceiver {
     NearbyReceiver {
         name: "receiver".into(),
+        receiver_certificate_sha256: None,
         service: AirDropService {
             instance: "receiver._airdrop._tcp.local".into(),
             host: "localhost".into(),
@@ -774,10 +775,194 @@ fn tls_invalid_offer_is_rejected_before_consent_with_a_diagnostic() {
                 ReceiverEvent::Rejected {
                     path: "/Ask".into(),
                     status: 400,
-                    reason,
+                    reason: reason.into(),
                 },
             ]
         );
+    }
+}
+
+#[test]
+fn tls_rejects_mixed_offers_with_counts_and_no_sender_values() {
+    use owly_airdrop::proto::{
+        messages::{AskFile, Offer},
+        plist::{self, Dict, Value},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let id = identity(root.path());
+    let files = [
+        ("private-photo.HEIC", "public.heic", 100),
+        ("private-title.WEBLOC", "com.apple.web-internet-location", 0),
+    ]
+    .into_iter()
+    .map(|(name, file_type, size)| AskFile {
+        name: name.into(),
+        file_type: file_type.into(),
+        size: Some(size),
+        bom_path: format!("./{name}"),
+        is_directory: false,
+    })
+    .collect();
+    let ask = sender::ask_request(
+        &sender::Config::new("private sender", "abcdef123456"),
+        "MIXED",
+        &Offer::Files(files),
+    );
+    let (_, body_start) = http::parse_request(&ask, &http::Limits::default())
+        .unwrap()
+        .unwrap();
+    let Value::Dict(mut offer) =
+        plist::from_bytes(&ask[body_start..], &plist::Limits::default()).unwrap()
+    else {
+        panic!("expected an offer dictionary");
+    };
+    offer.insert(
+        "Items".into(),
+        Value::Array(vec![
+            "https://example.invalid/private-url".into(),
+            "private-app://path".into(),
+        ]),
+    );
+    for (transfer_type, expected) in [
+        (Some("files"), "files"),
+        (Some("links"), "links"),
+        (Some("private-type"), "other"),
+        (None, "missing"),
+    ] {
+        if let Some(kind) = transfer_type {
+            offer.insert(
+                "TransferType".into(),
+                Value::Dict(Dict::from([(kind.into(), Value::Dict(Dict::new()))])),
+            );
+        } else {
+            offer.remove("TransferType");
+        }
+        let body = plist::to_bytes(&Value::Dict(offer.clone()));
+        let request = http::post_head("/Ask", &[("Content-Length", &body.len().to_string())]);
+        let core = ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", root.path()))
+            .with_decision(|_| panic!("mixed offer must not prompt"));
+        let (peer, worker) = start(Arc::new(core), &id);
+        let mut tls = client(peer.service.address);
+        tls.write_all(&request).unwrap();
+        tls.write_all(&body).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, 400);
+        assert_eq!(
+            worker.join().unwrap().unwrap(),
+            [
+                ReceiverEvent::AskStarted,
+                ReceiverEvent::Rejected {
+                    path: "/Ask".into(),
+                    status: 400,
+                    reason: format!(
+                        "both files and URLs offered (transfer_type={expected}, files=2, items=2, shortcut_files=1, empty_link_metadata_files=1)"
+                    )
+                    .into(),
+                },
+            ]
+        );
+    }
+}
+
+#[test]
+fn tls_explicit_link_metadata_offers_require_valid_urls_and_consent() {
+    use owly_airdrop::proto::plist::{self, Dict, Value};
+
+    let root = tempfile::tempdir().unwrap();
+    let receiver = identity(&root.path().join("receiver"));
+    let sender = identity(&root.path().join("trusted sender"));
+    let destination = root.path().join("received");
+    let url = "https://b23.tv/wayline-test";
+    let webloc = ("Bilibili.webloc", "com.apple.web-internet-location", 0);
+    for (item, (name, file_type, file_size), decision, status, expected_prompt) in [
+        (url, webloc, Some(true), 200, true),
+        (
+            url,
+            ("Bilibili.url", "public.url", 0),
+            Some(true),
+            200,
+            true,
+        ),
+        (url, webloc, Some(false), 403, true),
+        (url, webloc, None, 403, false),
+        ("bilibili://video/1", webloc, Some(true), 403, false),
+        (
+            "https://user:password@example.invalid/",
+            webloc,
+            Some(true),
+            403,
+            false,
+        ),
+        (
+            url,
+            ("Bilibili.webloc", "com.apple.web-internet-location", 42),
+            Some(true),
+            400,
+            false,
+        ),
+        (
+            url,
+            ("attachment.txt", "public.url", 0),
+            Some(true),
+            400,
+            false,
+        ),
+    ] {
+        let body = plist::to_bytes(&Value::Dict(Dict::from([
+            (
+                "TransferType".into(),
+                Value::Dict(Dict::from([("links".into(), Value::Dict(Dict::new()))])),
+            ),
+            ("Items".into(), Value::Array(vec![item.into()])),
+            (
+                "Files".into(),
+                Value::Array(vec![Value::Dict(Dict::from([
+                    ("FileName".into(), name.into()),
+                    ("FileBomPath".into(), format!("./{name}").into()),
+                    ("FileSize".into(), Value::Integer(file_size)),
+                    ("FileType".into(), file_type.into()),
+                ]))]),
+            ),
+        ])));
+        let head = http::post_head("/Ask", &[("Content-Length", &body.len().to_string())]);
+        let options = ReceiverOptions::new("receiver", "Windows", &destination).with_accept_all();
+        let mut core = ReceiverCore::new(options);
+        let prompted = Arc::new(AtomicBool::new(false));
+        if let Some(decision) = decision {
+            let seen = Arc::clone(&prompted);
+            core = core.with_decision(move |transfer| {
+                seen.store(true, Ordering::Release);
+                assert!(transfer.files.is_empty());
+                assert_eq!(transfer.urls, [url]);
+                assert!(transfer.sender_certificate_sha256.is_some());
+                assert!(transfer.file_offer_certificate().is_none());
+                decision
+            });
+        }
+        let (peer, worker) = start(Arc::new(core), &receiver);
+        let mut tls = client_with_identity(peer.service.address, Some(&sender));
+        tls.write_all(&head).unwrap();
+        tls.write_all(&body).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, status);
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        drop(tls);
+        let events = worker.join().unwrap().unwrap();
+        assert_eq!(prompted.load(Ordering::Acquire), expected_prompt);
+        if status == 200 {
+            assert!(
+                matches!(events.last(), Some(ReceiverEvent::Received { transfer, files })
+                if files.is_empty() && transfer.urls == [url])
+            );
+        } else {
+            assert!(matches!(
+                events.last(),
+                Some(ReceiverEvent::Rejected { .. })
+            ));
+        }
+        assert!(!destination.exists());
     }
 }
 

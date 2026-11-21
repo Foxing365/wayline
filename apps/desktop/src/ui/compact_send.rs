@@ -27,7 +27,7 @@ impl Capsule {
                         ("compact-send-layout", text.send_layout_compact, true),
                     ]
                     .map(|(id, label, compact)| {
-                        button(id, label, self.saved_compact_send_view == compact)
+                        button(id, label, self.compact_send_view == compact)
                             .h(px(32.))
                             .min_w_0()
                             .flex_1()
@@ -39,25 +39,73 @@ impl Capsule {
                     }),
                 ),
             )
-            .when(
-                self.saved_compact_send_view != self.compact_send_view,
-                |panel| {
-                    panel.child(
+            .into_any_element()
+    }
+
+    pub(super) fn send_layout_refresh_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let text = self.language.strings();
+        let layout = if self.pending_send_layout == Some(true) {
+            text.send_layout_compact
+        } else {
+            text.send_layout_classic
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .rounded(px(14.))
+                    .bg(rgb(SURFACE))
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(layout),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
                             .text_color(rgb(MUTED))
                             .whitespace_normal()
-                            .child(text.send_layout_restart_hint),
+                            .child(text.send_layout_refresh_hint),
                     )
-                },
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                button("cancel-send-layout-refresh", text.cancel, false)
+                                    .flex_1()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_send_layout_refresh(cx)
+                                    })),
+                            )
+                            .child(
+                                button("apply-send-layout-refresh", text.send_layout_refresh, true)
+                                    .flex_1()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.refresh_send_layout(window, cx)
+                                    })),
+                            ),
+                    ),
             )
             .into_any_element()
     }
 
     pub(super) fn compact_send_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
-        let ready = self.model.phase == Phase::Ready;
-        let mut sheet = div()
+        if self.model.phase != Phase::Ready {
+            return self.compact_transfer_card(cx);
+        }
+        let sheet = div()
             .flex_1()
             .min_h_0()
             .w_full()
@@ -109,45 +157,40 @@ impl Capsule {
                 )
                 .into_any_element();
         }
-        sheet = sheet.child(self.compact_file_summary(ready, cx));
-        if ready {
-            sheet = sheet
-                .child(
-                    div()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(4.))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(text.send_to_nearby),
-                        )
-                        .child(
-                            div()
-                                .id("compact-refresh")
-                                .flex_shrink_0()
-                                .py(px(3.))
-                                .px(px(4.))
-                                .text_size(px(10.))
-                                .text_color(rgb(SEND_ACCENT))
-                                .when(!self.model.scanning, |item| item.cursor_pointer())
-                                .child(if self.model.scanning {
-                                    text.searching
-                                } else {
-                                    text.search_again
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.scan(cx))),
-                        ),
-                )
-                .child(self.compact_device_grid(cx));
-        } else {
-            sheet = sheet.child(self.compact_transfer_card(cx));
-        }
         sheet
+            .child(self.compact_file_summary(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(text.send_to_nearby),
+                    )
+                    .child(
+                        div()
+                            .id("compact-refresh")
+                            .flex_shrink_0()
+                            .py(px(3.))
+                            .px(px(4.))
+                            .text_size(px(10.))
+                            .text_color(rgb(SEND_ACCENT))
+                            .when(!self.model.scanning, |item| item.cursor_pointer())
+                            .child(if self.model.scanning {
+                                text.searching
+                            } else {
+                                text.search_again
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.scan(cx))),
+                    ),
+            )
+            .child(self.compact_device_grid(cx))
             .children(
                 self.model
                     .error
@@ -157,7 +200,7 @@ impl Capsule {
             .into_any_element()
     }
 
-    fn compact_file_summary(&self, ready: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn compact_file_summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let text = self.language.strings();
         let title = if self.model.files.len() == 1 {
             self.model.files[0]
@@ -194,51 +237,47 @@ impl Capsule {
                             .text_color(rgb(SEND_MUTED))
                             .child(file_size(self.model.bytes)),
                     )
-                    .when(ready, |row| {
-                        row.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(8.))
-                                .text_size(px(10.))
-                                .child(
-                                    div()
-                                        .id("compact-open-file")
-                                        .text_color(rgb(if can_open {
-                                            SEND_ACCENT
-                                        } else {
-                                            SEND_MUTED
-                                        }))
-                                        .when(can_open, |button| button.cursor_pointer())
-                                        .child(if self.opening_files.is_some() {
-                                            text.open_in_progress
-                                        } else if self.model.files.len() > 1 {
-                                            text.open_all
-                                        } else {
-                                            text.open_file
-                                        })
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.open_files(cx)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("compact-replace-files")
-                                        .cursor_pointer()
-                                        .text_color(rgb(SEND_ACCENT))
-                                        .child(if self.picker_open {
-                                            text.selecting
-                                        } else if self.model.validating {
-                                            text.reading_short
-                                        } else {
-                                            text.replace_files
-                                        })
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.choose(window, cx)
-                                        })),
-                                ),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .text_size(px(10.))
+                            .child(
+                                div()
+                                    .id("compact-open-file")
+                                    .text_color(rgb(if can_open {
+                                        SEND_ACCENT
+                                    } else {
+                                        SEND_MUTED
+                                    }))
+                                    .when(can_open, |button| button.cursor_pointer())
+                                    .child(if self.opening_files.is_some() {
+                                        text.open_in_progress
+                                    } else if self.model.files.len() > 1 {
+                                        text.open_all
+                                    } else {
+                                        text.open_file
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_files(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("compact-replace-files")
+                                    .cursor_pointer()
+                                    .text_color(rgb(SEND_ACCENT))
+                                    .child(if self.picker_open {
+                                        text.selecting
+                                    } else if self.model.validating {
+                                        text.reading_short
+                                    } else {
+                                        text.replace_files
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.choose(window, cx)),
+                                    ),
+                            ),
+                    ),
             )
     }
 
@@ -341,24 +380,33 @@ impl Capsule {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(10.))
             .child(
                 div()
                     .id("compact-transfer-scroll")
                     .flex_1()
                     .min_h_0()
+                    .flex()
+                    .flex_col()
                     .visible_scrollbar()
                     .child(self.send_readout()),
+            )
+            .children(
+                self.model
+                    .error
+                    .as_deref()
+                    .map(|error| self.compact_send_error(error)),
             )
             .child(
                 div().flex().flex_shrink_0().justify_end().child(
                     div()
                         .id("compact-transfer-action")
-                        .rounded(px(7.))
-                        .bg(rgb(0xeaf1fa))
-                        .px(px(9.))
-                        .py(px(5.))
-                        .text_size(px(11.))
+                        .rounded(px(10.))
+                        .bg(rgb(0xe6eef9))
+                        .px(px(17.))
+                        .py(px(8.))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(SEND_ACCENT))
                         .when(!cancelling, |action| {
                             action

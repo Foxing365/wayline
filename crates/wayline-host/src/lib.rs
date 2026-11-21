@@ -1,6 +1,13 @@
 //! Shared host preferences and identity. UI and command-line overrides never persist implicitly.
 mod advertisement;
 pub use advertisement::{ReceiverAdvertisement, receiver_advertisement};
+#[cfg(windows)]
+mod apple_identity;
+#[cfg(windows)]
+pub use apple_identity::{
+    has_apple_airdrop_identity, import_apple_airdrop_identity, load_apple_airdrop_identity,
+    remove_apple_airdrop_identity,
+};
 mod transfer_history;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value};

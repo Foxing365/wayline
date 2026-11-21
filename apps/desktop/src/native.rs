@@ -40,6 +40,7 @@ pub enum Action {
     DropHover(bool),
     FilesPicked(Result<Option<Vec<PathBuf>>, String>),
     DownloadDirectoryChosen(Result<Option<PathBuf>, String>),
+    AppleIdentityDirectoryChosen(Result<Option<PathBuf>, String>),
     FilesOpened(u64, Result<(), String>),
     HistoryFolderOpened(Result<(), String>),
     HistoryFileOpened(Result<(), String>),
@@ -430,6 +431,20 @@ impl Shell {
                 let _ = tx.send(Action::DownloadDirectoryChosen(result));
             })
             .context("启动接收保存目录选择器失败")?;
+        Ok(())
+    }
+
+    pub fn choose_apple_identity_directory(&self) -> Result<()> {
+        let owner = self.hwnd.0 as usize;
+        let language = crate::i18n::current();
+        let tx = ACTIONS.get().unwrap().clone();
+        std::thread::Builder::new()
+            .name("wayline-apple-identity-picker".into())
+            .spawn(move || {
+                let result = crate::picker::choose_apple_identity_directory(owner, language)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(Action::AppleIdentityDirectoryChosen(result));
+            })?;
         Ok(())
     }
 

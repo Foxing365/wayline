@@ -1,5 +1,6 @@
 //! Application lifecycle and blocking Windows workers around Owly's receiver.
 use crate::{
+    airdrop::web_url,
     mdns::{MdnsResponder, NetworkInterface},
     IncomingTransfer, TransferFailureKind,
 };
@@ -10,6 +11,7 @@ use owly_airdrop::{
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     io::{self, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
@@ -90,7 +92,7 @@ pub enum ReceiverEvent {
     Rejected {
         path: String,
         status: u16,
-        reason: &'static str,
+        reason: Cow<'static, str>,
     },
 }
 
@@ -297,6 +299,11 @@ impl ReceiverCore {
                         Event::Ask(ask) => {
                             awaiting_ask_body = false;
                             let mut transfer = IncomingTransfer::from_ask(&ask);
+                            let supported_link_items = !ask.has_link_metadata
+                                || transfer
+                                    .urls
+                                    .iter()
+                                    .all(|item| item.lines().any(|line| web_url(line).is_some()));
                             transfer.sender_certificate_sha256 = tls
                                 .conn
                                 .peer_certificates()
@@ -311,10 +318,11 @@ impl ReceiverCore {
                                 transfer.files.len(),
                             ));
                             let before = Instant::now();
-                            let accepted = core
-                                .decide
-                                .as_ref()
-                                .map_or(core.options.accept_all, |decide| decide(&transfer))
+                            let accepted = supported_link_items
+                                && core.decide.as_ref().map_or(
+                                    core.options.accept_all && !ask.has_link_metadata,
+                                    |decide| decide(&transfer),
+                                )
                                 && before.elapsed() < core.options.decision_timeout;
                             incoming = Some(transfer.clone());
                             if accepted {
@@ -332,7 +340,12 @@ impl ReceiverCore {
                                 notify(ReceiverEvent::Rejected {
                                     path: "/Ask".into(),
                                     status: 403,
-                                    reason: "offer declined by the receiver",
+                                    reason: if supported_link_items {
+                                        "offer declined by the receiver"
+                                    } else {
+                                        "link metadata offer contains an item without a supported web URL"
+                                    }
+                                    .into(),
                                 });
                             }
                         }

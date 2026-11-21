@@ -535,6 +535,7 @@ mod tests {
     fn receiver(instance: &str) -> NearbyReceiver {
         NearbyReceiver {
             name: "iPhone".into(),
+            receiver_certificate_sha256: None,
             service: wayline_core::AirDropService {
                 instance: instance.into(),
                 host: "phone.local".into(),
@@ -551,6 +552,7 @@ mod tests {
             files: vec!["photo.png".into()],
             status: Some(Ok(crate::backend::LinkStatus {
                 rtl8821cu_width_mhz: None,
+                rtl8821cu_startup: None,
                 state: "running".into(),
                 port: None,
                 channel: 6,

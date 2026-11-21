@@ -90,7 +90,15 @@ impl Config {
 /// `POST /Discover` with an empty dictionary, which is what every sender
 /// known to work with iOS 18 sends (§6.3).
 pub fn discover_request() -> Vec<u8> {
-    plist_request(Path::Discover, &DiscoverRequest::default().to_plist())
+    discover_request_with_record(None)
+}
+
+pub fn discover_request_with_record(sender_record: Option<&[u8]>) -> Vec<u8> {
+    let request = DiscoverRequest {
+        sender_record: sender_record.map(<[u8]>::to_vec),
+        ..DiscoverRequest::default()
+    };
+    plist_request(Path::Discover, &request.to_plist())
 }
 
 /// A receiver that answered `/Discover`.
@@ -117,6 +125,15 @@ pub fn parse_discover_response(response: &Response) -> Option<Receiver> {
 
 /// The `/Ask` for an offer, in the iOS 18 shape (ASK-7).
 pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8> {
+    ask_request_with_record(config, transfer_id, offer, None)
+}
+
+fn ask_request_with_record(
+    config: &Config,
+    transfer_id: &str,
+    offer: &Offer,
+    sender_record: Option<&[u8]>,
+) -> Vec<u8> {
     let request = AskRequest {
         transfer_id: Some(transfer_id.into()),
         transfer_type: None,
@@ -124,9 +141,10 @@ pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8>
         sender_model_name: config.model_name.clone(),
         sender_id: config.sender_id.clone(),
         bundle_id: config.bundle_id.clone(),
-        sender_record: None,
+        sender_record: sender_record.map(<[u8]>::to_vec),
         file_icon: None,
         offer: offer.clone(),
+        has_link_metadata: false,
         described: String::new(),
     };
     plist_request(Path::Ask, &request.to_plist())
@@ -347,6 +365,16 @@ impl Transfer {
         offer: &Offer,
         upload: Option<(Compressor, u64)>,
     ) -> Self {
+        Self::new_with_record(config, transfer_id, offer, upload, None)
+    }
+
+    pub fn new_with_record(
+        config: &Config,
+        transfer_id: &str,
+        offer: &Offer,
+        upload: Option<(Compressor, u64)>,
+        sender_record: Option<&[u8]>,
+    ) -> Self {
         let is_url = matches!(offer, Offer::Urls(_));
         let upload_head = match (offer, upload) {
             (Offer::Files(files), Some((compressor, len))) => {
@@ -366,7 +394,12 @@ impl Transfer {
             _ => None,
         };
         let actions = VecDeque::from([
-            Action::Transmit(ask_request(config, transfer_id, offer)),
+            Action::Transmit(ask_request_with_record(
+                config,
+                transfer_id,
+                offer,
+                sender_record,
+            )),
             Action::SetTimer(Some(config.ask_timeout)),
         ]);
         Transfer {
@@ -523,6 +556,42 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(["/Discover", "/Ask", "/Upload"].contains(&head.target.as_str()));
+        }
+    }
+
+    #[test]
+    fn passes_a_signed_record_in_discover_and_ask_only_when_supplied() {
+        let config = Config::new("Test", "0123456789ab");
+        let record = [0x30, 0x44, 0x12];
+        for selected in [None, Some(record.as_slice())] {
+            let discover = discover_request_with_record(selected);
+            let (_, bytes) = http::parse_request(&discover, &http::Limits::default())
+                .unwrap()
+                .unwrap();
+            let value = plist::from_bytes(&discover[bytes..], &plist::Limits::default()).unwrap();
+            assert_eq!(
+                DiscoverRequest::from_plist(&value)
+                    .unwrap()
+                    .sender_record
+                    .as_deref(),
+                selected
+            );
+            let mut transfer =
+                Transfer::new_with_record(&config, "ID", &file_offer(), None, selected);
+            let Some(Action::Transmit(ask)) = transfer.poll() else {
+                panic!("an offer should start with an Ask request");
+            };
+            let (_, bytes) = http::parse_request(&ask, &http::Limits::default())
+                .unwrap()
+                .unwrap();
+            let value = plist::from_bytes(&ask[bytes..], &plist::Limits::default()).unwrap();
+            assert_eq!(
+                AskRequest::from_plist(&value)
+                    .unwrap()
+                    .sender_record
+                    .as_deref(),
+                selected
+            );
         }
     }
 

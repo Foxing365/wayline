@@ -1,5 +1,8 @@
 //! Application-facing sender adapter for Owly's AirDrop state machine.
-use crate::{AirDropService, Identity, NetworkInterface, SendCancellation, TransferFailureKind};
+use crate::{
+    AirDropService, AppleSenderIdentity, Identity, NetworkInterface, SendCancellation,
+    SenderIdentity, TransferFailureKind,
+};
 use owly_airdrop::{
     driver::sender::prepare_cancellable,
     proto::{
@@ -8,6 +11,7 @@ use owly_airdrop::{
     },
 };
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
@@ -54,6 +58,7 @@ pub enum SendEvent {
 pub struct NearbyReceiver {
     pub name: String,
     pub service: AirDropService,
+    pub receiver_certificate_sha256: Option<[u8; 32]>,
 }
 #[derive(Debug)]
 pub struct SendError {
@@ -151,6 +156,24 @@ pub fn send_to_receiver_cancellable(
     files: &[PathBuf],
     options: &SendOptions,
     cancel: &SendCancellation,
+    notify: impl FnMut(SendEvent),
+) -> Result<SendReport, SendError> {
+    send_to_receiver_cancellable_with_identity(
+        selected,
+        identity.into(),
+        files,
+        options,
+        cancel,
+        notify,
+    )
+}
+
+pub fn send_to_receiver_cancellable_with_identity(
+    selected: &NearbyReceiver,
+    identity: SenderIdentity<'_>,
+    files: &[PathBuf],
+    options: &SendOptions,
+    cancel: &SendCancellation,
     mut notify: impl FnMut(SendEvent),
 ) -> Result<SendReport, SendError> {
     use wayline_board::{Phase, Reason, Tracker};
@@ -163,9 +186,22 @@ pub fn send_to_receiver_cancellable(
     let result = (|| {
         cancel.check()?;
         let source_bytes = validate_files(files)?;
+        let client = if let Some(apple) = identity.apple {
+            let expected = selected.receiver_certificate_sha256.ok_or_else(|| {
+                SendError::invalid(
+                    "find the receiver again using the Apple AirDrop identity before sending",
+                )
+            })?;
+            apple.pinned_client_config(expected)?
+        } else {
+            client_config(None)?
+        };
         #[cfg(windows)]
         let _advert = if options.ble_wake {
-            Some(crate::ble::AirDropAdvert::start(options.legacy_ble)?)
+            Some(crate::ble::AirDropAdvert::start_with_identity(
+                options.legacy_ble,
+                identity.apple,
+            )?)
         } else {
             None
         };
@@ -191,7 +227,7 @@ pub fn send_to_receiver_cancellable(
             Compressor::Gzip
         };
         let (offer, mut archive, len) = prepare_cancellable(files, compressor, &|| cancel.check())?;
-        let mut cfg = proto::Config::new(&options.sender_name, identity.service_id());
+        let mut cfg = proto::Config::new(&options.sender_name, identity.local.service_id());
         cfg.model_name = options.sender_model.clone();
         cfg.ask_timeout = options.timeout.max(Duration::from_secs(65));
         let mut id = [0; 16];
@@ -207,8 +243,13 @@ pub fn send_to_receiver_cancellable(
             &hex[16..20],
             &hex[20..]
         );
-        let mut transfer = Transfer::new(&cfg, &id, &offer, Some((compressor, len)));
-        let client = client_config()?;
+        let mut transfer = Transfer::new_with_record(
+            &cfg,
+            &id,
+            &offer,
+            Some((compressor, len)),
+            identity.apple.map(AppleSenderIdentity::record),
+        );
         let mut tls = connect(selected.service.address, &client, options.timeout, cancel)?;
         event(SendEvent::WaitingForAcceptance {
             receiver: selected.name.clone(),
@@ -389,8 +430,13 @@ fn select_format(requested: SendFormat, receiver_flags: Option<u32>) -> SendForm
     }
 }
 
-pub(crate) fn client_config() -> Result<Arc<ClientConfig>, SendError> {
+pub(crate) fn client_config(
+    identity: Option<&AppleSenderIdentity>,
+) -> Result<Arc<ClientConfig>, SendError> {
     crate::tls::install_provider();
+    if let Some(identity) = identity {
+        return Ok(identity.client_config()?);
+    }
     // AirDrop's Everyone mode accepts a sender without a TLS client
     // certificate. Some iPhones refuse the generated Windows certificate.
     Ok(owly_airdrop::driver::tls::client_config(None)?)
@@ -436,11 +482,24 @@ fn connect(
 pub(crate) fn discover(
     service: &AirDropService,
     client: &Arc<ClientConfig>,
+    sender_record: Option<&[u8]>,
     timeout: Duration,
     cancel: &SendCancellation,
-) -> Result<Option<String>, SendError> {
+) -> Result<Option<NearbyReceiver>, SendError> {
     let mut tls = connect(service.address, client, timeout, cancel)?;
-    tls.write_all(&proto::discover_request())?;
+    let receiver_certificate_sha256 = if sender_record.is_some() {
+        let leaf = tls
+            .conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .ok_or_else(|| {
+                SendError::invalid("Apple AirDrop receiver did not provide a sharing certificate")
+            })?;
+        Some(Sha256::digest(leaf).into())
+    } else {
+        None
+    };
+    tls.write_all(&proto::discover_request_with_record(sender_record))?;
     tls.flush()?;
     let mut parser = ResponseReader::new();
     let mut buf = [0; 16384];
@@ -467,7 +526,13 @@ pub(crate) fn discover(
         }
         .map_err(|e| SendError::invalid(e.to_string()))?;
         if let Some(response) = response {
-            return Ok(proto::parse_discover_response(&response).map(|r| r.computer_name));
+            return Ok(
+                proto::parse_discover_response(&response).map(|r| NearbyReceiver {
+                    name: r.computer_name,
+                    service: service.clone(),
+                    receiver_certificate_sha256,
+                }),
+            );
         }
     }
 }

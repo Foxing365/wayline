@@ -1,4 +1,5 @@
-//! RTL8821CU channel requests and confirmations in a service-owned per-child directory.
+//! RTL8821CU channel control and startup checkpoints in a service-owned per-child directory.
+use crate::protocol::Rtl8821cuStartupPhase;
 use std::{
     ffi::OsString,
     fs, io,
@@ -25,6 +26,7 @@ use windows_sys::Win32::{
 pub const CONTROL_DIR_ENV: &str = "WAYLINE_BRIDGE_CHANNEL_DIR";
 pub const REQUESTED: &str = "requested";
 pub const READY: &str = "ready";
+const STARTUP_PHASE: &str = "startup-phase";
 
 pub(crate) struct PrivateDirectory(PathBuf);
 
@@ -103,7 +105,7 @@ impl PrivateDirectory {
 
 impl Drop for PrivateDirectory {
     fn drop(&mut self) {
-        for name in [REQUESTED, READY] {
+        for name in [REQUESTED, READY, STARTUP_PHASE] {
             let _ = fs::remove_file(self.0.join(name));
         }
         let _ = fs::remove_dir(&self.0);
@@ -149,29 +151,73 @@ fn create_directory(path: &Path) -> io::Result<()> {
 }
 
 pub fn read(path: &Path) -> io::Result<Option<u8>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    match bytes.as_slice() {
-        [channel @ (6 | 44 | 149)] => Ok(Some(*channel)),
-        _ => Err(io::Error::new(
+    match read_byte(path)? {
+        None => Ok(None),
+        Some(channel @ (6 | 44 | 149)) => Ok(Some(channel)),
+        Some(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid RTL8821CU channel record",
         )),
     }
 }
 
+fn read_byte(path: &Path) -> io::Result<Option<u8>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match bytes.as_slice() {
+        [byte] => Ok(Some(*byte)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid RTL8821CU control record",
+        )),
+    }
+}
+
 pub fn publish(path: &Path, channel: u8) -> io::Result<()> {
+    publish_byte(path, channel)
+}
+
+/// Store one observed bridge checkpoint. Only the service can declare readiness.
+pub fn publish_startup_phase(dir: &Path, phase: Rtl8821cuStartupPhase) -> io::Result<()> {
+    let code = match phase {
+        Rtl8821cuStartupPhase::UsbHelperInitialization => 1,
+        Rtl8821cuStartupPhase::HelloVerification => 2,
+        Rtl8821cuStartupPhase::WintunSetup => 3,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "phase must be a bridge startup checkpoint",
+            ));
+        }
+    };
+    publish_byte(&dir.join(STARTUP_PHASE), code)
+}
+
+pub(crate) fn read_startup_phase(dir: &Path) -> io::Result<Option<Rtl8821cuStartupPhase>> {
+    match read_byte(&dir.join(STARTUP_PHASE))? {
+        None => Ok(None),
+        Some(1) => Ok(Some(Rtl8821cuStartupPhase::UsbHelperInitialization)),
+        Some(2) => Ok(Some(Rtl8821cuStartupPhase::HelloVerification)),
+        Some(3) => Ok(Some(Rtl8821cuStartupPhase::WintunSetup)),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid RTL8821CU startup checkpoint",
+        )),
+    }
+}
+
+fn publish_byte(path: &Path, value: u8) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "channel record needs a directory",
+            "control record needs a directory",
         )
     })?;
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    temp.write_all(&[channel])?;
+    temp.write_all(&[value])?;
     temp.persist(path).map_err(|failure| failure.error)?;
     Ok(())
 }
@@ -186,6 +232,36 @@ mod tests {
         },
         DACL_SECURITY_INFORMATION,
     };
+
+    #[test]
+    fn startup_checkpoints_are_isolated_to_their_child_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("radio-one");
+        let next = temp.path().join("radio-two");
+        create_directory(&dir).unwrap();
+        create_directory(&next).unwrap();
+
+        let dir = PrivateDirectory(dir);
+        let next = PrivateDirectory(next);
+        assert_eq!(read_startup_phase(dir.path()).unwrap(), None);
+        for phase in [
+            Rtl8821cuStartupPhase::UsbHelperInitialization,
+            Rtl8821cuStartupPhase::HelloVerification,
+            Rtl8821cuStartupPhase::WintunSetup,
+        ] {
+            publish_startup_phase(dir.path(), phase).unwrap();
+            assert_eq!(read_startup_phase(dir.path()).unwrap(), Some(phase));
+            assert_eq!(read_startup_phase(next.path()).unwrap(), None);
+        }
+        assert!(publish_startup_phase(dir.path(), Rtl8821cuStartupPhase::Ready).is_err());
+        assert_eq!(read(&dir.path().join(READY)).unwrap(), None);
+        fs::write(dir.path().join(STARTUP_PHASE), [100]).unwrap();
+        assert!(read_startup_phase(dir.path()).is_err());
+
+        let dropped = dir.path().to_owned();
+        drop(dir);
+        assert!(!dropped.exists());
+    }
 
     #[test]
     fn channel_directory_gets_only_the_protected_service_acl() {

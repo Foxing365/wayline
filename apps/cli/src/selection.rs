@@ -59,6 +59,7 @@ mod tests {
         let receivers: Vec<_> = (1..=2)
             .map(|i| NearbyReceiver {
                 name: "iPhone".into(),
+                receiver_certificate_sha256: None,
                 service: AirDropService {
                     instance: format!("{i}._airdrop._tcp.local"),
                     host: format!("{i}.local"),

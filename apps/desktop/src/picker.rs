@@ -65,8 +65,35 @@ pub fn choose(owner: usize, language: Language) -> Result<Option<Vec<PathBuf>>> 
 }
 
 pub fn choose_directory(owner: usize, language: Language) -> Result<Option<PathBuf>> {
-    let _apartment = Apartment::new()?;
     let text = language.strings();
+    choose_directory_with_labels(
+        owner,
+        text.picker_directory_title,
+        text.picker_directory_ok,
+        0x9628bd75_7d80_42de_b44d_e0304c159d90,
+    )
+}
+
+pub fn choose_apple_identity_directory(
+    owner: usize,
+    language: Language,
+) -> Result<Option<PathBuf>> {
+    let text = language.strings();
+    choose_directory_with_labels(
+        owner,
+        text.apple_identity_picker,
+        text.apple_identity_import,
+        0x40b16ac6_1ee5_4fea_88c1_70930190bb6f,
+    )
+}
+
+fn choose_directory_with_labels(
+    owner: usize,
+    title: &str,
+    label: &str,
+    picker_id: u128,
+) -> Result<Option<PathBuf>> {
+    let _apartment = Apartment::new()?;
     // SAFETY: this worker owns its STA and all COM interfaces stay on this thread,
     // dropping before Apartment uninitializes COM. Windows borrows the owner HWND
     // only for the modal dialog; no GPUI state crosses threads. Shell-allocated
@@ -82,11 +109,9 @@ pub fn choose_directory(owner: usize, language: Language) -> Result<Option<PathB
                 | FOS_NOCHANGEDIR
                 | FOS_DONTADDTORECENT,
         )?;
-        dialog.SetTitle(&windows::core::HSTRING::from(text.picker_directory_title))?;
-        dialog.SetOkButtonLabel(&windows::core::HSTRING::from(text.picker_directory_ok))?;
-        dialog.SetClientGuid(&windows::core::GUID::from_u128(
-            0x9628bd75_7d80_42de_b44d_e0304c159d90,
-        ))?;
+        dialog.SetTitle(&windows::core::HSTRING::from(title))?;
+        dialog.SetOkButtonLabel(&windows::core::HSTRING::from(label))?;
+        dialog.SetClientGuid(&windows::core::GUID::from_u128(picker_id))?;
         // Keep folder-picker history separate from the send-file dialog.
         if let Ok(folder) = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None) {
             let item = SHCreateItemFromParsingName::<_, _, IShellItem>(folder, None);

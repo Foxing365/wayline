@@ -95,8 +95,8 @@ fn integration() {
         .unwrap()
         .block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                checks::run().await;
                 checks::usb_leases_ignore_esp32_recovery_marker().await;
+                checks::run().await;
             })
             .await
             .expect("integration suite timed out");
@@ -163,12 +163,34 @@ mod checks {
             },
         ));
         initialized.await.unwrap();
+        let applying = client.clone();
+        let configured = tokio::task::spawn_blocking(move || {
+            applying.set_radio_and_wait(44, Some(40), Duration::from_secs(3))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(configured.state, "stopped");
+        assert_eq!(configured.channel, 44);
+        assert_eq!(configured.rtl8821cu_width_mhz, Some(40));
+
         assert!(client
             .acquire_async(SessionKind::Maintenance)
             .await
             .is_err());
         let send = client.acquire_async(SessionKind::Send).await.unwrap();
         let receive = client.acquire_async(SessionKind::Receive).await.unwrap();
+        let applying = client.clone();
+        let denied = tokio::task::spawn_blocking(move || {
+            applying.set_radio_and_wait(149, Some(80), Duration::from_secs(3))
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(denied.to_string().contains("radio is busy"));
+        let persisted = Config::load(&dir.path().join("config.json")).unwrap();
+        assert_eq!((persisted.channel, persisted.rtl8821cu_width_mhz), (44, 40));
+
         assert!(!send.release_async().await.unwrap().service_stopping);
         assert!(receive.release_async().await.unwrap().service_stopping);
         running.await.unwrap().unwrap();
@@ -405,7 +427,18 @@ mod checks {
 
         // Controlled crash on the next start, then recover after the retry delay.
         fs::write(dir.path().join("crash"), b"42").unwrap();
-        request(&pipe, json!({"cmd":"set","port":"com125","channel":6})).await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let reply = request(&pipe, json!({"cmd":"set","port":"com125","channel":6})).await;
+            match reply.error {
+                None => break,
+                Some(error) if error.contains("radio is busy") && Instant::now() < deadline => {
+                    // The child records its launch before the supervisor clears reconfiguration.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Some(error) => panic!("cannot schedule the crash fixture: {error}"),
+            }
+        }
         let crashed = started(dir.path(), 3).await;
         state(&pipe, "error").await;
         assert_exited(&crashed);

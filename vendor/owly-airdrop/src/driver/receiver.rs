@@ -317,7 +317,7 @@ impl Task {
                     }
                     Event::AskStarted => tracing::debug!("received /Ask headers"),
                     Event::AskRejected { status, reason } => {
-                        tracing::debug!(status, reason, "rejected /Ask before consent");
+                        tracing::debug!(status, reason = %reason, "rejected /Ask before consent");
                     }
                     Event::Ask(ask) => {
                         tracing::debug!(

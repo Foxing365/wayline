@@ -1,7 +1,7 @@
 //! Bounded JSON-line control client shared by desktop and CLI.
 use crate::{
-    config::{validate_rtl8821cu_width, SET_RTL8821CU_WIDTH},
-    protocol::{Request, Status},
+    config::{validate_rtl8821cu_width, validate_rtl8821cu_width_on_channel, SET_RTL8821CU_WIDTH},
+    protocol::{Request, Status, SET_RADIO},
 };
 use std::{
     fmt,
@@ -132,14 +132,54 @@ impl Client {
         width_mhz: u16,
         timeout: Duration,
     ) -> Result<Status, ClientError> {
-        let mut status = self.set_rtl8821cu_width(width_mhz)?;
-        let deadline = Instant::now() + timeout;
+        let status = self.set_rtl8821cu_width(width_mhz)?;
+        self.wait_for_rtl8821cu(status, None, width_mhz, timeout)
+    }
+
+    pub fn set_radio_and_wait(
+        &self,
+        channel: u16,
+        rtl8821cu_width_mhz: Option<u16>,
+        timeout: Duration,
+    ) -> Result<Status, ClientError> {
+        let Some(width_mhz) = rtl8821cu_width_mhz else {
+            return self.set_channel_and_wait(channel, timeout);
+        };
+        if !matches!(channel, 6 | 44 | 149) {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "channel must be 6, 44 or 149",
+            ));
+        }
+        validate_rtl8821cu_width_on_channel(width_mhz, channel)
+            .map_err(|error| ClientError::new(ClientErrorKind::InvalidRequest, error))?;
+        let mut request = Request::new(SET_RADIO);
+        request.channel = Some(channel);
+        request.rtl8821cu_width_mhz = Some(width_mhz);
+        let status = self.request(&request)?;
+        self.wait_for_rtl8821cu(status, Some(channel), width_mhz, timeout)
+    }
+
+    fn wait_for_rtl8821cu(
+        &self,
+        mut status: Status,
+        channel: Option<u16>,
+        width_mhz: u16,
+        timeout: Duration,
+    ) -> Result<Status, ClientError> {
+        let started = Instant::now();
+        let requested = match channel {
+            Some(channel) => format!("channel {channel} at {width_mhz} MHz"),
+            None => format!("{width_mhz} MHz"),
+        };
         loop {
-            if status.rtl8821cu_width_mhz != Some(width_mhz) {
+            if status.rtl8821cu_width_mhz != Some(width_mhz)
+                || channel.is_some_and(|channel| status.channel != channel)
+            {
                 return Err(ClientError::new(
                     ClientErrorKind::Service,
                     status.error.unwrap_or_else(|| {
-                        format!("RTL8821CU width changed before {width_mhz} MHz became ready")
+                        format!("RTL8821CU settings changed before {requested} became ready")
                     }),
                 ));
             }
@@ -158,10 +198,10 @@ impl Client {
                 // The preference was saved. Ready status will follow on service start.
                 return Ok(status);
             }
-            if Instant::now() >= deadline {
+            if started.elapsed() >= timeout {
                 return Err(ClientError::new(
                     ClientErrorKind::Timeout,
-                    format!("timed out waiting for RTL8821CU {width_mhz} MHz to become ready"),
+                    format!("timed out waiting for RTL8821CU {requested} to become ready"),
                 ));
             }
             thread::sleep(Duration::from_millis(250));
@@ -227,6 +267,12 @@ impl Client {
             let status: Status = read_json(&mut pipe).await?;
             if request.cmd != "status" {
                 if let Some(error) = &status.error {
+                    if request.cmd == SET_RADIO && error == "unknown command" {
+                        return Err(ClientError::new(
+                            ClientErrorKind::UpgradeRequired,
+                            "update Wayline desktop and service together to save channel and monitor width",
+                        ));
+                    }
                     return Err(ClientError::new(ClientErrorKind::Service, error));
                 }
             }
@@ -346,6 +392,7 @@ mod tests {
             port: Some("COM123".into()),
             channel: 6,
             rtl8821cu_width_mhz: None,
+            rtl8821cu_startup: None,
             target: Some("esp32s3".into()),
             awdl0: true,
             error: error.map(str::to_owned),
@@ -417,6 +464,26 @@ mod tests {
                 .kind(),
             ClientErrorKind::Service
         );
+    }
+    #[tokio::test]
+    async fn reports_old_service_before_applying_combined_radio_settings() {
+        let error = response(
+            status_bytes(Some("unknown command")),
+            Request::new(SET_RADIO),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::UpgradeRequired);
+        assert!(error.to_string().contains("desktop and service together"));
+        let busy = response(
+            status_bytes(Some("radio is busy")),
+            Request::new(SET_RADIO),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(busy.kind(), ClientErrorKind::Service);
     }
     #[tokio::test]
     async fn rejects_oversized_truncated_and_invalid_json() {

@@ -192,7 +192,8 @@ The unelevated UI and LocalSystem service use the same `wayline-desktop.exe`; di
 
 Launch acquires a service session. Tray Quit or `Ctrl+Q` cancels desktop's workers and releases
 its sessions; the last on-demand client waits for the Rust bridge reclamation before service shutdown.
-Closing the card hides it while work continues. Service registration is currently a manual
+The exit panel can hide while cleanup completes in the background. Closing the sharing card
+hides it while work continues. Service registration is currently a manual
 Windows operation while the Rust installer migration is in progress.
 Launch the UI normally so Explorer drag-and-drop works.
 
@@ -236,9 +237,10 @@ event, including a zero-byte event, and runs through final confirmation. Prepara
 for acceptance are excluded. History average speed divides transfer-stream bytes by this duration.
 The sharing card header provides Device firmware and Recent transfers icons.
 
-Pages, lists and long text use a shared scroll area. When content exceeds the viewport, a
-persistent proportional scrollbar supports the mouse wheel, thumb dragging and track clicks.
-Nested areas scroll the inner content first, then the outer area at its boundary. Bottom
+Pages, lists and long text use a shared scroll area. Mouse-wheel notches move content smoothly
+to the target offset. Precision input and Windows reduced-motion settings use direct scrolling.
+A persistent proportional scrollbar supports thumb dragging and track clicks. Nested areas
+scroll the inner content first, then the outer area at its boundary. Bottom
 actions remain fixed, including the history deletion confirmation's confirm and cancel buttons.
 
 Up to 200 records live separately in `%LOCALAPPDATA%\wayline\transfer-history.json`, written

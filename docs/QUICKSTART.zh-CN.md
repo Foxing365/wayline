@@ -28,6 +28,12 @@
 - 设置：可修改设备名称、接收目录和界面语言；语言使用下拉框选择，支持简体中文、繁體中文、English、日本語、한국어、Français、Deutsch 和 Español。名称与目录桌面和 CLI 共用。默认保存到下载目录的 `Wayline` 文件夹；更改目录不移动已有文件，接收期间不可更改。语言选择保存在本机并立即生效。
 - 错误详情：鼠标悬停提示可展开全文，点击“复制”获取完整诊断。
 
+### 向「仅限联系人」设备发送
+
+在桌面设置找到「发给『仅限联系人』」，选择包含自己已取得的 AirDrop 身份文件的文件夹。文件名为 `certificate.pem`、`key.pem`、`validation_record.cms`。分别放置证书链、与叶证书配对的未加密 PEM 私钥、Apple 签发的 DER 验证记录。每次运行要使用此身份时，勾选「本次运行使用 Apple 身份查找和发送」。接收方通讯录需包含验证记录对应的 Apple 账户邮箱或手机号。此功能目前为实验功能，实际发现和传输需按设备验证。[Apple 的 AirDrop 身份说明](https://support.apple.com/zh-cn/guide/security/sec2261183f4/web) · [Omdrop 身份文件说明](https://github.com/netmojo-systems/omdrop-plugin#your-airdrop-identity)
+
+Wayline 在当前 Windows 用户下使用 DPAPI 加密保存导入材料。「移除身份」删除应用保存的副本。现有的 AirDrop 身份须由用户提供，Apple 没有公开完整身份的常规导出步骤。Apple 设备显示的已验证联系人照片来自该设备的通讯录。
+
 × 或 Esc 隐藏卡片，接收继续运行。托盘“退出 Wayline”或 `Ctrl+Q` 结束本客户端任务；默认按需服务在最后一个客户端退出后回收无线设备，独立服务部署可以常驻。
 
 首次启动会注册文件右键菜单和“发送到 → Wayline AirDrop”。Windows 11 中通常位于“显示更多选项”。退出后运行 `wayline-desktop.exe --unregister-shell` 可移除入口。
