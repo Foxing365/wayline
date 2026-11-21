@@ -2,8 +2,9 @@
 //! (SEC-1–3, UP-7). They decide; the driver does the writing, inside a
 //! staging directory.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, hash_map::Entry as MapEntry};
 use std::fmt;
+use std::mem::size_of;
 
 use super::cpio::Entry;
 
@@ -17,6 +18,7 @@ pub struct RelPath(Vec<String>);
 /// Longest component and whole path accepted, in bytes.
 const MAX_COMPONENT: usize = 255;
 const MAX_PATH: usize = 1024;
+const MAX_TRACKED_PATH_BYTES: usize = 64 << 20;
 
 impl RelPath {
     /// Parses an archive name or `FileBomPath`: `./a/b` or `a/b`. Absolute
@@ -154,6 +156,7 @@ pub enum Error {
     /// A symlink, device, FIFO or socket, or a file with hard links (SEC-1).
     Unsupported(String),
     TooManyEntries,
+    TooManyPathBytes,
     TooLarge,
     BadRoot,
     Missing(String),
@@ -169,6 +172,7 @@ impl fmt::Display for Error {
                 write!(f, "archive entry {name:?} isn't a plain file or directory")
             }
             Error::TooManyEntries => f.write_str("archive has too many entries"),
+            Error::TooManyPathBytes => f.write_str("archive has too much path metadata"),
             Error::TooLarge => f.write_str("archive is too large"),
             Error::BadRoot => f.write_str("bad archive root entry"),
             Error::Missing(path) => write!(f, "offered item {path:?} is missing from the archive"),
@@ -196,8 +200,8 @@ pub struct Allowed {
 pub struct Rules {
     allowed: Vec<Allowed>,
     limits: Limits,
-    seen: HashSet<RelPath>,
-    written: HashSet<RelPath>,
+    seen: HashMap<RelPath, bool>,
+    path_bytes: usize,
     entries: u32,
     total: u64,
 }
@@ -207,8 +211,8 @@ impl Rules {
         Rules {
             allowed,
             limits,
-            seen: HashSet::new(),
-            written: HashSet::new(),
+            seen: HashMap::new(),
+            path_bytes: 0,
             entries: 0,
             total: 0,
         }
@@ -259,12 +263,17 @@ impl Rules {
         } else {
             return Err(Error::NotAsked(entry.name.clone()));
         };
-        if !self.seen.insert(path.clone()) {
+        // Bound the live index independently of the on-wire path lengths and
+        // count the storage for each component in a deep relative pathname.
+        let cost = size_of::<RelPath>() + path.0.len() * size_of::<String>() + entry.name.len();
+        let MapEntry::Vacant(slot) = self.seen.entry(path) else {
             return Err(Error::Duplicate(entry.name.clone()));
+        };
+        self.path_bytes += cost;
+        if self.path_bytes > MAX_TRACKED_PATH_BYTES {
+            return Err(Error::TooManyPathBytes);
         }
-        if !matches!(item, Item::Skip) {
-            self.written.insert(path);
-        }
+        slot.insert(!matches!(item, Item::Skip));
         self.total = self.total.saturating_add(entry.size);
         if self.total > self.limits.max_total {
             return Err(Error::TooLarge);
@@ -274,10 +283,12 @@ impl Rules {
 
     pub fn finish(&self) -> Result<(), Error> {
         for allowed in &self.allowed {
-            if !self
-                .written
-                .iter()
-                .any(|p| *p == allowed.path || allowed.is_directory && p.starts_with(&allowed.path))
+            if self.seen.get(&allowed.path) != Some(&true)
+                && !(allowed.is_directory
+                    && self
+                        .seen
+                        .iter()
+                        .any(|(path, written)| *written && path.starts_with(&allowed.path)))
             {
                 return Err(Error::Missing(allowed.path.to_string()));
             }

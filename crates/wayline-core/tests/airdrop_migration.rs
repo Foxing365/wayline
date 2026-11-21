@@ -806,6 +806,82 @@ fn tls_receive_publishes_both_top_level_files_from_one_offer() {
 }
 
 #[test]
+fn tls_receives_an_offered_directory_with_over_4096_entries() {
+    use owly_airdrop::proto::{
+        archive::{compress::Encoder, cpio},
+        messages::{AskFile, Offer},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let id = identity(root.path());
+    let destination = root.path().join("received");
+    let header = |name: &str, mode| {
+        cpio::odc_header(&cpio::Entry {
+            name: name.into(),
+            mode,
+            size: 0,
+            nlink: 1,
+            ino: 1,
+            uid: 501,
+            gid: 20,
+            mtime: 0,
+        })
+    };
+    let compressor = Compressor::DvZip;
+    let mut encoder = Encoder::new(compressor, flate2::Compression::fast());
+    let mut wire = encoder.write(&header(".", cpio::MODE_DIR | 0o755));
+    wire.extend(encoder.write(&header("./Folder", cpio::MODE_DIR | 0o755)));
+    for index in 0..4100 {
+        wire.extend(encoder.write(&header(
+            &format!("./Folder/part-{index:04}.txt"),
+            cpio::MODE_FILE | 0o644,
+        )));
+    }
+    wire.extend(encoder.write(&cpio::odc_trailer()));
+    wire.extend(encoder.finish());
+
+    let core = Arc::new(ReceiverCore::new(
+        ReceiverOptions::new("receiver", "Windows", &destination).with_accept_all(),
+    ));
+    let (peer, worker) = start(core, &id);
+    let mut tls = client(peer.service.address);
+    tls.sock
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let ask = sender::ask_request(
+        &sender::Config::new("iPhone", "abcdef123456"),
+        "LARGE_FOLDER",
+        &Offer::Files(vec![AskFile {
+            name: "Folder".into(),
+            file_type: "public.folder".into(),
+            size: None,
+            bom_path: "./Folder".into(),
+            is_directory: true,
+        }]),
+    );
+    tls.write_all(&ask).unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 200);
+    tls.write_all(&sender::upload_head(
+        "LARGE_FOLDER",
+        compressor,
+        wire.len() as u64,
+    ))
+    .unwrap();
+    tls.write_all(&wire).unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 200);
+    let events = worker.join().unwrap().unwrap();
+    let expected = destination.join("Folder");
+    assert!(matches!(
+        events.last(),
+        Some(ReceiverEvent::Received { files, .. }) if files == std::slice::from_ref(&expected)
+    ));
+    assert_eq!(fs::read_dir(&expected).unwrap().count(), 4100);
+    assert!(expected.join("part-4099.txt").is_file());
+}
+
+#[test]
 fn tls_batch_of_61_converted_photos_skips_unoffered_appledouble_metadata() {
     use owly_airdrop::proto::{
         archive::{compress::Encoder, cpio},

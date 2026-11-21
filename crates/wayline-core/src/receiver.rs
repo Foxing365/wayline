@@ -247,6 +247,7 @@ impl ReceiverCore {
         config.ask_timeout = core.options.decision_timeout;
         config.limits.max_buffered = core.options.max_control_body;
         config.limits.plist.max_bytes = core.options.max_control_body;
+        config.limits.max_directory_entries = Some(65_536);
         config.allow_dvzip_archive_boundary = core.options.allow_dvzip_archive_boundary;
         let mut connection = Connection::new(Arc::new(config));
         let mut incoming: Option<IncomingTransfer> = None;

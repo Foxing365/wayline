@@ -23,6 +23,8 @@ Unlisted AppleDouble members associated with an offered file or its wrapper
 count toward archive limits and are discarded before staging.
 DVZip blocks are decoded through a fixed buffer with an independent chunk
 limit and the existing upload and extracted-size limits.
+Wayline accepts up to 65,536 archive entries for offers that include a
+directory. The regular file-offer limit is 4,096. Both use a bounded path index.
 Accepted responses requesting connection closure reconnect before upload;
 transport failure/timeout remains distinct from an explicit refusal. Windows
 regressions live in `crates/wayline-core/tests/airdrop_migration.rs`; upstream

@@ -40,6 +40,8 @@ pub struct Limits {
     /// Largest `/Upload` body, compressed.
     pub max_upload_body: u64,
     pub extract: extract::Limits,
+    /// Optional entry limit for an upload with an explicitly accepted directory.
+    pub max_directory_entries: Option<u32>,
     /// Largest DVZip chunk (DVZ-3).
     pub max_dvzip_chunk: u32,
     /// Most bytes buffered while a prompt is up, before the connection is
@@ -54,6 +56,7 @@ impl Default for Limits {
             plist: plist::Limits::default(),
             max_upload_body: 16 << 30,
             extract: extract::Limits::default(),
+            max_directory_entries: None,
             // Chunks are streamed through a fixed buffer. Keep a per-chunk
             // bound independent of the HTTP body and extracted archive limits.
             max_dvzip_chunk: 64 << 20,
@@ -700,6 +703,12 @@ impl Connection {
             .collect();
         let config = self.config.clone();
         let limits = &config.limits;
+        let mut extract_limits = limits.extract;
+        if files.iter().any(|file| file.is_directory)
+            && let Some(max_directory_entries) = limits.max_directory_entries
+        {
+            extract_limits.max_entries = max_directory_entries;
+        }
         let decoder = match BodyDecoder::new(head.body, limits.max_upload_body, &limits.http) {
             Ok(decoder) => decoder,
             Err(e) => {
@@ -730,8 +739,8 @@ impl Connection {
         ));
         let unpacker = Unpacker::new(
             kind,
-            Rules::new(allowed, limits.extract),
-            &limits.extract,
+            Rules::new(allowed, extract_limits),
+            &extract_limits,
             limits.max_dvzip_chunk,
         );
         self.state = State::Upload(Box::new(Upload {
@@ -810,7 +819,11 @@ impl Connection {
     fn upload_failed(&mut self, error: UploadError) {
         let status = match &error {
             UploadError::Http(http::Error::BodyTooLarge)
-            | UploadError::Archive(archive::Error::Extract(extract::Error::TooLarge)) => 413,
+            | UploadError::Archive(archive::Error::Extract(
+                extract::Error::TooLarge
+                | extract::Error::TooManyEntries
+                | extract::Error::TooManyPathBytes,
+            )) => 413,
             UploadError::Http(e) => e.status(),
             UploadError::Archive(_) => 400,
         };
