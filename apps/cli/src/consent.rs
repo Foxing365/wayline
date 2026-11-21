@@ -153,11 +153,7 @@ fn write_offer(
             writeln!(output, "  {:?} ({:?} 字节)", file.name, file.size)?;
         }
     }
-    for url in transfer
-        .urls
-        .iter()
-        .filter_map(|value| wayline_core::airdrop::web_url(value))
-    {
+    for url in wayline_core::airdrop::web_links(&transfer.urls) {
         writeln!(output, "  网页链接 {:?}", url.as_str())?;
     }
     write!(output, "接受这次传输？[y/N] ")
@@ -175,12 +171,16 @@ mod tests {
             urls: Vec::new(),
             icon: None,
             sender_record_data: None,
+            sender_certificate_sha256: None,
         }
     }
     #[test]
     fn link_preview_only_prints_web_urls_before_asking() {
         let mut offer = offer();
-        offer.urls = vec!["https://b23.tv/test".into(), "file:///C:/file".into()];
+        offer.urls = vec![
+            "Example title\nhttps://b23.tv/test".into(),
+            "file:///C:/file".into(),
+        ];
         let mut prompt = Vec::new();
         write_offer(&mut prompt, &offer, std::path::Path::new("downloads")).unwrap();
         let prompt = String::from_utf8(prompt).unwrap();

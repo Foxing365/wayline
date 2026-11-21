@@ -46,6 +46,33 @@ pub fn configuration(mac: [u8; 6], name: &str, target: &str, channel: u8) -> io:
     // Block Ack is a firmware capability; never impersonate it from the host.
     config.accept_addba = false;
     config.amsdu = false;
+    if target == "rtl8821cu" {
+        // The compact USB adapter can hear valid AWDL adverts well below the
+        // default -65 dBm admission threshold. Give weak peers some margin;
+        // the ordinary frame validation and existing hysteresis still apply.
+        config.rssi_threshold = Some(-75);
+    }
+    Ok(config)
+}
+
+/// The optional HT20 rate applies to eligible RTL8821CU unicast data.
+pub fn rtl8821cu_configuration(
+    mac: [u8; 6],
+    name: &str,
+    channel: u8,
+    preferred_mcs: Option<u8>,
+) -> io::Result<Config> {
+    let mut config = configuration(mac, name, "rtl8821cu", channel)?;
+    if let Some(mcs) = preferred_mcs {
+        if mcs > 7 {
+            return Err(invalid(
+                "RTL8821CU HT20 supports one stream (MCS 0 through 7)",
+            ));
+        }
+        // Owly falls back to BASIC for multicast and peers whose HT capability
+        // does not include this index. Action frames are always BASIC.
+        config.rate = TxRate::Ht { mcs, sgi: false };
+    }
     Ok(config)
 }
 
@@ -68,11 +95,47 @@ mod tests {
             let c = configuration(mac, "Wayline", target, channel).unwrap();
             assert_eq!(c.max_frame, 1600);
             assert!(!c.no_ack && !c.accept_addba && !c.amsdu);
+            assert_eq!(c.rate, TxRate::BASIC);
             assert_eq!(c.radio.presence, Presence::Fixed);
+            assert_eq!(c.rssi_threshold, Some(-65));
         }
         for (target, channel) in [("esp32s3", 44), ("esp32c6", 149), ("esp32c5", 1)] {
             assert!(configuration(mac, "Wayline", target, channel).is_err());
         }
         assert!(configuration([0; 6], "Wayline", "esp32s3", 6).is_err());
+    }
+
+    #[test]
+    fn rtl8821cu_admits_weaker_nearby_awdl_advertisements() {
+        let config = configuration([2, 0, 0, 0, 0, 1], "Wayline", "rtl8821cu", 149).unwrap();
+        assert_eq!(config.rssi_threshold, Some(-75));
+    }
+
+    #[test]
+    fn rtl8821cu_ht20_rate_falls_back_without_the_requested_peer_mcs() {
+        use owly_awdl::tlv::HtCapabilities;
+
+        let mac = [2, 0, 0, 0, 0, 1];
+        assert_eq!(
+            rtl8821cu_configuration(mac, "Wayline", 149, None)
+                .unwrap()
+                .rate,
+            TxRate::BASIC
+        );
+        assert!(rtl8821cu_configuration(mac, "Wayline", 149, Some(8)).is_err());
+        for mcs in [4, 7] {
+            let cfg = rtl8821cu_configuration(mac, "Wayline", 149, Some(mcs)).unwrap();
+            let expected = TxRate::Ht { mcs, sgi: false };
+            assert_eq!(
+                cfg.rate.for_peer(Some(&HtCapabilities::ONE_STREAM)),
+                expected
+            );
+            assert_eq!(cfg.rate.for_peer(None), TxRate::BASIC);
+            let mismatch = HtCapabilities {
+                rx_mcs: 0x0f,
+                ..HtCapabilities::ONE_STREAM
+            };
+            assert_eq!(cfg.rate.for_peer(Some(&mismatch)), TxRate::BASIC);
+        }
     }
 }

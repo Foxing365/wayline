@@ -196,11 +196,15 @@ Closing the card hides it while work continues. Service registration is currentl
 Windows operation while the Rust installer migration is in progress.
 Launch the UI normally so Explorer drag-and-drop works.
 
+The optional Windows 11 context menu extension in `apps/explorer-menu` uses a signed,
+per-user sparse package and shares the desktop's `--send --` entry point. See the
+[build and registration guide](EXPLORER.zh-CN.md).
+
 | Option | Behavior |
 | --- | --- |
 | `--send -- <paths...>` | Open files or forward them to the running instance |
 | `--show-in-taskbar` | Show the card in the taskbar and Alt-Tab; retain a usable window if tray registration fails |
-| `--unregister-shell` | Remove the current user's Explorer and Send to entries after quitting |
+| `--unregister-shell` | Remove the current user's classic menu and Send to entries after quitting |
 | `--version` | Print the version without GPUI or service initialization |
 
 Device name, receive directory, interface language, notification position and identity live under `%LOCALAPPDATA%\wayline`.
@@ -261,7 +265,10 @@ If any selected record contains a folder, Also delete files rejects the whole ba
 preflight and retains all records, protecting files added to that folder after the transfer.
 Open the folder's location to manage its contents, or uncheck Also delete files to delete only history.
 
-Incoming transfers require confirmation. Completion requires archive validation and the final
+Incoming transfers require confirmation by default. The desktop may automatically accept a file
+offer after the user has trusted the same TLS client certificate and the sender has proved
+possession of its key. `trusted_senders` in `desktop.json` keeps the display name and certificate
+fingerprint. Links continue to be reviewed individually. Completion requires archive validation and the final
 protocol response. Firmware maintenance pauses the idle receiver and rejects active transfers
 or other receivers; cancel/quit waits for the flashing child to exit before releasing the device.
 

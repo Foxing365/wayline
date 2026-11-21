@@ -21,63 +21,127 @@ use windows_sys::Win32::{
     System::Threading::{CreateEventW, SetEvent, CREATE_NO_WINDOW},
 };
 
-use wayline_service::config::{RTL8821CU_HELPER_CLEANUP, RTL8821CU_STARTUP};
+use wayline_service::{
+    channel_switch,
+    config::{
+        Rtl8821cuRateProfile, RTL8821CU_DEFAULT_WIDTH_MHZ, RTL8821CU_HELPER_CLEANUP,
+        RTL8821CU_STARTUP,
+    },
+};
+
+pub(super) struct PerformanceOptions {
+    pub(super) rate_profile: Rtl8821cuRateProfile,
+    pub(super) high_resolution_timer: bool,
+    pub(super) mtu: u32,
+    pub(super) width_mhz: u8,
+}
 
 pub(super) fn run(
-    channel: u8,
+    mut channel: u8,
     managed: bool,
     helper: PathBuf,
     dll: PathBuf,
     stop: Option<StopEvent>,
+    performance: PerformanceOptions,
 ) -> io::Result<()> {
+    let PerformanceOptions {
+        rate_profile,
+        high_resolution_timer,
+        mtu,
+        width_mhz,
+    } = performance;
     let _guard = if managed {
         None
     } else {
         Some(wayline_service::device_lock::DeviceGuard::try_acquire_rtl8821cu()?)
     };
     let mac = session_mac()?;
-    let config = wayline_awdl::configuration(mac.0, "Wayline", "rtl8821cu", channel)?;
+    let mut config = wayline_awdl::rtl8821cu_configuration(
+        mac.0,
+        "Wayline",
+        channel,
+        rate_profile.preferred_mcs(),
+    )?;
+    let channel_dir = if managed && u16::from(width_mhz) == RTL8821CU_DEFAULT_WIDTH_MHZ {
+        std::env::var_os(channel_switch::CONTROL_DIR_ENV).map(PathBuf::from)
+    } else {
+        None
+    };
+    let mut target_file = std::env::var_os("WAYLINE_BRIDGE_TARGET_FILE").map(PathBuf::from);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
-            let mut helper = Helper::start(&helper, channel)?;
+            let mut helper = Helper::start(&helper, channel, width_mhz)?;
             let stopping = wait_for_stop(&stop);
             tokio::pin!(stopping);
-            let socket = tokio::select! {
-                result = helper.connect(channel, mac) => result?,
+            let mut socket = tokio::select! {
+                result = helper.connect(channel, width_mhz, mac) => result?,
                 result = &mut stopping => return result,
             };
-            let (peers, _) = watch::channel(Vec::new());
-            let running = driver::spawn(
-                config,
-                move || {
-                    let net = Wintun::open(&dll, mac)?;
-                    Ok((radio_link::Radio::from_socket(socket)?, net))
-                },
-                peers,
-            )?;
-            if let Some(path) = std::env::var_os("WAYLINE_BRIDGE_TARGET_FILE") {
-                publish_radio_target(Path::new(&path), "rtl8821cu")?;
-            }
-            tracing::info!("RTL8821CU AWDL ready on channel {channel}");
-            let mut failed = running.failed();
-            let result = loop {
-                if let Some(error) = failed.borrow().as_ref() {
-                    break Err(io::Error::other(error.clone()));
+            let _timer = high_resolution_timer.then(super::timer_resolution::TimerResolution::request).flatten();
+            let mut poll = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                let library = dll.clone();
+                let (peers, mut signal) = watch::channel(Vec::new());
+                let running = driver::spawn(
+                    config,
+                    move || {
+                        let net = Wintun::open_with_mtu(&library, mac, mtu)?;
+                        Ok((radio_link::Radio::from_socket(socket)?, net))
+                    },
+                    peers,
+                )?;
+                if let Some(dir) = &channel_dir {
+                    channel_switch::publish(&dir.join(channel_switch::READY), channel)?;
                 }
-                tokio::select! {
-                    result = &mut stopping => break result,
-                    result = failed.changed() => {
-                        if result.is_err() {
-                            break Err(io::Error::other("RTL8821CU AWDL worker ended"));
+                if let Some(path) = target_file.take() {
+                    publish_radio_target(&path, "rtl8821cu")?;
+                }
+                tracing::info!("RTL8821CU AWDL ready on channel {channel}, monitor width {width_mhz} MHz, rate profile {}, MTU {mtu}", rate_profile.as_str());
+                let mut failed = running.failed();
+                let change = loop {
+                    if let Some(error) = failed.borrow().as_ref() {
+                        break Err(io::Error::other(error.clone()));
+                    }
+                    tokio::select! {
+                        result = &mut stopping => break result.map(|()| None),
+                        result = failed.changed() => {
+                            if result.is_err() {
+                                break Err(io::Error::other("RTL8821CU AWDL worker ended"));
+                            }
+                        }
+                        Ok(()) = signal.changed() => {
+                            let peers = signal.borrow_and_update();
+                            if let Some(strongest) = peers.iter().filter_map(|peer| peer.rssi).max() {
+                                tracing::info!("RTL8821CU AWDL peers: {}, strongest signal {strongest} dBm", peers.len());
+                            }
+                        }
+                        _ = poll.tick(), if channel_dir.is_some() => {
+                            let path = channel_dir.as_ref().unwrap().join(channel_switch::REQUESTED);
+                            if let Some(next) = channel_switch::read(&path)?.filter(|next| *next != channel) {
+                                break Ok(Some(next));
+                            }
                         }
                     }
+                };
+                if !matches!(change, Ok(Some(_))) {
+                    helper.signal_stop();
                 }
-            };
-            helper.signal_stop();
-            running.stop();
-            result
+                running.stop();
+                let Some(next) = change? else { return Ok(()) };
+                if !matches!((channel, next), (44, 149) | (149, 44)) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported RTL8821CU hot channel switch"));
+                }
+                socket = tokio::select! {
+                    result = helper.retune(channel, next, mac) => result.map_err(|error| {
+                        io::Error::new(error.kind(), format!("RTL8821CU channel {channel} -> {next}: {error}"))
+                    })?,
+                    result = &mut stopping => return result,
+                };
+                channel = next;
+                config = wayline_awdl::rtl8821cu_configuration(mac.0, "Wayline", channel, rate_profile.preferred_mcs())?;
+            }
         })
 }
 
@@ -108,7 +172,7 @@ struct Helper {
 }
 
 impl Helper {
-    fn start(executable: &Path, channel: u8) -> io::Result<Self> {
+    fn start(executable: &Path, channel: u8, width_mhz: u8) -> io::Result<Self> {
         let folder = executable.parent().expect("helper path has a parent");
         for path in [executable.to_path_buf(), folder.join("libusb-1.0.dll")] {
             if !path.is_file() {
@@ -156,7 +220,7 @@ impl Helper {
         }
         let child = command
             .current_dir(folder)
-            .args([channel.to_string(), "20".into(), port.to_string()])
+            .args([channel.to_string(), width_mhz.to_string(), port.to_string()])
             // radio_link's helper parses these with strtoul base 0.
             .env("AIRBRIDGE_VID", "0x0bda")
             .env("AIRBRIDGE_PID", "0xc820")
@@ -173,15 +237,51 @@ impl Helper {
         })
     }
 
-    async fn connect(&mut self, channel: u8, mac: MacAddr) -> io::Result<std::net::TcpStream> {
+    async fn connect(
+        &mut self,
+        channel: u8,
+        width_mhz: u8,
+        mac: MacAddr,
+    ) -> io::Result<std::net::TcpStream> {
         let deadline = self.bringup_until.expect("first helper connection");
+        let mut socket = self.open_client(deadline).await?;
+        // The authenticated helper starts listening only after completing USB
+        // initialization. A mismatched HELLO can use the normal stop deadline.
+        self.bringup_until = None;
+        radio_link::handshake(&mut socket, channel, width_mhz, mac, Duration::from_secs(3)).await?;
+        socket.into_std()
+    }
+
+    async fn retune(&mut self, from: u8, to: u8, mac: MacAddr) -> io::Result<std::net::TcpStream> {
+        let wait = Duration::from_secs(8);
+        // The existing AWDL worker has already dropped its data socket. The
+        // helper accepts a fresh client without tearing down its USB session.
+        tokio::time::timeout(Duration::from_secs(18), async {
+            let mut control = self.open_client(Instant::now() + wait).await?;
+            radio_link::request_channel(&mut control, from, to, wait).await?;
+            drop(control);
+            let mut data = self.open_client(Instant::now() + wait).await?;
+            radio_link::handshake(&mut data, to, RTL8821CU_DEFAULT_WIDTH_MHZ as u8, mac, wait)
+                .await?;
+            data.into_std()
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "RTL8821CU retune did not establish a new data session",
+            )
+        })?
+    }
+
+    async fn open_client(&mut self, deadline: Instant) -> io::Result<TcpStream> {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 return Err(io::Error::other(format!(
                     "RTL8821CU helper exited ({status}); check WinUSB on USB 0BDA:C820 MI_02 and the bridge log"
                 )));
             }
-            if let Ok(mut socket) = TcpStream::connect(self.address).await {
+            if let Ok(socket) = TcpStream::connect(self.address).await {
                 if !owns_connection(
                     self.child.id(),
                     self.address.port(),
@@ -193,14 +293,12 @@ impl Helper {
                     ));
                 }
                 socket.set_nodelay(true)?;
-                radio_link::handshake(&mut socket, channel, mac).await?;
-                self.bringup_until = None;
-                return socket.into_std();
+                return Ok(socket);
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "RTL8821CU helper initialization timed out",
+                    "RTL8821CU helper did not open a data socket in time",
                 ));
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -285,6 +383,10 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let server = listener.local_addr().unwrap();
         let client = std::net::TcpStream::connect(server).unwrap();
+        let port = client.local_addr().unwrap().port();
+        // A hot-switch connection may be queued while the helper finishes
+        // the previous session, before its accept() runs again.
+        assert!(owns_connection(std::process::id(), server.port(), port).unwrap());
         let (_accepted, client_address) = listener.accept().unwrap();
         assert_eq!(client.local_addr().unwrap(), client_address);
         assert!(owns_connection(std::process::id(), server.port(), client_address.port()).unwrap());

@@ -1,5 +1,8 @@
 //! Bounded JSON-line control client shared by desktop and CLI.
-use crate::protocol::{Request, Status};
+use crate::{
+    config::{validate_rtl8821cu_width, SET_RTL8821CU_WIDTH},
+    protocol::{Request, Status},
+};
 use std::{
     fmt,
     path::Path,
@@ -115,6 +118,54 @@ impl Client {
                 ));
             }
             thread::sleep(Duration::from_millis(250));
+        }
+    }
+    pub fn set_rtl8821cu_width(&self, width_mhz: u16) -> Result<Status, ClientError> {
+        validate_rtl8821cu_width(width_mhz)
+            .map_err(|error| ClientError::new(ClientErrorKind::InvalidRequest, error))?;
+        let mut request = Request::new(SET_RTL8821CU_WIDTH);
+        request.rtl8821cu_width_mhz = Some(width_mhz);
+        self.request(&request)
+    }
+    pub fn set_rtl8821cu_width_and_wait(
+        &self,
+        width_mhz: u16,
+        timeout: Duration,
+    ) -> Result<Status, ClientError> {
+        let mut status = self.set_rtl8821cu_width(width_mhz)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if status.rtl8821cu_width_mhz != Some(width_mhz) {
+                return Err(ClientError::new(
+                    ClientErrorKind::Service,
+                    status.error.unwrap_or_else(|| {
+                        format!("RTL8821CU width changed before {width_mhz} MHz became ready")
+                    }),
+                ));
+            }
+            if status.state == "running" && status.awdl0 && status.error.is_none() {
+                return Ok(status);
+            }
+            if matches!(
+                status.state.as_str(),
+                "error" | "maintenance-failed" | "no-radio"
+            ) {
+                if let Some(error) = status.error {
+                    return Err(ClientError::new(ClientErrorKind::Service, error));
+                }
+            }
+            if status.state == "stopped" && !status.enabled {
+                // The preference was saved. Ready status will follow on service start.
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(ClientError::new(
+                    ClientErrorKind::Timeout,
+                    format!("timed out waiting for RTL8821CU {width_mhz} MHz to become ready"),
+                ));
+            }
+            thread::sleep(Duration::from_millis(250));
+            status = self.status()?;
         }
     }
     pub fn firewall(&self, exe: &Path) -> Result<Status, ClientError> {
@@ -294,6 +345,7 @@ mod tests {
             state: "running".into(),
             port: Some("COM123".into()),
             channel: 6,
+            rtl8821cu_width_mhz: None,
             target: Some("esp32s3".into()),
             awdl0: true,
             error: error.map(str::to_owned),

@@ -68,10 +68,13 @@ struct NotificationPlacement {
 
 pub struct Instance(HANDLE);
 impl Instance {
-    pub fn acquire(paths: &[PathBuf]) -> Result<Option<Self>> {
+    pub fn acquire(paths: &[PathBuf], background: bool) -> Result<Option<Self>> {
         let handle = unsafe { CreateMutexW(None, false, w!("Local\\WaylineDesktop"))? };
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             let _handle = Self(handle);
+            if background {
+                return Ok(None);
+            }
             let bytes = crate::integration::encode_paths(paths)?;
             // Another Explorer invocation may arrive while the first process is
             // still creating its GPU window. Wait for the subclass to be ready.

@@ -132,14 +132,25 @@ pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8>
     plist_request(Path::Ask, &request.to_plist())
 }
 
-/// The `/Upload` head for a body of `len` bytes (UP-1a, UP-9, UP-10).
+/// An `/Upload` head for a body of `len` bytes when the source size is unknown.
+/// [`Transfer`] uses the sizes in its file offer for UP-10.
 pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64) -> Vec<u8> {
+    upload_head_with_file_bytes(transfer_id, compressor, len, 0)
+}
+
+fn upload_head_with_file_bytes(
+    transfer_id: &str,
+    compressor: Compressor,
+    len: u64,
+    file_bytes: u64,
+) -> Vec<u8> {
     let len = len.to_string();
+    let file_bytes = file_bytes.to_string();
     head(
         Path::Upload,
         &[
             ("TransferID", transfer_id),
-            ("TotalBytes", "0"),
+            ("TotalBytes", &file_bytes),
             ("Content-Type", compressor.content_type()),
             ("Connection", "keep-alive"),
             ("Content-Length", &len),
@@ -321,9 +332,8 @@ enum State {
 #[derive(Debug)]
 pub struct Transfer {
     state: State,
-    transfer_id: String,
     is_url: bool,
-    upload: Option<(Compressor, u64)>,
+    upload_head: Option<Vec<u8>>,
     reader: ResponseReader,
     actions: VecDeque<Action>,
 }
@@ -338,15 +348,31 @@ impl Transfer {
         upload: Option<(Compressor, u64)>,
     ) -> Self {
         let is_url = matches!(offer, Offer::Urls(_));
+        let upload_head = match (offer, upload) {
+            (Offer::Files(files), Some((compressor, len))) => {
+                // UP-10: TotalBytes describes the source files offered in /Ask.
+                // Content-Length describes the compressed archive on this connection.
+                let file_bytes = files
+                    .iter()
+                    .try_fold(0u64, |total, file| total.checked_add(file.size?))
+                    .unwrap_or(0);
+                Some(upload_head_with_file_bytes(
+                    transfer_id,
+                    compressor,
+                    len,
+                    file_bytes,
+                ))
+            }
+            _ => None,
+        };
         let actions = VecDeque::from([
             Action::Transmit(ask_request(config, transfer_id, offer)),
             Action::SetTimer(Some(config.ask_timeout)),
         ]);
         Transfer {
             state: State::Asking,
-            transfer_id: transfer_id.into(),
             is_url,
-            upload,
+            upload_head,
             reader: ResponseReader::new(),
             actions,
         }
@@ -431,13 +457,9 @@ impl Transfer {
                     // ASK-4: a URL share is done once accepted.
                     self.finish(Outcome::Delivered);
                 } else {
-                    let (compressor, len) = self.upload.expect("a file share has an upload");
+                    let head = self.upload_head.take().expect("a file share has an upload");
                     self.state = State::Uploading;
-                    self.actions.push_back(Action::SendUpload(upload_head(
-                        &self.transfer_id,
-                        compressor,
-                        len,
-                    )));
+                    self.actions.push_back(Action::SendUpload(head));
                 }
             }
             State::Asking => self.finish(Outcome::Declined),
@@ -523,12 +545,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.headers.get("TransferID"), Some("ID"));
+        assert_eq!(head.headers.get("TotalBytes"), Some("5"));
         assert_eq!(head.body, BodyKind::Length(10));
         t.upload_sent();
         t.receive(&response(200, b""));
         assert_eq!(
             drain(&mut t).last(),
             Some(&Action::Done(Outcome::Delivered))
+        );
+    }
+
+    #[test]
+    fn upload_advertises_the_sum_of_offered_file_sizes_or_zero_when_unknown() {
+        let config = Config::new("Test", "0123456789ab");
+        let limit = i64::MAX as u64;
+        for (sizes, expected) in [
+            (vec![Some(0), Some(15), Some(1000)], "1015"),
+            (vec![Some(15), None], "0"),
+            (vec![Some(limit), Some(limit), Some(2)], "0"),
+            (vec![Some(0)], "0"),
+        ] {
+            let files = sizes
+                .into_iter()
+                .enumerate()
+                .map(|(index, size)| AskFile {
+                    name: format!("file-{index}"),
+                    file_type: "public.data".into(),
+                    size,
+                    bom_path: format!("./file-{index}"),
+                    is_directory: false,
+                })
+                .collect();
+            let offer = Offer::Files(files);
+            for compressor in [Compressor::Gzip, Compressor::DvZip] {
+                let mut transfer = Transfer::new(&config, "ID", &offer, Some((compressor, 72)));
+                drain(&mut transfer);
+                transfer.receive(&response(200, b""));
+                let actions = drain(&mut transfer);
+                let Some(Action::SendUpload(bytes)) = actions.last() else {
+                    panic!("{actions:?}")
+                };
+                let (head, _) = http::parse_request(bytes, &http::Limits::default())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(head.headers.get("TotalBytes"), Some(expected));
+                assert_eq!(head.body, BodyKind::Length(72));
+            }
+        }
+        let mut url = Transfer::new(
+            &config,
+            "URL",
+            &Offer::Urls(vec!["https://example.com/".into()]),
+            None,
+        );
+        drain(&mut url);
+        url.receive(&response(200, b""));
+        let actions = drain(&mut url);
+        assert_eq!(actions.last(), Some(&Action::Done(Outcome::Delivered)));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::SendUpload(_)))
         );
     }
 

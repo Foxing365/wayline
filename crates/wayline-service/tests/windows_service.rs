@@ -382,6 +382,15 @@ mod checks {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("busy")));
+        let width_busy = request(
+            &pipe,
+            json!({"cmd":"set-rtl8821cu-width","rtl8821cuWidthMhz":40}),
+        )
+        .await;
+        assert!(width_busy
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("busy")));
         receive_lease.finish_maintenance_async(false).await.unwrap();
         request(&pipe, json!({"cmd":"set","port":"com124","channel":6})).await;
         let second = started(dir.path(), 2).await;

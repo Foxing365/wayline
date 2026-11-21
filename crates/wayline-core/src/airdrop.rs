@@ -4,6 +4,7 @@ use owly_airdrop::proto::messages::{AskRequest, Offer};
 /// Normalize a browser URL from a peer before presenting or opening it.
 /// Windows can dispatch custom schemes and local file paths to other programs.
 pub fn web_url(value: &str) -> Option<String> {
+    let value = value.trim();
     if value
         .chars()
         .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
@@ -16,6 +17,18 @@ pub fn web_url(value: &str) -> Option<String> {
     }
     let url = url::Url::parse(value).ok()?;
     (url.has_host() && url.username().is_empty() && url.password().is_none()).then(|| url.into())
+}
+
+/// A share item can contain a display title on a separate line from its URL.
+/// Keep the HTTP(S) lines in their original order and ignore app-only links.
+pub fn web_links(items: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    items
+        .iter()
+        .flat_map(|item| item.lines())
+        .filter_map(web_url)
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingFile {
@@ -32,6 +45,9 @@ pub struct IncomingTransfer {
     pub urls: Vec<String>,
     pub icon: Option<Vec<u8>>,
     pub sender_record_data: Option<Vec<u8>>,
+    /// Leaf of the client TLS chain, after the handshake proved key possession.
+    /// The peer may send no certificate, or a certificate shared by several devices.
+    pub sender_certificate_sha256: Option<[u8; 32]>,
 }
 impl IncomingTransfer {
     pub(crate) fn from_ask(ask: &AskRequest) -> Self {
@@ -63,6 +79,16 @@ impl IncomingTransfer {
             urls,
             icon: ask.file_icon.clone(),
             sender_record_data: ask.sender_record.clone(),
+            sender_certificate_sha256: None,
+        }
+    }
+
+    /// A pin can authorize writing files, while links always need consent.
+    pub fn file_offer_certificate(&self) -> Option<[u8; 32]> {
+        if self.urls.is_empty() && !self.files.is_empty() {
+            self.sender_certificate_sha256
+        } else {
+            None
         }
     }
 }

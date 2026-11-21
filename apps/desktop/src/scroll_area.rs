@@ -1,10 +1,17 @@
 //! Native scrolling with a persistent, proportional scrollbar when content overflows.
 use gpui::*;
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 const GUTTER: f32 = 12.;
 const INSET: f32 = 2.;
 const MIN_THUMB: f32 = 24.;
+const WHEEL_HOLD: Duration = Duration::from_millis(90);
+const WHEEL_FADE: Duration = Duration::from_millis(210);
+const WHEEL_FEEDBACK: Duration = WHEEL_HOLD.saturating_add(WHEEL_FADE);
 
 fn wheel_moved(before: Pixels, after: Pixels, max: Pixels) -> bool {
     before.clamp(-max, px(0.)) != after.clamp(-max, px(0.))
@@ -14,6 +21,46 @@ fn wheel_moved(before: Pixels, after: Pixels, max: Pixels) -> bool {
 pub struct ScrollState {
     handle: ScrollHandle,
     grab_offset: Rc<Cell<Option<f32>>>,
+    wheel_feedback: Rc<Cell<Option<WheelFeedback>>>,
+    feedback_expiry: Rc<RefCell<Option<Task<()>>>>,
+}
+
+#[derive(Clone, Copy)]
+struct WheelFeedback {
+    started: Instant,
+    animated: bool,
+}
+
+impl WheelFeedback {
+    fn intensity(self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed >= WHEEL_FEEDBACK {
+            return 0.;
+        }
+        if !self.animated {
+            return 1.;
+        }
+        1. - (elapsed.saturating_sub(WHEEL_HOLD).as_secs_f32() / WHEEL_FADE.as_secs_f32())
+    }
+}
+
+pub(crate) fn client_area_animation_enabled() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+
+    let mut enabled = 0_i32;
+    // SPI_GETCLIENTAREAANIMATION writes one Win32 BOOL to the supplied pointer.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&raw mut enabled).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok()
+        && enabled != 0
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +219,8 @@ impl Element for ScrollArea {
         });
         if bar.is_none() {
             state.1.grab_offset.set(None);
+            state.1.wheel_feedback.set(None);
+            state.1.feedback_expiry.borrow_mut().take();
         }
         (inner, bar)
     }
@@ -191,18 +240,46 @@ impl Element for ScrollArea {
         // the boundary without reimplementing GPUI's line-height-aware wheel delta.
         if let Some(hitbox) = &prepaint.0 {
             let wheel_hitbox = hitbox.clone();
-            let handle = state.1.handle.clone();
+            let scroll = state.1.clone();
             let previous_offset = Rc::new(Cell::new(None));
             window.on_mouse_event(move |_event: &ScrollWheelEvent, phase, window, cx| {
                 if !wheel_hitbox.should_handle_scroll(window) {
                     return;
                 }
                 if phase.capture() {
-                    previous_offset.set(Some(handle.offset().y));
+                    previous_offset.set(Some(scroll.handle.offset().y));
                 } else if phase.bubble()
                     && let Some(previous) = previous_offset.take()
-                    && wheel_moved(previous, handle.offset().y, handle.max_offset().height)
+                    && wheel_moved(
+                        previous,
+                        scroll.handle.offset().y,
+                        scroll.handle.max_offset().height,
+                    )
                 {
+                    if scroll.grab_offset.get().is_none() {
+                        // The wheel keeps GPUI's exact offset. Only the visible
+                        // thumb accent changes, including for touchpad input.
+                        let animated = scroll
+                            .wheel_feedback
+                            .get()
+                            .map_or_else(client_area_animation_enabled, |feedback| {
+                                feedback.animated
+                            });
+                        scroll.wheel_feedback.set(Some(WheelFeedback {
+                            started: Instant::now(),
+                            animated,
+                        }));
+                        scroll.feedback_expiry.replace((!animated).then(|| {
+                            let activity = scroll.wheel_feedback.clone();
+                            window.spawn(cx, async move |cx| {
+                                cx.background_executor().timer(WHEEL_FEEDBACK).await;
+                                let _ = cx.update(|window, _| {
+                                    activity.set(None);
+                                    window.refresh();
+                                });
+                            })
+                        }));
+                    }
                     cx.stop_propagation();
                 }
             });
@@ -221,6 +298,22 @@ impl Element for ScrollArea {
         };
         let geometry = *geometry;
         let hovered = hitbox.is_hovered(window);
+        let direct = hovered || state.1.grab_offset.get().is_some();
+        let mut intensity = 0.;
+        let mut width = if direct { 8. } else { 6. };
+        if let Some(feedback) = state.1.wheel_feedback.get() {
+            intensity = feedback.intensity(Instant::now());
+            if intensity == 0. {
+                state.1.wheel_feedback.set(None);
+            } else if feedback.animated {
+                width += (8. - width) * intensity;
+                window.request_animation_frame();
+            }
+        }
+        let thumb = rgb(if direct { 0xb4b4be } else { 0x787882 }).blend(Rgba {
+            a: intensity,
+            ..rgb(0x73b2ff)
+        });
         window.set_cursor_style(CursorStyle::Arrow, hitbox);
         window.paint_quad(
             fill(
@@ -235,16 +328,15 @@ impl Element for ScrollArea {
         window.paint_quad(
             fill(
                 Bounds::new(
-                    point(hitbox.left() + px(3.), px(geometry.thumb_top)),
-                    size(px(6.), px(geometry.thumb_height)),
+                    point(
+                        hitbox.left() + px((GUTTER - width) / 2.),
+                        px(geometry.thumb_top),
+                    ),
+                    size(px(width), px(geometry.thumb_height)),
                 ),
-                rgb(if hovered || state.1.grab_offset.get().is_some() {
-                    0xb4b4be
-                } else {
-                    0x787882
-                }),
+                thumb,
             )
-            .corner_radii(px(3.)),
+            .corner_radii(px(width / 2.)),
         );
 
         let down_hitbox = hitbox.clone();
@@ -263,6 +355,8 @@ impl Element for ScrollArea {
             } else {
                 geometry.thumb_height / 2.
             };
+            down.wheel_feedback.set(None);
+            down.feedback_expiry.borrow_mut().take();
             down.grab_offset.set(Some(grab));
             down.handle.set_offset(point(
                 down.handle.offset().x,
@@ -306,8 +400,25 @@ impl Element for ScrollArea {
 
 #[cfg(test)]
 mod tests {
-    use super::{Geometry, MIN_THUMB, wheel_moved};
+    use super::{
+        Geometry, MIN_THUMB, WHEEL_FADE, WHEEL_FEEDBACK, WHEEL_HOLD, WheelFeedback, wheel_moved,
+    };
     use gpui::px;
+    use std::time::Instant;
+
+    #[test]
+    fn wheel_feedback_is_bounded_and_respects_reduced_motion() {
+        let started = Instant::now();
+        for animated in [false, true] {
+            let feedback = WheelFeedback { started, animated };
+            assert_eq!(feedback.intensity(started + WHEEL_HOLD), 1.);
+            assert_eq!(
+                feedback.intensity(started + WHEEL_HOLD + WHEEL_FADE / 2),
+                if animated { 0.5 } else { 1. },
+            );
+            assert_eq!(feedback.intensity(started + WHEEL_FEEDBACK), 0.);
+        }
+    }
 
     #[test]
     fn wheel_stays_inside_nested_content_until_its_boundary() {

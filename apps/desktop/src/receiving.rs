@@ -12,7 +12,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use wayline_core::airdrop::web_url;
+use wayline_core::airdrop::web_links;
 use wayline_core::{IncomingTransfer, ReceiverCore, ReceiverEvent, ReceiverOptions};
 use wayline_host::{
     TransferDirection, TransferFailureReason, TransferFormat, TransferHistoryRecord,
@@ -62,11 +62,7 @@ pub fn accepted_web_links(event: &ReceiverEvent, applied: bool) -> Vec<String> {
     if let ReceiverEvent::Received { transfer, .. } = event
         && applied
     {
-        return transfer
-            .urls
-            .iter()
-            .filter_map(|url| web_url(url))
-            .collect();
+        return web_links(&transfer.urls);
     }
     Vec::new()
 }
@@ -430,19 +426,30 @@ impl Model {
                 let message = match kind {
                     wayline_core::TransferFailureKind::Cancelled => text.receive_cancelled,
                     wayline_core::TransferFailureKind::Declined => text.receive_declined_notice,
+                    wayline_core::TransferFailureKind::Interrupted => text.receive_interrupted,
                     wayline_core::TransferFailureKind::Validation => text.receive_validation,
                     wayline_core::TransferFailureKind::Connection => text.receive_connection,
-                    _ => text.receive_failed,
+                    wayline_core::TransferFailureKind::Other => text.receive_failed,
                 };
                 self.finished_elapsed = active.elapsed(now);
                 self.active = None;
                 self.reset_speed();
-                // Keep the banner short; full diagnostics remain available on demand.
-                self.show_notice_with_details(
-                    message,
-                    format!("{message}\n{error}"),
-                    NoticeKind::Error,
-                );
+                if matches!(
+                    kind,
+                    wayline_core::TransferFailureKind::Cancelled
+                        | wayline_core::TransferFailureKind::Declined
+                        | wayline_core::TransferFailureKind::Interrupted
+                ) {
+                    // The receiver log already has the transport detail.
+                    self.show_notice(message, NoticeKind::Info);
+                } else {
+                    // Keep the banner short; full diagnostics remain available on demand.
+                    self.show_notice_with_details(
+                        message,
+                        format!("{message}\n{error}"),
+                        NoticeKind::Error,
+                    );
+                }
             }
             _ => return false,
         }
@@ -469,7 +476,8 @@ impl Model {
                     wayline_core::TransferFailureKind::Cancelled => {
                         (TransferOutcome::Cancelled, None)
                     }
-                    wayline_core::TransferFailureKind::Connection => (
+                    wayline_core::TransferFailureKind::Connection
+                    | wayline_core::TransferFailureKind::Interrupted => (
                         TransferOutcome::Failed,
                         Some(TransferFailureReason::Connection),
                     ),
@@ -575,7 +583,7 @@ fn offered_names(transfer: &IncomingTransfer) -> Vec<String> {
         .files
         .iter()
         .map(|file| file.name.clone())
-        .chain(transfer.urls.iter().filter_map(|url| web_url(url)))
+        .chain(web_links(&transfer.urls))
         .collect()
 }
 
@@ -774,12 +782,24 @@ fn run(
     let prompt_events = events.clone();
     let prompt_stop = stop.clone();
     let core = Arc::new(ReceiverCore::new(options).with_decision(move |transfer| {
-        if prompt_stop.load(Ordering::Acquire)
-            || (transfer.files.is_empty() && transfer.urls.is_empty())
-            || transfer.urls.iter().any(|url| web_url(url).is_none())
-        {
+        if prompt_stop.load(Ordering::Acquire) {
             return false;
         }
+        let mut transfer = transfer.clone();
+        let offered_links = transfer.urls.len();
+        transfer.urls = web_links(&transfer.urls);
+        if transfer.files.is_empty() && transfer.urls.is_empty() {
+            log("incoming ask declined: no supported web links or files");
+            return false;
+        }
+        log(&format!(
+            "incoming ask preview: {} files, {} web links from {} link items, client certificate: {}",
+            transfer.files.len(),
+            transfer.urls.len(),
+            offered_links,
+            transfer.sender_certificate_sha256.is_some()
+        ));
+        let transfer_id = transfer.id.clone();
         let (decision, answer) = mpsc::channel();
         let accepting = Arc::new(AtomicBool::new(false));
         let started_at = Instant::now();
@@ -787,7 +807,7 @@ fn run(
         let expires = started_at + Duration::from_secs(45);
         if prompt_events
             .send(Event::Incoming(IncomingRequest {
-                transfer: transfer.clone(),
+                transfer,
                 save_dir: directory.clone(),
                 started_at_unix_ms,
                 decision,
@@ -805,7 +825,7 @@ fn run(
             // before expiry. End the UI's waiting state even in that boundary race.
             let _ = prompt_events.send(
                 Event::ReceiverActivity(ReceiverEvent::TransferFailed {
-                    transfer_id: transfer.id.clone(),
+                    transfer_id,
                     error: crate::i18n::current().strings().incoming_expired.into(),
                     kind: wayline_core::TransferFailureKind::Cancelled,
                 })
@@ -833,6 +853,7 @@ fn run(
                     let _ = events.send(Event::ReceiverStatus(Ok(())));
                 }
                 ReceiverEvent::Discovered => log("remote /Discover answered"),
+                ReceiverEvent::AskStarted => log("remote /Ask headers received"),
                 ReceiverEvent::ConnectionFailed { peer, error, .. } => {
                     log(&format!("connection from {peer} failed: {error}"))
                 }
@@ -846,14 +867,23 @@ fn run(
                     log(&format!("confirming transfer {transfer_id}"))
                 }
                 ReceiverEvent::TransferFailed {
-                    transfer_id, error, ..
-                } => log(&format!("transfer {transfer_id} failed: {error}")),
-                ReceiverEvent::Received { files, .. } => {
-                    log(&format!("received {} files", files.len()))
-                }
-                ReceiverEvent::Rejected { path, status } => {
-                    log(&format!("rejected {path}: {status}"))
-                }
+                    transfer_id,
+                    error,
+                    kind,
+                } => log(&format!(
+                    "transfer {transfer_id} {}: {error}",
+                    kind.as_str()
+                )),
+                ReceiverEvent::Received { files, transfer } => log(&format!(
+                    "received {} files and {} web links",
+                    files.len(),
+                    web_links(&transfer.urls).len()
+                )),
+                ReceiverEvent::Rejected {
+                    path,
+                    status,
+                    reason,
+                } => log(&format!("rejected {path}: {status} ({reason})")),
             }
             if events
                 .send(Event::Timestamped(
@@ -890,7 +920,7 @@ fn wait_for_decision(answer: mpsc::Receiver<bool>, stop: &AtomicBool, expires: I
     false
 }
 
-fn log(message: &str) {
+pub(crate) fn log(message: &str) {
     if let Some(directory) = std::env::var_os("LOCALAPPDATA") {
         let path = PathBuf::from(directory)
             .join("wayline")
@@ -922,6 +952,31 @@ mod tests {
             urls: vec![],
             icon: None,
             sender_record_data: None,
+            sender_certificate_sha256: None,
+        }
+    }
+
+    #[test]
+    fn cancellation_and_peer_disconnect_are_status_notices_without_diagnostics() {
+        use wayline_core::TransferFailureKind;
+
+        for kind in [
+            TransferFailureKind::Cancelled,
+            TransferFailureKind::Interrupted,
+            TransferFailureKind::Declined,
+        ] {
+            let mut model = Model::default();
+            model.begin(&transfer("current"), "saved".into());
+            assert!(model.apply(&ReceiverEvent::TransferFailed {
+                transfer_id: "current".into(),
+                error: "peer closed connection (os error 10054)".into(),
+                kind,
+            }));
+            assert!(model.active.is_none());
+            let notice = model.notice.unwrap();
+            assert_eq!(notice.kind, NoticeKind::Info);
+            assert_eq!(notice.full_text, notice.message);
+            assert!(!notice.full_text.contains("10054"));
         }
     }
 
@@ -930,6 +985,8 @@ mod tests {
         let mut share = transfer("web-share");
         share.files.clear();
         share.urls = vec![
+            "A shared title\n https://b23.tv/short \r\n".into(),
+            "bilibili://video/123".into(),
             "https://b23.tv/short".into(),
             "file:///C:/Windows/test.exe".into(),
         ];

@@ -1,3 +1,5 @@
+#[cfg(windows)]
+pub mod channel_switch;
 pub mod client;
 pub mod config;
 pub mod protocol;

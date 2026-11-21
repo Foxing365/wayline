@@ -315,6 +315,10 @@ impl Task {
                             request,
                         });
                     }
+                    Event::AskStarted => tracing::debug!("received /Ask headers"),
+                    Event::AskRejected { status, reason } => {
+                        tracing::debug!(status, reason, "rejected /Ask before consent");
+                    }
                     Event::Ask(ask) => {
                         tracing::debug!(
                             peer = %self.peer,
@@ -369,6 +373,11 @@ impl Task {
                     }
                     Event::CreateFile(path) => {
                         if let Err(e) = staging.as_mut().unwrap().create_file(&path).await {
+                            return self.fail(&mut tls, id, e).await;
+                        }
+                    }
+                    Event::CreateWrappedFile(name) => {
+                        if let Err(e) = staging.as_mut().unwrap().create_wrapped_file(&name).await {
                             return self.fail(&mut tls, id, e).await;
                         }
                     }

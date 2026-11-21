@@ -23,6 +23,7 @@ pub struct LinkStatus {
     pub state: String,
     pub port: Option<String>,
     pub channel: u16,
+    pub rtl8821cu_width_mhz: Option<u16>,
     pub target: Option<String>,
     pub awdl0: bool,
     pub error: Option<String>,
@@ -33,6 +34,7 @@ impl From<Status> for LinkStatus {
             state: status.state,
             port: status.port,
             channel: status.channel,
+            rtl8821cu_width_mhz: status.rtl8821cu_width_mhz,
             target: status.target,
             awdl0: status.awdl0,
             error: status.error,
@@ -62,7 +64,7 @@ pub enum Event {
     HistoryDeletePreferenceSaved(Result<bool, String>),
     HistoryFlushed,
     DownloadDirectorySaved(Result<PathBuf, String>),
-    RadioChannelChanged(Result<Status, String>),
+    RadioChanged(RadioChange, Result<Status, String>),
     Incoming(crate::receiving::IncomingRequest),
     ShutdownDone(Result<bool, String>),
     Firmware(crate::firmware::Event),
@@ -222,8 +224,14 @@ pub fn monitor(tx: Sender<Event>) -> Monitor {
     }
 }
 
-pub fn change_radio_channel(
-    channel: u16,
+#[derive(Clone, Copy)]
+pub enum RadioChange {
+    Channel(u16),
+    MonitorWidth(u16),
+}
+
+pub fn change_radio(
+    change: RadioChange,
     receiver: Option<JoinHandle<()>>,
     tx: Sender<Event>,
 ) -> JoinHandle<()> {
@@ -247,11 +255,15 @@ pub fn change_radio_channel(
                 } else {
                     Duration::from_secs(45)
                 };
-                client
-                    .set_channel_and_wait(channel, timeout)
-                    .map_err(|error| format!("{error}"))
+                match change {
+                    RadioChange::Channel(channel) => client.set_channel_and_wait(channel, timeout),
+                    RadioChange::MonitorWidth(mhz) => {
+                        client.set_rtl8821cu_width_and_wait(mhz, timeout)
+                    }
+                }
+                .map_err(|error| error.to_string())
             });
-        let _ = tx.send(Event::RadioChannelChanged(result));
+        let _ = tx.send(Event::RadioChanged(change, result));
     })
 }
 

@@ -137,8 +137,11 @@ pub enum Item {
     Root,
     Dir(RelPath),
     File(RelPath),
-    /// An AppleDouble `._` sidecar holding a listed item's Finder metadata:
-    /// read past its data, write nothing (UP-7a).
+    /// A wrapped file's top-level publication name. Its archive path stays
+    /// distinct so two explicitly offered files can share a name.
+    WrappedFile(RelPath),
+    /// An AppleDouble sidecar or a directory wrapping individual files.
+    /// Read past the entry and write nothing (UP-2a, UP-7a).
     Skip,
 }
 
@@ -233,8 +236,16 @@ impl Rules {
             .allowed
             .iter()
             .any(|a| path == a.path && a.is_directory == entry.is_dir());
-        let item = if !listed && entry.is_file() && self.is_sidecar(&path) {
+        let wrapper = !listed
+            && entry.is_dir()
+            && path.components().len() == 1
+            && self.allowed.iter().any(|a| {
+                !a.is_directory && a.path.components().len() == 2 && a.path.starts_with(&path)
+            });
+        let item = if wrapper || !listed && entry.is_file() && self.is_sidecar(&path) {
             Item::Skip
+        } else if listed && entry.is_file() && path.components().len() == 2 {
+            Item::WrappedFile(RelPath::file_name(path.last())?)
         } else if listed || self.is_inside_directory(&path) {
             if entry.is_dir() {
                 Item::Dir(path.clone())
@@ -244,11 +255,11 @@ impl Rules {
         } else {
             return Err(Error::NotAsked(entry.name.clone()));
         };
-        if !matches!(item, Item::Skip) {
-            self.written.insert(path.clone());
-        }
-        if !self.seen.insert(path) {
+        if !self.seen.insert(path.clone()) {
             return Err(Error::Duplicate(entry.name.clone()));
+        }
+        if !matches!(item, Item::Skip) {
+            self.written.insert(path);
         }
         self.total = self.total.saturating_add(entry.size);
         if self.total > self.limits.max_total {
@@ -463,6 +474,38 @@ mod tests {
         r.check(&entry("./a", MODE_FILE | 0o644, 1)).unwrap();
         assert!(matches!(
             r.check(&entry("a", MODE_FILE | 0o644, 1)),
+            Err(Error::Duplicate(_))
+        ));
+    }
+
+    #[test]
+    fn same_name_wrapped_files_are_distinct_only_when_both_paths_are_offered() {
+        let mut r = rules(&[("first/photo.jpg", false), ("second/photo.jpg", false)]);
+        let photo = Item::WrappedFile(RelPath::file_name("photo.jpg").unwrap());
+        assert_eq!(
+            r.check(&entry("./first", MODE_DIR | 0o755, 0)),
+            Ok(Item::Skip)
+        );
+        assert!(matches!(r.finish(), Err(Error::Missing(_))));
+        assert_eq!(
+            r.check(&entry("./first/photo.jpg", MODE_FILE | 0o644, 1)),
+            Ok(photo.clone())
+        );
+        assert_eq!(
+            r.check(&entry("./first/._photo.jpg", MODE_FILE | 0o644, 1)),
+            Ok(Item::Skip)
+        );
+        assert!(matches!(
+            r.check(&entry("./first/unlisted.jpg", MODE_FILE | 0o644, 1)),
+            Err(Error::NotAsked(_))
+        ));
+        assert_eq!(
+            r.check(&entry("./second/photo.jpg", MODE_FILE | 0o644, 1)),
+            Ok(photo)
+        );
+        assert!(r.finish().is_ok());
+        assert!(matches!(
+            r.check(&entry("first/photo.jpg", MODE_FILE | 0o644, 1)),
             Err(Error::Duplicate(_))
         ));
     }

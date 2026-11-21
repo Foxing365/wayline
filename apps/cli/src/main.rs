@@ -577,6 +577,7 @@ fn receiver_event(event: ReceiverEvent, output: Output) {
     match event {
         ReceiverEvent::Listening => output.event("listening", json!({})),
         ReceiverEvent::Discovered => output.event("discovered", json!({})),
+        ReceiverEvent::AskStarted => output.event("askStarted", json!({"direction":"receive"})),
         ReceiverEvent::ConnectionFailed { peer, error, kind } => output.event("transferFailed", json!({"direction":"receive","peer":peer.to_string(),"category":kind.as_str(),"message":error})),
         ReceiverEvent::Asked(transfer) => output.event("transferAccepted", json!({"sender":transfer.sender_name,"transferId":transfer.id,"files":transfer.files.iter().map(|f| json!({"name":f.name,"size":f.size})).collect::<Vec<_>>()})),
         ReceiverEvent::ModeSelected(format) => output.event("modeSelected", json!({"direction":"receive","format":format!("{format:?}")})),
@@ -585,7 +586,7 @@ fn receiver_event(event: ReceiverEvent, output: Output) {
         ReceiverEvent::Confirming { transfer_id } => output.event("confirming", json!({"direction":"receive","transferId":transfer_id})),
         ReceiverEvent::TransferFailed { transfer_id, error, kind } => output.event("transferFailed", json!({"direction":"receive","transferId":transfer_id,"category":kind.as_str(),"message":error})),
         ReceiverEvent::Received { transfer, files } => output.event("transferCompleted", json!({"direction":"receive","sender":transfer.sender_name,"transferId":transfer.id,"files":files,"urls":transfer.urls})),
-        ReceiverEvent::Rejected { path, status } => output.event("transferRejected", json!({"direction":"receive","path":path,"status":status})),
+        ReceiverEvent::Rejected { path, status, reason } => output.event("transferRejected", json!({"direction":"receive","path":path,"status":status,"reason":reason})),
     }
 }
 

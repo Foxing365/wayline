@@ -550,6 +550,7 @@ mod tests {
             scanning: true,
             files: vec!["photo.png".into()],
             status: Some(Ok(crate::backend::LinkStatus {
+                rtl8821cu_width_mhz: None,
                 state: "running".into(),
                 port: None,
                 channel: 6,

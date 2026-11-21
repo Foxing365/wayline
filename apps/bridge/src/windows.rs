@@ -12,12 +12,17 @@ use wayline_awdl::{
     windows::{feedback, wintun::Wintun},
     MacAddr,
 };
+use wayline_service::config::{
+    validate_rtl8821cu_mtu, validate_rtl8821cu_width_on_channel, RTL8821CU_DEFAULT_MTU,
+    RTL8821CU_DEFAULT_WIDTH_MHZ,
+};
 use windows_sys::Win32::{
     Foundation::{WAIT_FAILED, WAIT_OBJECT_0},
     System::Threading::{OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE},
 };
 
 mod rtl8821cu;
+mod timer_resolution;
 
 enum RadioSource {
     Esp32(String),
@@ -28,6 +33,7 @@ struct Options {
     source: RadioSource,
     channel: u8,
     managed: bool,
+    rtl_performance: rtl8821cu::PerformanceOptions,
 }
 impl Options {
     fn parse(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Self>> {
@@ -35,10 +41,14 @@ impl Options {
         let mut source = None;
         let mut channel = 6;
         let mut managed = false;
+        let mut rtl_rate_profile = None;
+        let mut rtl_timer_1ms = false;
+        let mut rtl_mtu = None;
+        let mut rtl_width_mhz = None;
         while let Some(arg) = args.next() {
             match arg.to_str() {
                 Some("--help" | "-h") => {
-                    println!("wayline-bridge (--port COM<n> | --rtl8821cu) [--channel 6|44|149] [--managed]\nRequires the verified wintun.dll beside the executable. --managed is for service launches.");
+                    println!("wayline-bridge (--port COM<n> | --rtl8821cu) [--channel 6|44|149] [--managed]\nRTL8821CU options: --rtl-rate-profile baseline|ht20-mcs4|ht20-mcs7, --rtl-timer-1ms, --rtl-mtu 1440|1450, --rtl-width-mhz 20|40|80 (monitor bandwidth; 40/80 require channel 44 or 149)\nRequires the verified wintun.dll beside the executable. --managed is for service launches.");
                     return Ok(None);
                 }
                 Some("--port") => {
@@ -59,6 +69,37 @@ impl Options {
                         return Err(invalid("select exactly one radio"));
                     }
                 }
+                Some("--rtl-rate-profile") => {
+                    let profile = args
+                        .next()
+                        .ok_or_else(|| invalid("--rtl-rate-profile requires a value"))?;
+                    let profile = profile
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid RTL8821CU rate profile"))?
+                        .parse()?;
+                    if rtl_rate_profile.replace(profile).is_some() {
+                        return Err(invalid("select exactly one RTL8821CU rate profile"));
+                    }
+                }
+                Some("--rtl-timer-1ms") => rtl_timer_1ms = true,
+                Some("--rtl-mtu") => {
+                    let mtu = args
+                        .next()
+                        .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| invalid("--rtl-mtu requires 1440 or 1450"))?;
+                    if rtl_mtu.replace(validate_rtl8821cu_mtu(mtu)?).is_some() {
+                        return Err(invalid("select exactly one RTL8821CU MTU"));
+                    }
+                }
+                Some("--rtl-width-mhz") => {
+                    let width = args
+                        .next()
+                        .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| invalid("--rtl-width-mhz requires 20, 40 or 80"))?;
+                    if rtl_width_mhz.replace(width).is_some() {
+                        return Err(invalid("select exactly one RTL8821CU monitor width"));
+                    }
+                }
                 Some("--channel") => {
                     channel = args
                         .next()
@@ -75,13 +116,31 @@ impl Options {
             }
         }
         let source = source.ok_or_else(|| invalid("select --port COM<n> or --rtl8821cu"))?;
+        if matches!(source, RadioSource::Esp32(_))
+            && (rtl_rate_profile.is_some()
+                || rtl_timer_1ms
+                || rtl_mtu.is_some()
+                || rtl_width_mhz.is_some())
+        {
+            return Err(invalid(
+                "--rtl-rate-profile, --rtl-timer-1ms and --rtl-mtu require --rtl8821cu",
+            ));
+        }
         if ![6, 44, 149].contains(&channel) {
             return Err(invalid("unsupported channel"));
         }
+        let rtl_width_mhz = rtl_width_mhz.unwrap_or(RTL8821CU_DEFAULT_WIDTH_MHZ);
+        validate_rtl8821cu_width_on_channel(rtl_width_mhz, u16::from(channel))?;
         Ok(Some(Self {
             source,
             channel,
             managed,
+            rtl_performance: rtl8821cu::PerformanceOptions {
+                rate_profile: rtl_rate_profile.unwrap_or_default(),
+                high_resolution_timer: rtl_timer_1ms,
+                mtu: rtl_mtu.unwrap_or(RTL8821CU_DEFAULT_MTU),
+                width_mhz: rtl_width_mhz as u8,
+            },
         }))
     }
 }
@@ -144,7 +203,14 @@ pub fn main() -> io::Result<()> {
         let helper = executable
             .with_file_name("usb-radio")
             .join("airbridge_radio.exe");
-        return rtl8821cu::run(options.channel, options.managed, helper, dll, stop);
+        return rtl8821cu::run(
+            options.channel,
+            options.managed,
+            helper,
+            dll,
+            stop,
+            options.rtl_performance,
+        );
     };
     // The service owns the device guard for managed children. Foreground use
     // acquires the same guard before any serial/driver access.
@@ -231,6 +297,8 @@ async fn wait_for_stop(event: &Option<StopEvent>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wayline_service::config::Rtl8821cuRateProfile;
+
     fn args(s: &[&str]) -> Vec<OsString> {
         s.iter().map(OsString::from).collect()
     }
@@ -252,5 +320,69 @@ mod tests {
         assert!(matches!(o.source, RadioSource::Esp32(ref port) if port == "COM4"));
         assert_eq!(o.channel, 149);
         assert!(o.managed);
+    }
+
+    #[test]
+    fn accepts_only_explicit_rtl8821cu_experiment_options() {
+        let defaults = Options::parse(args(&["--rtl8821cu"])).unwrap().unwrap();
+        assert_eq!(
+            defaults.rtl_performance.rate_profile,
+            Rtl8821cuRateProfile::Baseline
+        );
+        assert!(!defaults.rtl_performance.high_resolution_timer);
+        assert_eq!(defaults.rtl_performance.mtu, RTL8821CU_DEFAULT_MTU);
+        assert_eq!(defaults.rtl_performance.width_mhz, 20);
+        for profile in [
+            Rtl8821cuRateProfile::Baseline,
+            Rtl8821cuRateProfile::Ht20Mcs4,
+            Rtl8821cuRateProfile::Ht20Mcs7,
+        ] {
+            let options = Options::parse(args(&[
+                "--rtl-rate-profile",
+                profile.as_str(),
+                "--rtl8821cu",
+                "--rtl-timer-1ms",
+                "--rtl-mtu",
+                "1440",
+            ]))
+            .unwrap()
+            .unwrap();
+            assert!(matches!(options.source, RadioSource::Rtl8821cu));
+            assert_eq!(options.rtl_performance.rate_profile, profile);
+            assert!(options.rtl_performance.high_resolution_timer);
+            assert_eq!(options.rtl_performance.mtu, 1440);
+        }
+        for (requested, width) in [("40", 40), ("80", 80)] {
+            let options = Options::parse(args(&[
+                "--rtl-width-mhz",
+                requested,
+                "--channel",
+                "149",
+                "--rtl8821cu",
+            ]))
+            .unwrap()
+            .unwrap();
+            assert_eq!(options.rtl_performance.width_mhz, width);
+        }
+        for invalid in [
+            &["--port", "COM1", "--rtl-rate-profile", "baseline"][..],
+            &["--port", "COM1", "--rtl-timer-1ms"],
+            &["--port", "COM1", "--rtl-mtu", "1440"],
+            &["--port", "COM1", "--rtl-width-mhz", "20"],
+            &["--rtl8821cu", "--rtl-width-mhz", "80"],
+            &["--rtl8821cu", "--channel", "149", "--rtl-width-mhz", "160"],
+            &["--rtl8821cu", "--rtl-rate-profile", "ht40-mcs7"],
+            &["--rtl8821cu", "--rtl-mtu", "1500"],
+            &["--rtl8821cu", "--rtl-rate-profile"],
+            &[
+                "--rtl8821cu",
+                "--rtl-rate-profile",
+                "ht20-mcs7",
+                "--rtl-rate-profile",
+                "baseline",
+            ],
+        ] {
+            assert!(Options::parse(args(invalid)).is_err(), "{invalid:?}");
+        }
     }
 }

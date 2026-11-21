@@ -18,8 +18,13 @@ pub struct Staging {
     dir: tempfile::TempDir,
     dest: PathBuf,
     file: Option<fs::File>,
-    /// Top-level names, in the order they arrived.
-    top: Vec<String>,
+    /// Items to publish, in the order they arrived.
+    top: Vec<Publication>,
+}
+
+enum Publication {
+    TopLevel(String),
+    Wrapped { source: PathBuf, name: String },
 }
 
 impl Staging {
@@ -51,8 +56,12 @@ impl Staging {
 
     fn join(&mut self, path: &RelPath) -> PathBuf {
         let first = &path.components()[0];
-        if !self.top.contains(first) {
-            self.top.push(first.clone());
+        if !self
+            .top
+            .iter()
+            .any(|item| matches!(item, Publication::TopLevel(name) if name == first))
+        {
+            self.top.push(Publication::TopLevel(first.clone()));
         }
         let mut out = self.dir.path().to_path_buf();
         out.extend(path.components());
@@ -74,6 +83,27 @@ impl Staging {
         #[cfg(unix)]
         options.mode(0o644);
         self.file = Some(options.open(path).await?);
+        Ok(())
+    }
+
+    pub async fn create_wrapped_file(&mut self, name: &RelPath) -> io::Result<()> {
+        // Keep the published basename separate from the staging path, so
+        // MoveFileExW/renameat2 can choose one suffix for all collisions.
+        let directory = self.dir.path().to_path_buf();
+        let (file, source) = tokio::task::spawn_blocking(move || {
+            tempfile::Builder::new()
+                .prefix(".owly-wrapped-")
+                .tempfile_in(directory)?
+                .keep()
+                .map_err(|error| error.error)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        self.file = Some(fs::File::from_std(file));
+        self.top.push(Publication::Wrapped {
+            source,
+            name: name.last().to_owned(),
+        });
         Ok(())
     }
 
@@ -100,8 +130,12 @@ impl Staging {
         let top = std::mem::take(&mut self.top);
         tokio::task::spawn_blocking(move || {
             let mut moved = Vec::new();
-            for name in top {
-                match move_unique(&staging.join(&name), &dest, &name) {
+            for item in top {
+                let (source, name) = match item {
+                    Publication::TopLevel(name) => (staging.join(&name), name),
+                    Publication::Wrapped { source, name } => (source, name),
+                };
+                match move_unique(&source, &dest, &name) {
                     Ok(path) => moved.push(path),
                     Err(error) => {
                         rollback(&moved);

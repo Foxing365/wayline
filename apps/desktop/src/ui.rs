@@ -1,10 +1,13 @@
+mod compact_send;
+mod live_transfer;
+
 use crate::{
-    backend::{self, Event},
+    backend::{self, Event, RadioChange},
     i18n::{self, Language},
     model::{Model, Phase, Visibility, file_size},
     native::{Action, Shell},
     preview::{FileKind, MAX_PREVIEWS},
-    scroll_area::ScrollbarExt,
+    scroll_area::{ScrollbarExt, client_area_animation_enabled},
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -23,6 +26,12 @@ enum ExitState {
     Stopping,
     FlushingHistory(bool),
     Failed(String),
+}
+
+enum IncomingAnswer {
+    Accept,
+    Decline,
+    AutoAccept,
 }
 
 struct HistoryDeletion {
@@ -50,6 +59,10 @@ pub struct Capsule {
     name_input: Option<Entity<crate::name_input::NameInput>>,
     name_input_subscription: Option<Subscription>,
     settings_open: bool,
+    compact_send_view: bool,
+    saved_compact_send_view: bool,
+    animate_send_view: bool,
+    startup_prewarm: bool,
     history_open: bool,
     history: Vec<wayline_host::TransferHistoryRecord>,
     history_detail: Option<wayline_host::TransferHistoryRecord>,
@@ -69,7 +82,7 @@ pub struct Capsule {
     notification_position_menu_open: bool,
     notification_duration_menu_open: bool,
     settings_error: Option<String>,
-    radio_channel_pending: Option<u16>,
+    radio_change_pending: bool,
     name_saved: bool,
     device_name: String,
     receiver: crate::receiving::ReceiverHost,
@@ -80,6 +93,8 @@ pub struct Capsule {
     download_directory: Option<PathBuf>,
     receiver_declined_until: Option<Instant>,
     incoming: Option<crate::receiving::IncomingRequest>,
+    trust_incoming: bool,
+    trusted_senders: Vec<wayline_host::TrustedSender>,
     drop_hovered: bool,
     opening_files: Option<u64>,
     queued_files: Vec<PathBuf>,
@@ -92,7 +107,12 @@ pub struct Capsule {
 }
 
 impl Capsule {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, files: Vec<PathBuf>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        files: Vec<PathBuf>,
+        background: bool,
+    ) -> Self {
         let detected = Language::detect();
         let (language, language_error) = match Language::load_preference() {
             Ok(Some(language)) => (language, None),
@@ -180,12 +200,21 @@ impl Capsule {
             crate::settings::DEFAULT_DRAG_ACTIVATE,
             text.drag_activate,
         );
+        let compact_send_view = load_preference(
+            crate::settings::load_compact_send_view(),
+            false,
+            text.send_layout_title,
+        );
+        let trusted_senders = wayline_host::load_trusted_senders().unwrap_or_else(|error| {
+            settings_error = Some(format!("{} {error:#}", text.trusted_senders_error));
+            Vec::new()
+        });
         let (tx, rx) = mpsc::channel();
         let (history_worker, history_thread) = crate::history::StoreWorker::start(tx.clone());
         let (action_tx, actions) = mpsc::channel();
         if !files.is_empty() {
             let _ = action_tx.send(Action::Files(files));
-        } else if std::env::args_os().any(|arg| arg == "--show-in-taskbar") {
+        } else if !background {
             let _ = action_tx.send(Action::Show);
         }
         let shell = Shell::new(window, action_tx).expect("initialize Windows shell integration");
@@ -235,6 +264,10 @@ impl Capsule {
             name_input: None,
             name_input_subscription: None,
             settings_open: false,
+            compact_send_view,
+            saved_compact_send_view: compact_send_view,
+            animate_send_view: client_area_animation_enabled(),
+            startup_prewarm: crate::integration::startup_prewarm_enabled(),
             history_open: false,
             history: Vec::new(),
             history_detail: None,
@@ -254,7 +287,7 @@ impl Capsule {
             notification_position_menu_open: false,
             notification_duration_menu_open: false,
             settings_error,
-            radio_channel_pending: None,
+            radio_change_pending: false,
             name_saved: false,
             device_name,
             receiver,
@@ -265,6 +298,8 @@ impl Capsule {
             download_directory,
             receiver_declined_until: None,
             incoming: None,
+            trust_incoming: false,
+            trusted_senders,
             drop_hovered: false,
             opening_files: None,
             queued_files: Vec::new(),
@@ -523,8 +558,8 @@ impl Capsule {
                     changed = true;
                     continue;
                 }
-                Event::RadioChannelChanged(result) => {
-                    self.radio_channel_pending = None;
+                Event::RadioChanged(change, result) => {
+                    self.radio_change_pending = false;
                     self.receiver = crate::receiving::ReceiverHost::new(self.tx.clone());
                     self.receiver.configure(
                         self.model
@@ -534,33 +569,60 @@ impl Capsule {
                     match result {
                         Ok(_) => self.settings_error = None,
                         Err(error) => {
-                            self.settings_error = Some(format!(
-                                "{}{error}",
-                                self.language.strings().err_channel_change
-                            ));
+                            let text = self.language.strings();
+                            let prefix = match change {
+                                RadioChange::Channel(_) => text.err_channel_change,
+                                RadioChange::MonitorWidth(_) => text.err_width_change,
+                            };
+                            self.settings_error = Some(format!("{prefix}{error}"));
                         }
                     }
                     changed = true;
                     continue;
                 }
                 Event::Incoming(request) => {
-                    if self.incoming.is_some()
-                        || self.receiver_status.is_err()
-                        || self.download_directory.as_ref() != Some(&request.save_dir)
-                        || self.firmware.busy
-                        || self.receive.active.is_some()
-                        || self.model.phase.busy()
-                        || self.picker_open
-                        || self.name_input.is_some()
-                        || self.history_open
-                        || !request.active()
-                    {
+                    let reason = if !request.active() {
+                        Some("expired or receiver stopping")
+                    } else if self.download_directory.as_ref() != Some(&request.save_dir) {
+                        Some("download directory changed")
+                    } else if self.incoming.is_some() || self.receive.active.is_some() {
+                        Some("another incoming transfer is active")
+                    } else if self.firmware.busy || self.model.phase.busy() {
+                        Some("firmware update or outgoing transfer is active")
+                    } else if self.picker_open {
+                        Some("file picker is open")
+                    } else if self.name_input.is_some() {
+                        Some("device name is being edited")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        crate::receiving::log(&format!(
+                            "incoming ask declined by desktop: {reason}"
+                        ));
                         let _ = request.decision.send(false);
                     } else {
-                        self.expand(true, window, cx);
+                        let trusted =
+                            request
+                                .transfer
+                                .file_offer_certificate()
+                                .is_some_and(|pin| {
+                                    self.trusted_senders
+                                        .iter()
+                                        .any(|entry| entry.certificate_sha256 == pin)
+                                });
                         self.receive.dismiss_notice();
                         self.incoming = Some(request);
+                        self.trust_incoming = false;
                         self.receiver_declined_until = None;
+                        if trusted {
+                            crate::receiving::log(
+                                "incoming files approved by matching saved certificate",
+                            );
+                            self.answer_incoming(IncomingAnswer::AutoAccept, cx);
+                        } else {
+                            self.expand(true, window, cx);
+                        }
                     }
                     changed = true;
                     continue;
@@ -763,6 +825,7 @@ impl Capsule {
                     return;
                 }
                 Action::Reposition => {
+                    self.animate_send_view = client_area_animation_enabled();
                     self.place();
                 }
                 Action::RestoreTray => {
@@ -777,7 +840,7 @@ impl Capsule {
             .as_ref()
             .is_some_and(|request| !request.active())
         {
-            self.answer_incoming(false, cx);
+            self.answer_incoming(IncomingAnswer::Decline, cx);
             self.receive.show_notice(
                 self.language.strings().incoming_ended,
                 crate::receiving::NoticeKind::Info,
@@ -936,10 +999,48 @@ impl Capsule {
         cx.notify();
     }
 
+    fn set_compact_send_view(&mut self, compact: bool, cx: &mut Context<Self>) {
+        if compact == self.saved_compact_send_view {
+            return;
+        }
+        self.settings_error = match crate::settings::save_compact_send_view(compact) {
+            Ok(saved) => {
+                self.saved_compact_send_view = saved;
+                None
+            }
+            Err(error) => {
+                let text = self.language.strings();
+                Some(format!(
+                    "{}{}: {error:#}",
+                    text.err_behavior_setting_save, text.send_layout_title
+                ))
+            }
+        };
+        cx.notify();
+    }
+
+    fn toggle_startup_prewarm(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.startup_prewarm;
+        self.settings_error = match crate::integration::set_startup_prewarm(enabled) {
+            Ok(()) => {
+                self.startup_prewarm = enabled;
+                None
+            }
+            Err(error) => {
+                let text = self.language.strings();
+                Some(format!(
+                    "{}{}: {error:#}",
+                    text.err_behavior_setting_save, text.startup_prewarm
+                ))
+            }
+        };
+        cx.notify();
+    }
+
     fn expand(&mut self, expanded: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !expanded {
             self.receive.reset_notice_hover();
-            self.answer_incoming(false, cx);
+            self.answer_incoming(IncomingAnswer::Decline, cx);
         }
         self.drop_hovered = false;
         self.settings_open = false;
@@ -1050,43 +1151,49 @@ impl Capsule {
             && !self.receiver.has_active_transfers()
     }
 
-    fn can_change_radio_channel(&self, channel: u16) -> bool {
-        if self.radio_channel_pending.is_some()
-            || self.firmware.busy
-            || self.model.phase.busy()
-            || self.picker_open
-            || self.name_input.is_some()
-            || self.incoming.is_some()
-            || self.receive.active.is_some()
-            || self.receiver.has_active_transfers()
-        {
-            return false;
-        }
+    fn can_change_radio(&self, change: RadioChange) -> bool {
         let Some(Ok(status)) = self.model.status.as_ref() else {
             return false;
         };
-        if status.channel == channel {
+        if self.radio_change_pending
+            || self.model.phase.busy()
+            || self.model.scanning
+            || !self.can_change_download_directory()
+        {
             return false;
         }
-        match channel {
-            6 => true,
-            44 | 149 => {
+        match change {
+            RadioChange::Channel(channel) if status.channel == channel => false,
+            RadioChange::Channel(6) => status.rtl8821cu_width_mhz.unwrap_or(20) == 20,
+            RadioChange::Channel(44 | 149) => {
                 matches!(status.target.as_deref(), Some("esp32c5" | "rtl8821cu")) && status.ready()
             }
+            RadioChange::MonitorWidth(width) => status.rtl8821cu_width_mhz.is_some_and(|current| {
+                current != width
+                    && (width == 20
+                        || matches!(width, 40 | 80)
+                            && matches!(status.channel, 44 | 149)
+                            && status.ready())
+            }),
             _ => false,
         }
     }
 
-    fn set_radio_channel(&mut self, channel: u16, cx: &mut Context<Self>) {
-        if !self.can_change_radio_channel(channel) {
+    fn set_radio(&mut self, change: RadioChange, cx: &mut Context<Self>) {
+        if !self.can_change_radio(change) {
             return;
         }
-        self.radio_channel_pending = Some(channel);
+        self.radio_change_pending = true;
         self.settings_error = None;
-        self.receiver_status = Err(self.language.strings().switching_channel.into());
+        let text = self.language.strings();
+        self.receiver_status = Err(match change {
+            RadioChange::Channel(_) => text.switching_channel,
+            RadioChange::MonitorWidth(_) => text.switching_width,
+        }
+        .into());
         let receiver_worker = self.receiver.shutdown();
-        self.workers.push(backend::change_radio_channel(
-            channel,
+        self.workers.push(backend::change_radio(
+            change,
             receiver_worker,
             self.tx.clone(),
         ));
@@ -1235,7 +1342,11 @@ impl Capsule {
         cx.notify();
     }
     fn scan(&mut self, cx: &mut Context<Self>) {
-        if self.firmware.busy || self.model.scanning || self.model.phase.busy() {
+        if self.radio_change_pending
+            || self.firmware.busy
+            || self.model.scanning
+            || self.model.phase.busy()
+        {
             return;
         }
         self.model.scan_id += 1;
@@ -1257,7 +1368,8 @@ impl Capsule {
         cx.notify();
     }
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.firmware.busy
+        if self.radio_change_pending
+            || self.firmware.busy
             || self.picker_open
             || self.name_input.is_some()
             || self.queued_at.is_some()
@@ -1511,6 +1623,16 @@ impl Capsule {
     fn panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
         let (status, color) = self.status_text();
+        let compact_theme = self.compact_send_view
+            && !self.settings_open
+            && !self.history_open
+            && !self.firmware.open
+            && self.incoming.is_none();
+        let backdrop = if compact_theme { 0xf8fafc } else { 0x1c1c1f };
+        let surface = if compact_theme { 0xe9eef4 } else { SURFACE };
+        let hover = if compact_theme { 0xdce8f6 } else { 0x393940 };
+        let ink = if compact_theme { 0x172538 } else { INK };
+        let muted = if compact_theme { 0x4d5d74 } else { MUTED };
         let show_back = self.incoming.is_none()
             && (self.settings_open
                 || self.history_open
@@ -1521,16 +1643,24 @@ impl Capsule {
             .id("panel")
             .size_full()
             .rounded(px(crate::window_frame::CORNER_RADIUS))
-            .bg(rgb(0x1c1c1f))
+            .bg(rgb(backdrop))
             .border_1()
-            .border_color(rgba(0xffffff24))
+            .border_color(rgba(if compact_theme {
+                0x15253b35
+            } else {
+                0xffffff24
+            }))
             .flex()
             .flex_col()
             .p(px(22.))
             .overflow_hidden()
             .relative()
             .when(self.drop_hovered, |panel| {
-                panel.border_color(rgb(BLUE)).bg(rgb(0x202b38))
+                panel.border_color(rgb(BLUE)).bg(rgb(if compact_theme {
+                    0xe6f0fc
+                } else {
+                    0x202b38
+                }))
             })
             .child(
                 div()
@@ -1549,6 +1679,7 @@ impl Capsule {
                                 div()
                                     .text_size(px(17.))
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(ink))
                                     .child("Wayline"),
                             ),
                     )
@@ -1570,20 +1701,20 @@ impl Capsule {
                                             .size(px(28.))
                                             .flex_shrink_0()
                                             .rounded_full()
-                                            .bg(rgb(SURFACE))
+                                            .bg(rgb(surface))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .text_size(px(11.))
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(muted))
                                             .child(firmware_icon())
                                             .tooltip(move |window, cx| {
                                                 icon_tooltip(text.firmware_title, window, cx)
                                             })
                                             .when(self.can_open_firmware(), |control| {
-                                                control.cursor_pointer().hover(|s| {
-                                                    s.bg(rgb(0x393940)).text_color(rgb(INK))
+                                                control.cursor_pointer().hover(move |s| {
+                                                    s.bg(rgb(hover)).text_color(rgb(ink))
                                                 })
                                             })
                                             .when(!self.can_open_firmware(), |control| {
@@ -1606,18 +1737,18 @@ impl Capsule {
                                             .id("history")
                                             .size(px(28.))
                                             .rounded_full()
-                                            .bg(rgb(SURFACE))
+                                            .bg(rgb(surface))
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(muted))
                                             .child(history_icon())
                                             .tooltip(move |window, cx| {
                                                 icon_tooltip(text.history_title, window, cx)
                                             })
                                             .when(self.can_open_history(), |control| {
-                                                control.cursor_pointer().hover(|s| {
-                                                    s.bg(rgb(0x393940)).text_color(rgb(INK))
+                                                control.cursor_pointer().hover(move |s| {
+                                                    s.bg(rgb(hover)).text_color(rgb(ink))
                                                 })
                                             })
                                             .when(!self.can_open_history(), |control| {
@@ -1635,11 +1766,11 @@ impl Capsule {
                                         .id("settings")
                                         .size(px(28.))
                                         .rounded_full()
-                                        .bg(rgb(SURFACE))
+                                        .bg(rgb(surface))
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(muted))
                                         .child(settings_gear())
                                         .tooltip(move |window, cx| {
                                             icon_tooltip(text.settings_title, window, cx)
@@ -1649,8 +1780,8 @@ impl Capsule {
                                                 && !self.picker_open
                                                 && self.name_input.is_none(),
                                             |control| {
-                                                control.cursor_pointer().hover(|s| {
-                                                    s.bg(rgb(0x393940)).text_color(rgb(INK))
+                                                control.cursor_pointer().hover(move |s| {
+                                                    s.bg(rgb(hover)).text_color(rgb(ink))
                                                 })
                                             },
                                         )
@@ -1677,15 +1808,25 @@ impl Capsule {
                                     .justify_center()
                                     .when(pinned, |control| {
                                         control
-                                            .bg(rgb(0x182c40))
+                                            .bg(rgb(if compact_theme {
+                                                0xd9e9fa
+                                            } else {
+                                                0x182c40
+                                            }))
                                             .text_color(rgb(BLUE))
-                                            .hover(|s| s.bg(rgb(0x223d59)))
+                                            .hover(move |s| {
+                                                s.bg(rgb(if compact_theme {
+                                                    0xcbe1fa
+                                                } else {
+                                                    0x223d59
+                                                }))
+                                            })
                                     })
                                     .when(!pinned, |control| {
                                         control
-                                            .bg(rgb(SURFACE))
-                                            .text_color(rgb(MUTED))
-                                            .hover(|s| s.bg(rgb(0x393940)).text_color(rgb(INK)))
+                                            .bg(rgb(surface))
+                                            .text_color(rgb(muted))
+                                            .hover(move |s| s.bg(rgb(hover)).text_color(rgb(ink)))
                                     })
                                     .child(pin_icon(pinned))
                                     .tooltip(move |window, cx| {
@@ -1709,25 +1850,27 @@ impl Capsule {
                                     .cursor_pointer()
                                     .size(px(28.))
                                     .rounded_full()
-                                    .bg(rgb(SURFACE))
+                                    .bg(rgb(surface))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(muted))
                                     .text_size(px(20.))
                                     .child("×")
-                                    .hover(|s| s.bg(rgb(0x393940)))
+                                    .hover(move |s| s.bg(rgb(hover)))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.expand(false, window, cx)
                                     })),
                             ),
                     ),
             )
-            .children(
-                self.settings_error
-                    .as_ref()
-                    .map(|error| self.error_view(error)),
-            )
+            .children(self.settings_error.as_ref().map(|error| {
+                if compact_theme {
+                    self.compact_send_error(error)
+                } else {
+                    self.error_view(error)
+                }
+            }))
             .child(
                 div()
                     .flex_1()
@@ -1755,7 +1898,7 @@ impl Capsule {
                                         .gap(px(4.))
                                         .rounded(px(8.))
                                         .cursor_pointer()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(muted))
                                         .child(back_chevron())
                                         .child(div().text_size(px(11.)).line_height(px(14.)).child(
                                             if self.history_open {
@@ -1766,7 +1909,7 @@ impl Capsule {
                                                 text.back
                                             },
                                         ))
-                                        .hover(|s| s.bg(rgb(SURFACE)).text_color(rgb(INK)))
+                                        .hover(move |s| s.bg(rgb(surface)).text_color(rgb(ink)))
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
                                                 this.back(window, cx)
@@ -1810,14 +1953,13 @@ impl Capsule {
                         self.history_view(cx)
                     } else if self.settings_open {
                         self.settings_view(cx)
-                    } else if self.model.phase != Phase::Ready {
-                        self.transfer_view(cx)
-                    } else if self.receive.active.is_some() && self.model.files.is_empty() {
+                    } else if self.model.phase == Phase::Ready
+                        && self.receive.active.is_some()
+                        && self.model.files.is_empty()
+                    {
                         self.receiving_view(false)
-                    } else if self.model.files.is_empty() {
-                        self.empty_view(cx)
                     } else {
-                        self.files_view(cx)
+                        self.send_page(cx)
                     }),
             )
             .when(self.incoming.is_none(), |panel| {
@@ -1838,7 +1980,7 @@ impl Capsule {
                                 .w_full()
                                 .text_center()
                                 .text_size(px(10.))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(muted))
                                 .child(text.receiver_declined),
                         )
                     })
@@ -1851,7 +1993,7 @@ impl Capsule {
                     .justify_between()
                     .items_center()
                     .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(muted))
                     .child(
                         div()
                             .flex()
@@ -1906,7 +2048,8 @@ impl Capsule {
         cx.notify();
     }
     fn firmware_transfer_active(&self) -> bool {
-        self.model.phase.busy()
+        self.radio_change_pending
+            || self.model.phase.busy()
             || self.receive.active.is_some()
             || self.incoming.is_some()
             || self.receiver.has_active_transfers()
@@ -2473,7 +2616,7 @@ impl Capsule {
                     .gap(px(8.))
                     .children(choices.iter().copied().map(|channel| {
                         let selected = channel == status.map_or(0, |status| status.channel);
-                        let enabled = self.can_change_radio_channel(channel);
+                        let enabled = self.can_change_radio(RadioChange::Channel(channel));
                         let label = match channel {
                             6 => text.channel_6,
                             44 => text.channel_44,
@@ -2501,11 +2644,15 @@ impl Capsule {
                                     .hover(|style| style.bg(rgb(0x484850)))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_radio_channel(channel, cx)
+                                this.set_radio(RadioChange::Channel(channel), cx)
                             }))
                     })),
             )
-            .when(self.radio_channel_pending.is_some(), |view| {
+            .when_some(
+                status.and_then(|status| status.rtl8821cu_width_mhz),
+                |view, current| view.child(self.radio_width_controls(current, cx)),
+            )
+            .when(self.radio_change_pending, |view| {
                 view.child(
                     div()
                         .text_size(px(10.))
@@ -2514,6 +2661,54 @@ impl Capsule {
                 )
             })
             .into_any_element()
+    }
+
+    fn radio_width_controls(&self, current: u16, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self.language.strings();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(7.))
+            .child(div().text_size(px(12.)).child(text.radio_width_title))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .children([20, 40, 80].map(|width| {
+                        let change = RadioChange::MonitorWidth(width);
+                        let selected = current == width;
+                        let enabled = self.can_change_radio(change);
+                        div()
+                            .id(("rtl8821cu-width", u32::from(width)))
+                            .h(px(32.))
+                            .px(px(10.))
+                            .rounded(px(8.))
+                            .bg(rgb(if selected { BLUE } else { 0x393940 }))
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.))
+                            .child(format!("{width} MHz"))
+                            .when(!enabled && !selected, |button| button.opacity(0.4))
+                            .when(enabled, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x484850)))
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.set_radio(change, cx)
+                                        }),
+                                    )
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .whitespace_normal()
+                    .child(text.radio_width_hint),
+            )
     }
 
     fn language_settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3097,6 +3292,7 @@ impl Capsule {
             .flex_col()
             .gap(px(12.))
             .child(self.language_settings_view(cx))
+            .child(self.send_layout_settings_view(cx))
             .child(
                 div()
                     .flex_shrink_0()
@@ -3106,6 +3302,16 @@ impl Capsule {
                     .flex()
                     .flex_col()
                     .gap(px(10.))
+                    .child(
+                        checkbox(
+                            "startup-prewarm",
+                            text.startup_prewarm,
+                            self.startup_prewarm,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_startup_prewarm(cx);
+                        })),
+                    )
                     .child(
                         checkbox(
                             "desktop-notifications-enabled",
@@ -3135,6 +3341,7 @@ impl Capsule {
                     .child(self.notification_duration_select(cx)),
             )
             .child(self.radio_settings_view(cx))
+            .child(self.trusted_senders_view(cx))
             .child(
                 div()
                     .flex_shrink_0()
@@ -3978,10 +4185,96 @@ impl Capsule {
         .into_any_element()
     }
 
-    fn answer_incoming(&mut self, accepted: bool, cx: &mut Context<Self>) {
+    fn trusted_senders_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self.language.strings();
+        div()
+            .flex_shrink_0()
+            .rounded(px(16.))
+            .bg(rgb(SURFACE))
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(div().text_size(px(13.)).child(text.trusted_senders))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(text.trusted_senders_hint),
+            )
+            .children(
+                self.trusted_senders
+                    .iter()
+                    .enumerate()
+                    .map(|(index, sender)| {
+                        let pin = sender.certificate_sha256;
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .child(sender.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(MUTED))
+                                            .child(short_certificate_pin(pin)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("forget-trusted-sender", index))
+                                    .flex_shrink_0()
+                                    .px(px(7.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(BLUE))
+                                    .child(text.trusted_sender_forget)
+                                    .cursor_pointer()
+                                    .hover(|item| item.bg(rgb(0x38383d)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.update_trusted_senders(
+                                            wayline_host::forget_trusted_sender(pin),
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                    }),
+            )
+    }
+
+    fn update_trusted_senders(&mut self, result: anyhow::Result<Vec<wayline_host::TrustedSender>>) {
+        match result {
+            Ok(senders) => self.trusted_senders = senders,
+            Err(error) => {
+                let message = format!(
+                    "{} {error:#}",
+                    self.language.strings().trusted_senders_error
+                );
+                self.settings_error = Some(message.clone());
+                self.receive
+                    .show_notice(message, crate::receiving::NoticeKind::Error);
+            }
+        }
+    }
+
+    fn answer_incoming(&mut self, answer: IncomingAnswer, cx: &mut Context<Self>) {
+        let trust_incoming = std::mem::take(&mut self.trust_incoming);
         if let Some(request) = self.incoming.take() {
             let active = request.active();
-            let accepted = accepted && active;
+            let accepted = !matches!(answer, IncomingAnswer::Decline) && active;
             let channel = self.model.current_channel();
             let declined_record = (!accepted && active).then(|| {
                 let mut record = crate::receiving::declined_history_record(
@@ -4000,8 +4293,20 @@ impl Capsule {
             if accepted && delivered {
                 self.receive.set_channel(channel);
                 self.receive.begin(&request.transfer, request.save_dir);
-                self.settings_open = false;
-                self.firmware.open = false;
+                if matches!(answer, IncomingAnswer::Accept) {
+                    self.settings_open = false;
+                    self.firmware.open = false;
+                }
+                if trust_incoming
+                    && let Some(certificate_sha256) = request.transfer.file_offer_certificate()
+                {
+                    self.update_trusted_senders(wayline_host::trust_sender(
+                        wayline_host::TrustedSender {
+                            name: request.transfer.sender_name,
+                            certificate_sha256,
+                        },
+                    ));
+                }
             } else if active && delivered {
                 self.receive.dismiss_notice();
                 self.receiver_declined_until = Some(Instant::now() + Duration::from_secs(3));
@@ -4021,173 +4326,21 @@ impl Capsule {
         }
     }
 
-    fn receiving_view(&self, compact: bool) -> AnyElement {
-        use crate::receiving::Phase as ReceivePhase;
-        let text = self.language.strings();
-        let transfer = self.receive.active.as_ref().unwrap();
-        let speed = self
-            .receive
-            .speed_bytes_per_second
-            .map(|bytes| self.language.transfer_speed(&file_size(bytes)));
-        let elapsed = self
-            .receive
-            .receive_elapsed(Instant::now())
-            .map(|duration| {
-                self.language
-                    .transfer_elapsed(duration.as_millis().min(u64::MAX as u128) as u64)
-            });
-        let (title, detail, fraction) = match transfer.phase {
-            ReceivePhase::Waiting => (
-                text.receive_waiting_title,
-                text.receive_waiting_detail.into(),
-                None,
-            ),
-            ReceivePhase::Receiving {
-                received,
-                total: Some(total),
-            } if total > 0 => {
-                let fraction = (received as f64 / total as f64).clamp(0., 1.) as f32;
-                (
-                    text.receiving_title,
-                    format!(
-                        "{} / {} · {:.0}%",
-                        file_size(received),
-                        file_size(total),
-                        fraction * 100.
-                    ),
-                    Some(fraction),
-                )
-            }
-            ReceivePhase::Receiving { received, .. } => (
-                text.receiving_title,
-                self.language.received_size(&file_size(received)),
-                None,
-            ),
-            ReceivePhase::Confirming => (
-                text.receive_confirming_title,
-                text.receive_confirming_detail.into(),
-                Some(1.),
-            ),
-        };
-        let bar = div().h_full().rounded_full().bg(rgb(BLUE));
-        let progress = match fraction {
-            Some(fraction) => bar.w(relative(fraction)).into_any_element(),
-            None => bar
-                .absolute()
-                .w(relative(0.25))
-                .with_animation(
-                    "receiving-indeterminate",
-                    Animation::new(Duration::from_secs(2))
-                        .repeat()
-                        .with_easing(bounce(ease_in_out)),
-                    |bar, delta| bar.left(relative(delta * 0.75)),
-                )
-                .into_any_element(),
-        };
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(if compact { 8. } else { 16. }))
-            .when(compact, |view| {
-                view.flex_shrink_0()
-                    .rounded(px(12.))
-                    .bg(rgb(SURFACE))
-                    .p(px(12.))
-            })
-            .when(!compact, |view| {
-                view.flex_1()
-                    .min_h_0()
-                    .justify_center()
-                    .items_center()
-                    .child(
-                        div()
-                            .size(px(76.))
-                            .rounded_full()
-                            .bg(rgb(0x233249))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(34.))
-                            .text_color(rgb(BLUE))
-                            .child("↓"),
-                    )
-            })
-            .child(
-                div()
-                    .text_size(px(if compact { 13. } else { 22. }))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(
-                        self.language
-                            .transfer_files(&transfer.sender, transfer.files),
-                    ),
-            )
-            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                self.language.transfer_network(
-                    self.receive.transfer_metadata().0,
-                    self.receive.transfer_metadata().1,
-                ),
-            ))
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .h(px(5.))
-                    .rounded_full()
-                    .overflow_hidden()
-                    .bg(rgb(0x3a3a40))
-                    .child(progress),
-            )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(detail),
-            )
-            .when_some(speed, |view, speed| {
-                view.child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(speed))
-            })
-            .when_some(elapsed, |view, elapsed| {
-                view.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(elapsed),
-                )
-            })
-            .when(!compact, |view| {
-                view.child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgb(MUTED))
-                        .whitespace_normal()
-                        .child(
-                            self.language
-                                .saved_to(&transfer.save_dir.display().to_string()),
-                        ),
-                )
-            })
-            .into_any_element()
-    }
-
     fn incoming_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
         let request = self.incoming.as_ref().unwrap();
         let is_link_share = !request.transfer.urls.is_empty();
-        div()
-            .flex_1()
-            .min_h_0()
+        let certificate = request
+            .transfer
+            .file_offer_certificate()
+            .filter(|_| wayline_host::normalize_name(&request.transfer.sender_name).is_ok());
+        let content = div()
+            .flex_grow()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(16.))
+            .gap(px(12.))
             .child(
                 div()
                     .text_size(px(24.))
@@ -4212,27 +4365,21 @@ impl Capsule {
                     }),
             )
             .child(
-                div()
-                    .id("incoming-files")
-                    .max_h(px(160.))
-                    .visible_scrollbar()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .children(
-                        request
-                            .transfer
-                            .files
-                            .iter()
-                            .map(|file| file.name.clone())
-                            .chain(
-                                request
-                                    .transfer
-                                    .urls
-                                    .iter()
-                                    .filter_map(|url| wayline_core::airdrop::web_url(url)),
-                            )
-                            .map(|name| div().whitespace_normal().mb(px(6.)).child(name)),
-                    ),
+                div().text_size(px(12.)).text_color(rgb(MUTED)).children(
+                    request
+                        .transfer
+                        .files
+                        .iter()
+                        .map(|file| file.name.clone())
+                        .chain(
+                            request
+                                .transfer
+                                .urls
+                                .iter()
+                                .filter_map(|url| wayline_core::airdrop::web_url(url)),
+                        )
+                        .map(|name| div().whitespace_normal().mb(px(6.)).child(name)),
+                ),
             )
             .when(!is_link_share, |view| {
                 view.child(
@@ -4245,6 +4392,31 @@ impl Capsule {
                                 .accepted_save_to(&request.save_dir.display().to_string()),
                         ),
                 )
+            });
+        let actions = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .when_some(certificate, |actions, pin| {
+                actions
+                    .child(
+                        checkbox(
+                            "trust-incoming",
+                            text.trusted_sender_auto_accept,
+                            self.trust_incoming,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.trust_incoming = !this.trust_incoming;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        div()
+                            .pl(px(25.))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(short_certificate_pin(pin)),
+                    )
             })
             .child(
                 button(
@@ -4256,12 +4428,66 @@ impl Capsule {
                     },
                     true,
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.answer_incoming(true, cx))),
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.answer_incoming(IncomingAnswer::Accept, cx)),
+                ),
             )
             .child(
                 button("decline-incoming", text.decline, true)
                     .bg(rgb(SURFACE))
-                    .on_click(cx.listener(|this, _, _, cx| this.answer_incoming(false, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.answer_incoming(IncomingAnswer::Decline, cx)
+                    })),
+            );
+        crate::share_layout::page_with_actions(
+            "incoming-request",
+            content.into_any_element(),
+            actions.into_any_element(),
+        )
+        .into_any_element()
+    }
+
+    fn send_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (ready, empty) = (
+            self.model.phase == Phase::Ready,
+            self.model.files.is_empty(),
+        );
+        let page = if self.compact_send_view {
+            self.compact_send_panel(cx)
+        } else if !ready {
+            self.transfer_view(cx)
+        } else if empty {
+            self.empty_view(cx)
+        } else {
+            self.files_view(cx)
+        };
+        if !self.animate_send_view {
+            return page;
+        }
+        // One identity per screen. Device discoveries and progress updates
+        // repaint in place and do not restart the entrance animation.
+        let animation_id = if !ready {
+            "send-transfer-entrance"
+        } else if empty {
+            "send-empty-entrance"
+        } else {
+            "send-devices-entrance"
+        };
+        div()
+            .relative()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(page)
+            .with_animation(
+                animation_id,
+                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                |page, progress| {
+                    page.opacity(0.7 + progress * 0.3)
+                        .top(px(3. * (1. - progress)))
+                },
             )
             .into_any_element()
     }
@@ -4651,146 +4877,14 @@ impl Capsule {
     fn transfer_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
         let complete = self.model.phase == Phase::Complete;
-        let declined = self.model.phase == Phase::Declined;
-        let uploading = matches!(self.model.phase, Phase::Uploading { .. });
-        let subtitle = match self.model.phase {
-            Phase::Preparing => text.transfer_preparing,
-            Phase::Waiting => text.transfer_waiting,
-            Phase::Confirming => text.transfer_confirming,
-            Phase::Complete => text.transfer_complete,
-            Phase::Cancelled => text.transfer_cancelled,
-            Phase::Declined => text.transfer_declined,
-            Phase::Cancelling => text.transfer_cancelling,
-            Phase::Failed => text.transfer_failed,
-            _ => text.transfer_keep_near,
-        };
-        let mut view = div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(if uploading { 8. } else { 14. }))
-            .child(
-                div()
-                    .size(px(76.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(if complete {
-                        0x203b2b
-                    } else if declined {
-                        SURFACE
-                    } else {
-                        0x233249
-                    }))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(34.))
-                    .text_color(rgb(if complete {
-                        0x30d158
-                    } else if declined {
-                        MUTED
-                    } else {
-                        BLUE
-                    }))
-                    .child(if complete {
-                        "✓"
-                    } else if declined {
-                        "×"
-                    } else {
-                        "↑"
-                    }),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(22.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.model.phase.title(self.language)),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .child(self.model.target.clone()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(self.language.transfer_network(
-                        self.model.transfer_metadata().0,
-                        self.model.transfer_metadata().1,
-                    )),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .text_center()
-                    .child(subtitle),
-            );
-        if let Phase::Uploading { sent, total } = self.model.phase {
-            let fraction = if total == 0 {
-                0.0
-            } else {
-                (sent as f32 / total as f32).min(1.0)
-            };
-            view = view
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(5.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(rgb(0x3a3a40))
-                        .child(
-                            div()
-                                .h_full()
-                                .w(relative(fraction))
-                                .rounded_full()
-                                .bg(rgb(BLUE)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(format!(
-                            "{} / {} · {:.0}%",
-                            file_size(sent),
-                            file_size(total),
-                            fraction * 100.
-                        )),
-                );
-            if let Some(bytes) = self.model.speed_bytes_per_second {
-                view = view.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(self.language.transfer_speed(&file_size(bytes))),
-                );
-            }
-        }
-        if let Some(duration) = self.model.send_elapsed(Instant::now()) {
-            view = view.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(
-                        self.language
-                            .transfer_elapsed(duration.as_millis().min(u64::MAX as u128) as u64),
-                    ),
-            );
-        }
+        let mut view = div().w_full().flex_1().min_h_0().flex().flex_col().child(
+            div()
+                .id("send-readout-scroll")
+                .flex_1()
+                .min_h_0()
+                .visible_scrollbar()
+                .child(self.send_readout()),
+        );
         view = view.children(
             self.model
                 .error
@@ -4874,6 +4968,7 @@ impl Drop for Capsule {
 impl Render for Capsule {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let show_orb = self.visibility == Visibility::Share
+            && !self.compact_send_view
             && self.exit_state.is_none()
             && self.incoming.is_none()
             && self.receive.active.is_none()
@@ -4952,6 +5047,11 @@ impl Render for IconTooltip {
 
 fn icon_tooltip(label: &'static str, _: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|_| IconTooltip(label)).into()
+}
+
+fn short_certificate_pin(pin: [u8; 32]) -> String {
+    let prefix: String = pin[..6].iter().map(|byte| format!("{byte:02X}")).collect();
+    format!("SHA-256 {prefix}…")
 }
 
 fn checkbox(id: &'static str, label: &'static str, checked: bool) -> Stateful<Div> {

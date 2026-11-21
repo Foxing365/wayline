@@ -8,6 +8,7 @@ use owly_airdrop::{
     proto::receiver::{self as proto, Connection, Event},
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use sha2::{Digest, Sha256};
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
@@ -58,6 +59,7 @@ impl ReceiverOptions {
 pub enum ReceiverEvent {
     Listening,
     Discovered,
+    AskStarted,
     ConnectionFailed {
         peer: std::net::SocketAddr,
         error: String,
@@ -88,6 +90,7 @@ pub enum ReceiverEvent {
     Rejected {
         path: String,
         status: u16,
+        reason: &'static str,
     },
 }
 
@@ -97,15 +100,16 @@ pub enum TransferFormat {
     DvZip,
 }
 #[derive(Debug)]
-pub struct ReceiverError(io::Error);
+pub struct ReceiverError(io::Error, TransferFailureKind);
 impl ReceiverError {
     pub fn kind(&self) -> TransferFailureKind {
-        TransferFailureKind::from_io(&self.0)
+        self.1
     }
 }
 impl From<io::Error> for ReceiverError {
     fn from(e: io::Error) -> Self {
-        Self(e)
+        let kind = TransferFailureKind::from_io(&e);
+        Self(e, kind)
     }
 }
 impl std::fmt::Display for ReceiverError {
@@ -207,6 +211,8 @@ impl ReceiverCore {
             confirmed: false,
         };
         let mut failure = None;
+        let mut terminal_kind = None;
+        let mut awaiting_ask_body = false;
         let mut deadline = None;
         let mut last_progress = None;
         let mut last_update = Instant::now();
@@ -215,6 +221,7 @@ impl ReceiverCore {
             let mut buffer = [0; 64 << 10];
             loop {
                 if stop.load(Ordering::Acquire) {
+                    terminal_kind = Some(TransferFailureKind::Cancelled);
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "receiver stopped",
@@ -249,8 +256,18 @@ impl ReceiverCore {
                     }
                     match event {
                         Event::Transmit(bytes) => {
-                            tls.write_all(&bytes)?;
-                            tls.flush()?;
+                            if let Err(error) = tls.write_all(&bytes).and_then(|()| tls.flush()) {
+                                // A failed write of the rejection must not erase a
+                                // validation/disk error already reported by the upload.
+                                if let Some(failure) = failure.take() {
+                                    return Err(failure);
+                                }
+                                return Err(classify_transport_error(
+                                    error,
+                                    active.is_some(),
+                                    &mut terminal_kind,
+                                ));
+                            }
                             if !published.paths.is_empty() && bytes.starts_with(b"HTTP/1.1 200") {
                                 published.confirmed = true;
                                 if let Some(b) = &mut board {
@@ -265,8 +282,26 @@ impl ReceiverCore {
                         }
                         Event::SetTimer(after) => deadline = after.map(|d| Instant::now() + d),
                         Event::Discovered(_) => notify(ReceiverEvent::Discovered),
+                        Event::AskStarted => {
+                            awaiting_ask_body = true;
+                            notify(ReceiverEvent::AskStarted);
+                        }
+                        Event::AskRejected { status, reason } => {
+                            awaiting_ask_body = false;
+                            notify(ReceiverEvent::Rejected {
+                                path: "/Ask".into(),
+                                status,
+                                reason,
+                            });
+                        }
                         Event::Ask(ask) => {
-                            let transfer = IncomingTransfer::from_ask(&ask);
+                            awaiting_ask_body = false;
+                            let mut transfer = IncomingTransfer::from_ask(&ask);
+                            transfer.sender_certificate_sha256 = tls
+                                .conn
+                                .peer_certificates()
+                                .and_then(|certificates| certificates.first())
+                                .map(|certificate| Sha256::digest(certificate.as_ref()).into());
                             core.active.fetch_add(1, Ordering::AcqRel);
                             active = Some(Active(&core.active));
                             board = Some(Tracker::begin(
@@ -297,6 +332,7 @@ impl ReceiverCore {
                                 notify(ReceiverEvent::Rejected {
                                     path: "/Ask".into(),
                                     status: 403,
+                                    reason: "offer declined by the receiver",
                                 });
                             }
                         }
@@ -333,6 +369,8 @@ impl ReceiverCore {
                         Event::CreateFile(path) => {
                             runtime.block_on(staging.as_mut().unwrap().create_file(&path))?
                         }
+                        Event::CreateWrappedFile(name) => runtime
+                            .block_on(staging.as_mut().unwrap().create_wrapped_file(&name))?,
                         Event::Data(data) => {
                             runtime.block_on(staging.as_mut().unwrap().write(&data))?
                         }
@@ -365,21 +403,21 @@ impl ReceiverCore {
                             }
                             failure = Some(io::Error::new(io::ErrorKind::InvalidData, message));
                         }
-                        Event::Close => {
-                            if active.is_some() && !published.confirmed && failure.is_none() {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "sender closed before transfer confirmation",
-                                ));
-                            }
-                            return match failure.take() {
-                                Some(e) => Err(e),
-                                None => Ok(()),
-                            };
-                        }
+                        Event::Close => break,
                     }
                 }
                 if connection.is_closed() {
+                    // An upload decoder can reach Closed after its rejection
+                    // without emitting a separate Close event. Keep its cause.
+                    if let Some(error) = failure.take() {
+                        return Err(error);
+                    }
+                    if active.is_some() && !published.confirmed {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "sender closed before transfer confirmation",
+                        ));
+                    }
                     return Ok(());
                 }
                 if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -389,13 +427,22 @@ impl ReceiverCore {
                 }
                 if connection.upload_progress().is_some()
                     && core.options.allow_dvzip_archive_boundary
-                    && !tls_has_pending_data(&mut &mut tls)?
+                    && !tls_has_pending_data(&mut &mut tls).map_err(|error| {
+                        classify_transport_error(error, active.is_some(), &mut terminal_kind)
+                    })?
                     && connection.finish_validated_dvzip_boundary()
                 {
                     continue;
                 }
                 match tls.read(&mut buffer) {
-                    Ok(0) => connection.receive_eof(),
+                    Ok(0) => {
+                        // Owly has already consumed available data. If EOF now
+                        // prevents completion, the peer interrupted the stream.
+                        if active.is_some() && failure.is_none() {
+                            terminal_kind = Some(TransferFailureKind::Interrupted);
+                        }
+                        connection.receive_eof();
+                    }
                     Ok(n) => {
                         idle = Instant::now() + Duration::from_secs(120);
                         connection.receive(&buffer[..n]);
@@ -409,27 +456,49 @@ impl ReceiverCore {
                         continue
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        return Err(classify_transport_error(
+                            e,
+                            active.is_some(),
+                            &mut terminal_kind,
+                        ));
+                    }
                 }
             }
         })();
         if let Some(mut stage) = staging {
             let _ = runtime.block_on(stage.end_file());
         }
-        if let Err(e) = &result {
+        if let Err(e) = result {
+            let kind = match terminal_kind {
+                Some(TransferFailureKind::Interrupted) if stop.load(Ordering::Acquire) => {
+                    TransferFailureKind::Cancelled
+                }
+                Some(kind) => kind,
+                None => TransferFailureKind::from_io(&e),
+            };
             if let Some(b) = &mut board {
-                b.fail(Reason::Interrupted);
+                if kind == TransferFailureKind::Cancelled {
+                    b.phase(Phase::Cancelled);
+                } else {
+                    b.fail(Reason::Interrupted);
+                }
             }
             if let Some(transfer) = &incoming {
                 notify(ReceiverEvent::TransferFailed {
                     transfer_id: transfer.id.clone(),
                     error: e.to_string(),
-                    kind: TransferFailureKind::from_io(e),
+                    kind,
                 });
             }
+            let error = if awaiting_ask_body && !stop.load(Ordering::Acquire) {
+                io::Error::new(e.kind(), format!("reading /Ask body before consent: {e}"))
+            } else {
+                e
+            };
+            return Err(ReceiverError(error, kind));
         }
-        drop(active);
-        result.map_err(ReceiverError::from)
+        Ok(())
     }
     /// Run an explicit TCP diagnostic listener, closing and joining every worker on stop.
     pub fn run_tcp_listener(
@@ -660,6 +729,17 @@ impl Write for TrackedSocket {
     fn flush(&mut self) -> io::Result<()> {
         self.socket.flush()
     }
+}
+
+fn classify_transport_error(
+    error: io::Error,
+    active: bool,
+    terminal_kind: &mut Option<TransferFailureKind>,
+) -> io::Error {
+    if active && TransferFailureKind::is_stream_disconnected(&error) {
+        *terminal_kind = Some(TransferFailureKind::Interrupted);
+    }
+    error
 }
 
 fn tls_has_pending_data(

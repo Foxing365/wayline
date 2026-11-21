@@ -3,6 +3,7 @@
 pub enum TransferFailureKind {
     Declined,
     Cancelled,
+    Interrupted,
     Connection,
     Validation,
     Other,
@@ -13,6 +14,7 @@ impl TransferFailureKind {
         match self {
             Self::Declined => "declined",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
             Self::Connection => "connection",
             Self::Validation => "validation",
             Self::Other => "other",
@@ -27,5 +29,15 @@ impl TransferFailureKind {
             InvalidData => Self::Validation,
             _ => Self::Other,
         }
+    }
+
+    // These indicate the stream was closed or reset, without telling us why.
+    // Timeouts and TLS/protocol failures retain their ordinary error category.
+    pub(crate) fn is_stream_disconnected(error: &std::io::Error) -> bool {
+        use std::io::ErrorKind::*;
+        matches!(
+            error.kind(),
+            UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | NotConnected
+        )
     }
 }

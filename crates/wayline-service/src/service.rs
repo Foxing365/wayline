@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, SET_RTL8821CU_WIDTH},
     platform::WindowsBackend,
     server::{self, Control, Handler},
     session::{Registry, Reply, RunMode, SessionKind, CAPABILITIES, VERSION},
@@ -286,8 +286,9 @@ pub async fn run(
                 // Clients that gave up before dispatch must not leave surprise
                 // start/stop commands waiting behind a busy queue.
                 if !control.response.is_closed() {
-                    let reconfigures_radio = control.request.cmd == "set"
-                        && (control.request.port.is_some() || control.request.channel.is_some());
+                    let changes_width = control.request.cmd == SET_RTL8821CU_WIDTH;
+                    let reconfigures_radio = changes_width || (control.request.cmd == "set"
+                        && (control.request.port.is_some() || control.request.channel.is_some()));
                     let in_use = registry.radio_reconfiguration_busy();
                     let before = radio.status();
                     let was_ready = before.state == "running" && before.awdl0 && before.error.is_none();
@@ -298,10 +299,15 @@ pub async fn run(
                     };
                     if reconfigures_radio
                         && !in_use
-                        && was_ready
+                        && (was_ready || (changes_width && reply.error.is_none()))
                         && matches!(reply.state.as_str(), "stopping" | "starting")
                     {
                         registry.radio_reconfiguring = true;
+                    }
+                    if changes_width && !in_use {
+                        // A client may poll immediately upon receiving the width
+                        // change reply. Publish the committed status first.
+                        *status.write().unwrap_or_else(|e| e.into_inner()) = radio.status();
                     }
                     let _ = control.response.send(reply);
                 }

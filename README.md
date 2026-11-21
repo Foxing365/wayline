@@ -1,6 +1,6 @@
 # Wayline
 
-For a dedicated Realtek RTL8821CU USB radio (`0BDA:C820`), see the [optional USB setup](docs/RTL8821CU.zh-CN.md). This path needs device interoperability testing.
+For a dedicated Realtek RTL8821CU USB radio (`0BDA:C820`), see the [optional USB setup](docs/RTL8821CU.zh-CN.md). Sending and receiving have been tested at 20 MHz. Monitor widths of 40 and 80 MHz on 5 GHz are experimental.
 
 AirDrop between Windows and Apple devices through a USB-attached ESP32. The desktop app,
 service, AirDrop core and firmware use Rust. AWDL and AirDrop use the pinned Owly crates.
@@ -75,10 +75,14 @@ Before updating, finish transfers, quit Wayline from the tray, and close CLI com
 
 - Received files default to Downloads/Wayline; change the folder in Settings. Desktop and CLI
   share the device name, identity and save directory.
+- On the first file offer, choose to accept files from your device automatically. Wayline remembers
+  the TLS certificate proved during that connection. Revoke it under Trusted devices in Settings.
+  New certificates, offers without a certificate, and web links require approval.
 - Receive results can appear in a separate, dismissible desktop notification window. Settings lets
   you enable or disable it, choose among six screen positions, and set a 3–30 second dismissal delay.
-- Active send and receive cards show smoothed transfer speed and elapsed time. Timing starts
-  when data transfer begins, includes final confirmation, and excludes preparation and acceptance waits.
+- Both themes display transferred and total bytes, smoothed speed, elapsed time, and progress during
+  sending and receiving. Animations follow Windows animation settings. Timing includes final
+  confirmation and starts when data transfer begins.
 - The history icon at the top of the sharing card opens Recent transfers with up to 200 results.
   The compact list shows device, outcome, file overview, size and time. Details shows the complete
   file list, transferred bytes, duration, average speed, radio band/channel and transfer mode,

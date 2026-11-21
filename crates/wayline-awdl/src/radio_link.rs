@@ -5,7 +5,10 @@
 
 use crate::{driver, invalid};
 use owly_awdl::{Frame, MacAddr, TxRate, BSSID};
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -16,19 +19,21 @@ use tokio::{
 const HELLO: u16 = 1;
 const RX: u16 = 2;
 const TX: u16 = 3;
+const SET_CHANNEL: u16 = 4;
 const SET_BSSID_FILTER: u16 = 5;
 const SET_ADDRESS: u16 = 6;
 const MAX_PAYLOAD: usize = 16384;
 const MAX_QUEUED: usize = 64;
 
-pub async fn handshake(stream: &mut TcpStream, channel: u8, mac: MacAddr) -> io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let (kind, payload) = read_message(stream).await?;
-        if kind != HELLO || payload.as_slice() != [3, 0, 0, 0, channel, 20, 0, 0] {
-            return Err(invalid(
-                "unexpected radio_link HELLO (requires v3, selected channel, 20 MHz)",
-            ));
-        }
+pub async fn handshake(
+    stream: &mut TcpStream,
+    channel: u8,
+    width_mhz: u8,
+    mac: MacAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        expect_hello(stream, channel, width_mhz).await?;
         // This order lets the radio program its hardware ACK address and BSSID
         // together when processing SET_ADDRESS.
         stream
@@ -40,10 +45,50 @@ pub async fn handshake(stream: &mut TcpStream, channel: u8, mac: MacAddr) -> io:
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "radio_link handshake timed out"))?
 }
 
+async fn expect_hello(stream: &mut TcpStream, channel: u8, width_mhz: u8) -> io::Result<()> {
+    let (kind, payload) = read_message(stream).await?;
+    if kind != HELLO || payload.as_slice() != [3, 0, 0, 0, channel, width_mhz, 0, 0] {
+        return Err(invalid(format!(
+            "unexpected radio_link HELLO (requires v3, channel {channel}, {width_mhz} MHz)"
+        )));
+    }
+    Ok(())
+}
+
+/// Use a short-lived control connection to request a new channel at 20 MHz. The next
+/// connection's HELLO must still be verified with `handshake`: v3 sends no ACK.
+pub async fn request_channel(
+    stream: &mut TcpStream,
+    from: u8,
+    to: u8,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        expect_hello(stream, from, 20).await?;
+        stream.write_all(&message(SET_CHANNEL, &[to])).await?;
+        stream.shutdown().await?;
+        // Half-close the control stream in order, then drain the helper until it
+        // has cleaned up this connection. No data from it enters the new AWDL node.
+        let mut drain = [0; 1024];
+        while stream.read(&mut drain).await? != 0 {}
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "radio_link retune did not close the control session",
+        )
+    })?
+}
+
 pub struct Radio {
     receive: mpsc::Receiver<io::Result<driver::Received>>,
     transmit: mpsc::Sender<Vec<u8>>,
     worker: JoinHandle<()>,
+    queued_unicast_legacy: u64,
+    queued_unicast_ht: u64,
+    rates_reported: Instant,
 }
 
 impl Radio {
@@ -85,7 +130,23 @@ impl Radio {
             receive,
             transmit,
             worker,
+            queued_unicast_legacy: 0,
+            queued_unicast_ht: 0,
+            rates_reported: Instant::now(),
         })
+    }
+
+    fn report_queued_rates(&mut self) {
+        if self.queued_unicast_legacy != 0 || self.queued_unicast_ht != 0 {
+            tracing::info!(
+                legacy = self.queued_unicast_legacy,
+                ht = self.queued_unicast_ht,
+                "RTL8821CU queued unicast data rates"
+            );
+            self.queued_unicast_legacy = 0;
+            self.queued_unicast_ht = 0;
+        }
+        self.rates_reported = Instant::now();
     }
 }
 
@@ -101,12 +162,25 @@ impl driver::Air for Radio {
 
     fn send(&mut self, frame: Frame) -> Result<(), Frame> {
         let packet = transmit_frame(&frame);
-        self.transmit.try_send(packet).map_err(|_| frame)
+        if self.transmit.try_send(packet).is_err() {
+            return Err(frame);
+        }
+        if !frame.to.is_multicast() && !frame.is_action() {
+            match frame.rate {
+                TxRate::Legacy(_) => self.queued_unicast_legacy += 1,
+                TxRate::Ht { .. } => self.queued_unicast_ht += 1,
+            }
+            if self.rates_reported.elapsed() >= Duration::from_secs(10) {
+                self.report_queued_rates();
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for Radio {
     fn drop(&mut self) {
+        self.report_queued_rates();
         self.worker.abort();
     }
 }
@@ -179,6 +253,116 @@ fn transmit_frame(frame: &Frame) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rtl8821cu_ht20_uses_the_helper_13_byte_per_packet_rate_header() {
+        for mcs in [4, 7] {
+            let message = transmit_frame(&Frame {
+                bytes: vec![0x08; 28],
+                to: MacAddr([2, 1, 2, 3, 4, 5]),
+                rate: TxRate::Ht { mcs, sgi: false },
+                no_ack: false,
+            });
+            assert_eq!(&message[..8], &[3, 0, 0, 0, 41, 0, 0, 0]);
+            assert_eq!(
+                &message[8..21],
+                &[0, 0, 13, 0, 0, 0x80, 8, 0, 0, 0, 7, 0, mcs]
+            );
+            assert_eq!(&message[21..], &[0x08; 28]);
+        }
+    }
+
+    #[tokio::test]
+    async fn retune_requires_a_new_hello_with_the_requested_channel() {
+        use tokio::net::TcpListener;
+
+        for actual_channel in [44, 149] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let limit = Duration::from_secs(2);
+            let mac = MacAddr([2, 1, 2, 3, 4, 5]);
+            let helper = tokio::spawn(async move {
+                let (mut control, _) = listener.accept().await.unwrap();
+                control
+                    .write_all(&message(HELLO, &[3, 0, 0, 0, 149, 20, 0, 0]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_message(&mut control).await.unwrap(),
+                    (SET_CHANNEL, vec![44])
+                );
+                assert_eq!(control.read(&mut [0; 1]).await.unwrap(), 0);
+                control
+                    .write_all(&message(RX, b"discarded during retune"))
+                    .await
+                    .unwrap();
+                drop(control);
+
+                let (mut data, _) = listener.accept().await.unwrap();
+                data.write_all(&message(HELLO, &[3, 0, 0, 0, actual_channel, 20, 0, 0]))
+                    .await
+                    .unwrap();
+                if actual_channel == 44 {
+                    assert_eq!(
+                        read_message(&mut data).await.unwrap(),
+                        (SET_BSSID_FILTER, BSSID.0.to_vec())
+                    );
+                    assert_eq!(
+                        read_message(&mut data).await.unwrap(),
+                        (SET_ADDRESS, mac.0.to_vec())
+                    );
+                }
+            });
+
+            let mut control = TcpStream::connect(address).await.unwrap();
+            request_channel(&mut control, 149, 44, limit).await.unwrap();
+            let mut data = TcpStream::connect(address).await.unwrap();
+            let result = handshake(&mut data, 44, 20, mac, limit).await;
+            if actual_channel == 44 {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+            tokio::time::timeout(limit, helper).await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_width_requires_a_matching_hello_before_programming_identity() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mac = MacAddr([2, 1, 2, 3, 4, 5]);
+        for (requested, reported) in [(40, 40), (80, 80), (80, 20)] {
+            let host = tokio::spawn(async move {
+                let mut socket = TcpStream::connect(address).await.unwrap();
+                handshake(&mut socket, 149, requested, mac, Duration::from_secs(3)).await
+            });
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(&message(HELLO, &[3, 0, 0, 0, 149, reported, 0, 0]))
+                .await
+                .unwrap();
+            if reported == requested {
+                assert_eq!(
+                    read_message(&mut socket).await.unwrap(),
+                    (SET_BSSID_FILTER, BSSID.0.to_vec())
+                );
+                assert_eq!(
+                    read_message(&mut socket).await.unwrap(),
+                    (SET_ADDRESS, mac.0.to_vec())
+                );
+                host.await.unwrap().unwrap();
+            } else {
+                assert_eq!(
+                    host.await.unwrap().unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert_eq!(socket.read(&mut [0_u8; 1]).await.unwrap(), 0);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn exchanges_radio_identity_and_converts_bidirectional_frames() {
         use driver::Air;
@@ -189,7 +373,9 @@ mod tests {
         let mac = MacAddr([2, 1, 2, 3, 4, 5]);
         let host = tokio::spawn(async move {
             let mut socket = TcpStream::connect(address).await.unwrap();
-            handshake(&mut socket, 149, mac).await.unwrap();
+            handshake(&mut socket, 149, 20, mac, Duration::from_secs(3))
+                .await
+                .unwrap();
             let mut radio = Radio::from_socket(socket.into_std().unwrap()).unwrap();
             let frame = radio.recv().await.unwrap();
             assert_eq!(frame.bytes, [0xd0; 24]);

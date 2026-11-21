@@ -342,15 +342,80 @@ fn stopping_listener_closes_and_joins_idle_tls_workers() {
 fn client(
     address: std::net::SocketAddrV6,
 ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    client_with_identity(address, None)
+}
+
+fn client_with_identity(
+    address: std::net::SocketAddrV6,
+    identity: Option<&Identity>,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     let socket = TcpStream::connect(address).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
-    let cfg = owly_airdrop::driver::tls::client_config(None).unwrap();
+    let identity = identity.map(|identity| {
+        owly_airdrop::driver::tls::Identity::from_der(
+            identity.certificate_der.clone(),
+            identity.private_key_der.clone(),
+        )
+    });
+    let cfg = owly_airdrop::driver::tls::client_config(identity.as_ref()).unwrap();
     let connection =
         rustls::ClientConnection::new(cfg, owly_airdrop::driver::tls::server_name()).unwrap();
     rustls::StreamOwned::new(connection, socket)
 }
+
+#[test]
+fn pinned_file_offer_requires_the_same_proven_tls_certificate() {
+    use owly_airdrop::proto::messages::Offer;
+    use sha2::{Digest, Sha256};
+
+    let (_source, file_ask, upload) = protocol_upload(Compressor::Gzip, false);
+    let root = tempfile::tempdir().unwrap();
+    let receiver = identity(&root.path().join("receiver"));
+    let trusted = identity(&root.path().join("trusted"));
+    let other = identity(&root.path().join("other"));
+    let pin: [u8; 32] = Sha256::digest(&trusted.certificate_der).into();
+    let url_ask = sender::ask_request(
+        &sender::Config::new("iPhone", "abcdef123456"),
+        "LINK123",
+        &Offer::Urls(vec!["https://example.com".into()]),
+    );
+
+    for (client_id, ask, accepted) in [
+        (None, &file_ask, false),
+        (Some(&other), &file_ask, false),
+        (Some(&trusted), &url_ask, false),
+        (Some(&trusted), &file_ask, true),
+    ] {
+        let opts = ReceiverOptions::new("receiver", "Windows", root.path().join("received"));
+        let core = Arc::new(
+            ReceiverCore::new(opts)
+                .with_decision(move |offer| offer.file_offer_certificate() == Some(pin)),
+        );
+        let (peer, worker) = start(core, &receiver);
+        let mut tls = client_with_identity(peer.service.address, client_id);
+        tls.write_all(ask).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, if accepted { 200 } else { 403 });
+        if accepted {
+            tls.write_all(&upload).unwrap();
+            tls.flush().unwrap();
+            assert_eq!(response(&mut tls).status, 200);
+        }
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        drop(tls);
+        let events = worker.join().unwrap().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| matches!(e, ReceiverEvent::Received { .. })),
+            accepted
+        );
+    }
+}
+
 fn response(stream: &mut impl Read) -> sender::Response {
     let mut reader = ResponseReader::new();
     let mut buf = [0; 4096];
@@ -360,6 +425,97 @@ fn response(stream: &mut impl Read) -> sender::Response {
         if let Some(reply) = reader.receive(&buf[..n]).unwrap() {
             return reply;
         }
+    }
+}
+
+#[test]
+fn receiver_distinguishes_active_peer_disconnect_from_a_malformed_upload() {
+    for (boundary, close_notify, malformed) in [
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let compressor = if boundary {
+            Compressor::DvZip
+        } else {
+            Compressor::Gzip
+        };
+        let (_source, offer, mut upload) = protocol_upload(compressor, false);
+        let root = tempfile::tempdir().unwrap();
+        let id = identity(root.path());
+        let dest = root.path().join("received");
+        let mut opts = ReceiverOptions::new("receiver", "Windows", &dest).with_accept_all();
+        opts.allow_dvzip_archive_boundary = boundary;
+        let core = Arc::new(ReceiverCore::new(opts));
+        let listener = TcpListener::bind("[::1]:0").unwrap();
+        let SocketAddr::V6(addr) = listener.local_addr().unwrap() else {
+            panic!()
+        };
+        let config = server_config(&id).unwrap();
+        let reset_at_boundary_probe = boundary && !close_notify && !malformed;
+        let (upload_started, started) = mpsc::channel();
+        let (reset, reset_done) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut events = Vec::new();
+            let result =
+                ReceiverCore::serve_tls_connection_with_events(stream, config, core, |event| {
+                    if reset_at_boundary_probe && matches!(event, ReceiverEvent::ModeSelected(_)) {
+                        upload_started.send(()).unwrap();
+                        reset_done.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    events.push(event)
+                });
+            (result, events)
+        });
+        let mut tls = client(addr);
+        tls.write_all(&offer).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, 200);
+        let body = upload
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        if malformed {
+            upload[body..].fill(0);
+        } else {
+            upload.truncate(body + 4);
+        }
+        tls.write_all(&upload).unwrap();
+        if close_notify {
+            tls.conn.send_close_notify();
+        }
+        tls.flush().unwrap();
+        if malformed || close_notify {
+            assert_eq!(response(&mut tls).status, 400);
+        }
+        if reset_at_boundary_probe {
+            started.recv_timeout(Duration::from_secs(3)).unwrap();
+            // Abort the actual TCP stream before the receiver can peek/read again.
+            socket2::SockRef::from(&tls.sock)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+        }
+        drop(tls);
+        if reset_at_boundary_probe {
+            reset.send(()).unwrap();
+        }
+
+        let (result, events) = worker.join().unwrap();
+        let expected = if malformed {
+            TransferFailureKind::Validation
+        } else {
+            TransferFailureKind::Interrupted
+        };
+        assert_eq!(result.expect_err(&format!("expected {expected:?} with close_notify={close_notify}, malformed={malformed}: {events:?}")).kind(), expected);
+        assert!(events.iter().any(
+            |event| matches!(event, ReceiverEvent::TransferFailed { kind, .. } if *kind == expected)
+        ));
+        assert!(!dest.exists() || fs::read_dir(dest).unwrap().next().is_none());
     }
 }
 
@@ -427,6 +583,202 @@ fn tls_validated_dvzip_boundary_finishes_without_zero_chunk_or_eof() {
         .iter()
         .any(|e| matches!(e, ReceiverEvent::ArchiveBoundary { .. })));
     assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"verified");
+}
+
+#[test]
+fn tls_receive_publishes_both_top_level_files_from_one_offer() {
+    use owly_airdrop::proto::{
+        archive::{compress::Encoder, cpio},
+        messages::{AskFile, Offer},
+    };
+
+    for (compressor, wrapped, same_name, omit_last_chunk) in [
+        (Compressor::Gzip, false, false, false),
+        (Compressor::Gzip, true, false, false),
+        (Compressor::DvZip, true, false, true),
+        (Compressor::DvZip, true, true, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let identity = identity(root.path());
+        let image_name = "IMG_001.HEIC";
+        let (second_name, second_type) = if same_name {
+            (image_name, "public.heic")
+        } else {
+            ("视频.MOV", "com.apple.quicktime-movie")
+        };
+        let entry_header = |name: &str, mode: u32, size: usize| {
+            cpio::odc_header(&cpio::Entry {
+                name: name.into(),
+                mode,
+                size: size as u64,
+                nlink: 1,
+                ino: 1,
+                uid: 501,
+                gid: 20,
+                mtime: 0,
+            })
+        };
+        let mut raw_archive = entry_header(".", cpio::MODE_DIR | 0o755, 0);
+        let mut files = Vec::new();
+        for (name, kind, wrapper, data) in [
+            (image_name, "public.heic", "./photo", b"image data"),
+            (second_name, second_type, "./other", b"other data"),
+        ] {
+            let bom_path = if wrapped {
+                raw_archive.extend(entry_header(wrapper, cpio::MODE_DIR | 0o755, 0));
+                format!("{wrapper}/{name}")
+            } else {
+                format!("./{name}")
+            };
+            raw_archive.extend(entry_header(&bom_path, cpio::MODE_FILE | 0o644, data.len()));
+            raw_archive.extend(data);
+            files.push(AskFile {
+                name: name.into(),
+                file_type: kind.into(),
+                size: Some(data.len() as u64),
+                bom_path,
+                is_directory: false,
+            });
+        }
+        raw_archive.extend(cpio::odc_trailer());
+        let mut encoder = Encoder::new(compressor, flate2::Compression::fast());
+        let mut body = encoder.write(&raw_archive);
+        body.extend(encoder.finish());
+
+        let destination = root.path().join("received");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join(image_name), b"existing file").unwrap();
+        let mut options = ReceiverOptions::new("receiver", "Windows", &destination);
+        options.allow_dvzip_archive_boundary = true;
+        let core = ReceiverCore::new(options).with_decision(move |transfer| {
+            assert_eq!(
+                transfer
+                    .files
+                    .iter()
+                    .map(|file| file.name.as_str())
+                    .collect::<Vec<_>>(),
+                [image_name, second_name]
+            );
+            true
+        });
+        let (peer, worker) = start(Arc::new(core), &identity);
+        let mut tls = client(peer.service.address);
+        let ask = sender::ask_request(
+            &sender::Config::new("iPhone", "abcdef123456"),
+            "MULTI-FILE",
+            &Offer::Files(files),
+        );
+        let plist = http::parse_request(&ask, &http::Limits::default())
+            .unwrap()
+            .unwrap()
+            .1;
+        tls.write_all(&http::post_head(
+            "/Ask",
+            &[("Transfer-Encoding", "chunked")],
+        ))
+        .unwrap();
+        for chunk in ask[plist..].chunks(67) {
+            tls.write_all(&http::chunk(chunk)).unwrap();
+        }
+        tls.write_all(b"0\r\n\r\n").unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, 200, "wrapped: {wrapped}");
+        tls.write_all(&http::post_head(
+            "/Upload",
+            &[
+                ("Content-Type", compressor.content_type()),
+                ("TransferID", "MULTI-FILE"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+        ))
+        .unwrap();
+        for chunk in body.chunks(23) {
+            tls.write_all(&http::chunk(chunk)).unwrap();
+        }
+        if !omit_last_chunk {
+            tls.write_all(b"0\r\n\r\n").unwrap();
+        }
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, 200);
+        let events = worker.join().unwrap().unwrap();
+        assert!(matches!(events.first(), Some(ReceiverEvent::AskStarted)));
+        assert_eq!(
+            fs::read(destination.join(image_name)).unwrap(),
+            b"existing file"
+        );
+        let expected = [
+            destination.join("IMG_001 (1).HEIC"),
+            destination.join(if same_name {
+                "IMG_001 (2).HEIC"
+            } else {
+                second_name
+            }),
+        ];
+        assert_eq!(fs::read(&expected[0]).unwrap(), b"image data");
+        assert_eq!(fs::read(&expected[1]).unwrap(), b"other data");
+        assert!(
+            matches!(events.last(), Some(ReceiverEvent::Received { transfer, files })
+            if transfer.files.len() == 2 && files.as_slice() == expected)
+        );
+    }
+}
+
+#[test]
+fn tls_invalid_offer_is_rejected_before_consent_with_a_diagnostic() {
+    use owly_airdrop::proto::messages::{AskFile, Offer};
+
+    let root = tempfile::tempdir().unwrap();
+    let id = identity(root.path());
+    let file = |bom_path: &str, is_directory| AskFile {
+        name: "IMG_001.jpg".into(),
+        file_type: "public.jpeg".into(),
+        size: Some(9),
+        bom_path: bom_path.into(),
+        is_directory,
+    };
+    let invalid_path = "file name or archive path failed validation";
+    for (files, reason) in [
+        (
+            vec![file("./photo/different-name.jpg", false)],
+            invalid_path,
+        ),
+        (
+            vec![file("./photo/nested/IMG_001.jpg", false)],
+            invalid_path,
+        ),
+        (vec![file("./photo/IMG_001.jpg", true)], invalid_path),
+        (
+            vec![
+                file("./photo/IMG_001.jpg", false),
+                file("photo/IMG_001.jpg", false),
+            ],
+            "duplicate archive path in offer",
+        ),
+    ] {
+        let core = ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", root.path()))
+            .with_decision(|_| panic!("invalid offer must not prompt"));
+        let (peer, worker) = start(Arc::new(core), &id);
+        let mut tls = client(peer.service.address);
+        let ask = sender::ask_request(
+            &sender::Config::new("iPhone", "abcdef123456"),
+            "BAD-PATH",
+            &Offer::Files(files),
+        );
+        tls.write_all(&ask).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, 400);
+        assert_eq!(
+            worker.join().unwrap().unwrap(),
+            [
+                ReceiverEvent::AskStarted,
+                ReceiverEvent::Rejected {
+                    path: "/Ask".into(),
+                    status: 400,
+                    reason,
+                },
+            ]
+        );
+    }
 }
 
 #[test]

@@ -14,6 +14,11 @@ Local adaptations validate compression and HTTP completion before publishing
 files, expose bounded upload progress and optional validated DVZip completion,
 support cooperative archive preparation cancellation, and use atomic Windows
 no-replace publication with rollback on a failed commit or final response.
+Multi-photo offers may list each file within one archive wrapper directory.
+The receiver validates that shape and saves each file under the name shown for
+consent, following [Owly ASK-5 and UP-2a](https://github.com/t4t5/owly/blob/main/docs/SPEC.md#64-post-ask).
+When distinct offered paths share a filename, each is staged separately and
+published with the same collision suffixes as other received files.
 Accepted responses requesting connection closure reconnect before upload;
 transport failure/timeout remains distinct from an explicit refusal. Windows
 regressions live in `crates/wayline-core/tests/airdrop_migration.rs`; upstream

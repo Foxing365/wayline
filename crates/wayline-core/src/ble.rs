@@ -1,5 +1,6 @@
 //! AirDrop wake advertisement sent while discovering nearby devices.
 
+use std::time::{Duration, Instant};
 use windows::{
     Devices::Bluetooth::Advertisement::{
         BluetoothLEAdvertisement, BluetoothLEAdvertisementPublisher,
@@ -31,11 +32,20 @@ impl Drop for Apartment {
 /// Owns the Windows BLE publisher. It stops advertising when dropped.
 pub struct AirDropAdvert {
     publisher: BluetoothLEAdvertisementPublisher,
+    startup_deadline: Instant,
     _apartment: Apartment,
 }
 
 impl AirDropAdvert {
     pub fn start(legacy_shape: bool) -> Result<Self, SendError> {
+        let advert = Self::begin(legacy_shape)?;
+        while !advert.ready()? {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(advert)
+    }
+
+    pub(crate) fn begin(legacy_shape: bool) -> Result<Self, SendError> {
         let apartment = Apartment::enter()?;
         let mut tag = [0; 3];
         getrandom::fill(&mut tag).map_err(|e| SendError::invalid(format!("BLE tag: {e}")))?;
@@ -66,30 +76,32 @@ impl AirDropAdvert {
         };
         let advert = Self {
             publisher,
+            startup_deadline: Instant::now() + Duration::from_secs(5),
             _apartment: apartment,
         };
         advert
             .publisher
             .Start()
             .map_err(|error| SendError::invalid(format!("start AirDrop BLE advert: {error}")))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let status = advert.publisher.Status().map_err(|error| {
-                SendError::invalid(format!("read BLE publisher status: {error}"))
-            })?;
-            if status == BluetoothLEAdvertisementPublisherStatus::Started {
-                break;
-            }
-            if status == BluetoothLEAdvertisementPublisherStatus::Aborted
-                || std::time::Instant::now() >= deadline
-            {
-                return Err(SendError::invalid(format!(
-                    "AirDrop BLE advertisement did not start (status {status:?})"
-                )));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
         Ok(advert)
+    }
+
+    pub(crate) fn ready(&self) -> Result<bool, SendError> {
+        let status = self
+            .publisher
+            .Status()
+            .map_err(|error| SendError::invalid(format!("read BLE publisher status: {error}")))?;
+        if status == BluetoothLEAdvertisementPublisherStatus::Started {
+            return Ok(true);
+        }
+        if status == BluetoothLEAdvertisementPublisherStatus::Aborted
+            || Instant::now() >= self.startup_deadline
+        {
+            return Err(SendError::invalid(format!(
+                "AirDrop BLE advertisement did not start (status {status:?})"
+            )));
+        }
+        Ok(false)
     }
 }
 

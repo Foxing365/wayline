@@ -11,10 +11,13 @@ use windows::{
         System::{Com::*, Registry::*},
         UI::Shell::*,
     },
-    core::{HSTRING, Interface, w},
+    core::{HSTRING, Interface},
 };
 
-const VERB: &str = r"Software\Classes\*\shell\Wayline.Send";
+const VERBS: [&str; 2] = [
+    r"Software\Classes\*\shell\Wayline.Send",
+    r"Software\Classes\Directory\shell\Wayline.Send",
+];
 const LINK: &str = "Wayline AirDrop.lnk";
 pub const COPY_DATA_ID: usize = 0x4f4d4452;
 pub const MAX_ACTIVATION_BYTES: usize = 1024 * 1024;
@@ -44,6 +47,7 @@ impl Mode {
 pub struct Launch {
     pub files: Vec<PathBuf>,
     pub unregister: bool,
+    pub background: bool,
 }
 impl Launch {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
@@ -56,6 +60,10 @@ impl Launch {
                     continue;
                 }
                 if arg == "--send" || arg == "--show-in-taskbar" {
+                    continue;
+                }
+                if arg == "--background" {
+                    result.background = true;
                     continue;
                 }
                 if arg == "--unregister-shell" {
@@ -72,6 +80,10 @@ impl Launch {
         ensure!(
             !result.unregister || result.files.is_empty(),
             "移除菜单时不能同时发送文件"
+        );
+        ensure!(
+            !result.background || (!result.unregister && result.files.is_empty()),
+            "后台启动不能同时发送文件或移除菜单"
         );
         Ok(result)
     }
@@ -150,12 +162,52 @@ fn set_value(key: &str, name: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn shortcut_path() -> Result<PathBuf> {
+fn shortcut_path(folder: &windows::core::GUID, name: &str) -> Result<PathBuf> {
     unsafe {
-        let name = SHGetKnownFolderPath(&FOLDERID_SendTo, KF_FLAG_DEFAULT, None)?;
-        let path = PathBuf::from(OsString::from_wide(name.as_wide())).join(LINK);
-        CoTaskMemFree(Some(name.0.cast()));
+        let location = SHGetKnownFolderPath(folder, KF_FLAG_DEFAULT, None)?;
+        let path = PathBuf::from(OsString::from_wide(location.as_wide())).join(name);
+        CoTaskMemFree(Some(location.0.cast()));
         Ok(path)
+    }
+}
+
+fn write_shortcut(path: &Path, exe: &Path, arguments: &str, description: &str) -> Result<()> {
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        let exe = HSTRING::from(exe.as_os_str());
+        link.SetPath(&exe)?;
+        link.SetArguments(&HSTRING::from(arguments))?;
+        link.SetDescription(&HSTRING::from(description))?;
+        link.SetIconLocation(&exe, 0)?;
+        let persist: IPersistFile = link.cast()?;
+        persist.Save(&HSTRING::from(path.as_os_str()), true)?;
+    }
+    Ok(())
+}
+
+fn remove_shortcut(path: PathBuf) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result.map_err(Into::into),
+    }
+}
+
+pub fn startup_prewarm_enabled() -> bool {
+    shortcut_path(&FOLDERID_Startup, LINK).is_ok_and(|path| path.is_file())
+}
+
+pub fn set_startup_prewarm(enabled: bool) -> Result<()> {
+    let path = shortcut_path(&FOLDERID_Startup, LINK)?;
+    if enabled {
+        let _apartment = crate::picker::Apartment::new()?;
+        write_shortcut(
+            &path,
+            &std::env::current_exe()?,
+            "--background",
+            "Wayline AirDrop",
+        )
+    } else {
+        remove_shortcut(path)
     }
 }
 fn command(exe: &Path) -> String {
@@ -168,35 +220,35 @@ pub fn register() -> Result<()> {
     let text = crate::i18n::current().strings();
     // Explorer may invoke a legacy verb once per selected file. The running
     // instance coalesces those activations into one selection and one window.
-    set_value(VERB, "", text.explorer_verb)?;
-    set_value(VERB, "Icon", &format!("\"{}\",0", exe.display()))?;
-    set_value(VERB, "MultiSelectModel", "Player")?;
-    set_value(&format!(r"{VERB}\command"), "", &command(&exe))?;
+    for verb in VERBS {
+        set_value(verb, "", text.explorer_verb)?;
+        set_value(verb, "Icon", &format!("\"{}\",0", exe.display()))?;
+        set_value(verb, "MultiSelectModel", "Player")?;
+        set_value(&format!(r"{verb}\command"), "", &command(&exe))?;
+    }
+    write_shortcut(
+        &shortcut_path(&FOLDERID_SendTo, LINK)?,
+        &exe,
+        "--send --",
+        text.explorer_description,
+    )?;
     unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-        link.SetPath(&HSTRING::from(exe.as_os_str()))?;
-        link.SetArguments(w!("--send --"))?;
-        link.SetDescription(&HSTRING::from(text.explorer_description))?;
-        link.SetIconLocation(&HSTRING::from(exe.as_os_str()), 0)?;
-        let persist: IPersistFile = link.cast()?;
-        persist.Save(&HSTRING::from(shortcut_path()?.as_os_str()), true)?;
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
     Ok(())
 }
 
 pub fn unregister() -> Result<()> {
-    unsafe {
-        let result = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(VERB));
-        if result != ERROR_FILE_NOT_FOUND {
-            result.ok()?;
+    for verb in VERBS {
+        unsafe {
+            let result = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(verb));
+            if result != ERROR_FILE_NOT_FOUND {
+                result.ok()?;
+            }
         }
     }
-    let path = shortcut_path()?;
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        result => result?,
-    }
+    remove_shortcut(shortcut_path(&FOLDERID_SendTo, LINK)?)?;
+    set_startup_prewarm(false)?;
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
@@ -276,5 +328,15 @@ mod tests {
             r#""C:\Program Files\Wayline\wayline.exe" --send -- "%1""#
         );
         assert!(Launch::parse([OsString::from("--unknown")]).is_err());
+    }
+
+    #[test]
+    fn background_activation_never_sends_files() {
+        let launch = Launch::parse(["--background"].map(OsString::from)).unwrap();
+        assert!(launch.background);
+        assert!(Launch::parse(["--background", "photo.jpg"].map(OsString::from)).is_err());
+        let launch = Launch::parse(["--send", "--", "--background"].map(OsString::from)).unwrap();
+        assert!(!launch.background);
+        assert_eq!(launch.files, [PathBuf::from("--background")]);
     }
 }

@@ -138,11 +138,19 @@ pub fn discover_receivers_live_cancellable(
         ));
     }
     #[cfg(windows)]
-    let _advert = if ble_wake {
-        Some(crate::ble::AirDropAdvert::start(legacy_ble)?)
-    } else {
-        None
-    };
+    let mut ble_error = None;
+    #[cfg(windows)]
+    let mut advert = ble_wake
+        .then(|| crate::ble::AirDropAdvert::begin(legacy_ble))
+        .and_then(|result| match result {
+            Ok(advert) => Some(advert),
+            Err(error) => {
+                ble_error = Some(error);
+                None
+            }
+        });
+    #[cfg(windows)]
+    let mut advert_started = false;
     #[cfg(not(windows))]
     let _ = (ble_wake, legacy_ble);
     let client = client_config()?;
@@ -153,6 +161,16 @@ pub fn discover_receivers_live_cancellable(
     while start.elapsed() < timeout {
         if cancel.is_cancelled() {
             return Err(SendError::cancelled());
+        }
+        #[cfg(windows)]
+        if let Some(publisher) = advert.as_ref().filter(|_| !advert_started) {
+            match publisher.ready() {
+                Ok(started) => advert_started = started,
+                Err(error) => {
+                    ble_error = Some(error);
+                    advert = None;
+                }
+            }
         }
         if start.elapsed() >= next_query {
             browser.query()?;
@@ -225,6 +243,20 @@ pub fn discover_receivers_live_cancellable(
     }
     if cancel.is_cancelled() {
         return Err(SendError::cancelled());
+    }
+    #[cfg(windows)]
+    if result.is_empty() {
+        // The last TCP probe can run past the publisher's startup deadline.
+        // Resolve its final status before reporting an empty discovery result.
+        let error = ble_error.or_else(|| {
+            advert
+                .as_ref()
+                .filter(|_| !advert_started)
+                .and_then(|publisher| publisher.ready().err())
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
     }
     Ok(result)
 }

@@ -84,7 +84,7 @@ impl Drop for Session {
 }
 
 impl Session {
-    fn open(dll: &Path, mac: MacAddr) -> io::Result<Self> {
+    fn open(dll: &Path, mac: MacAddr, mtu: u32) -> io::Result<Self> {
         if !dll.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -151,7 +151,7 @@ impl Session {
             }
             let mut id: NET_LUID_LH = mem::zeroed();
             luid(s.adapter, &mut id);
-            configure(id, mac)?;
+            configure(id, mac, mtu)?;
             s.session = start(s.adapter, 0x400000);
             if s.session.is_null() {
                 return Err(context("start Wintun session", io::Error::last_os_error()));
@@ -172,7 +172,7 @@ fn status(code: u32, action: &str) -> io::Result<()> {
     }
 }
 
-fn configure(id: NET_LUID_LH, mac: MacAddr) -> io::Result<()> {
+fn configure(id: NET_LUID_LH, mac: MacAddr, mtu: u32) -> io::Result<()> {
     // SAFETY: Win32 initializes the C rows; unions are accessed using the IPv6
     // discriminator. The system table remains alive until FreeMibTable.
     unsafe {
@@ -181,7 +181,7 @@ fn configure(id: NET_LUID_LH, mac: MacAddr) -> io::Result<()> {
         row.Family = AF_INET6;
         row.InterfaceLuid = id;
         status(GetIpInterfaceEntry(&mut row), "read awdl0 IPv6 settings")?;
-        row.NlMtu = MTU;
+        row.NlMtu = mtu;
         row.DadTransmits = 0;
         row.RouterDiscoveryBehavior = RouterDiscoveryDisabled;
         row.SitePrefixLength = 0;
@@ -238,7 +238,19 @@ pub struct Wintun {
 
 impl Wintun {
     pub fn open(dll: &Path, mac: MacAddr) -> io::Result<Self> {
-        let session = Arc::new(Session::open(dll, mac)?);
+        Self::open_with_mtu(dll, mac, MTU)
+    }
+
+    pub fn open_with_mtu(dll: &Path, mac: MacAddr, mtu: u32) -> io::Result<Self> {
+        // Windows advertises this link MTU for outbound packets and TCP MSS.
+        // The inbound decoder still accepts the original AWDL maximum.
+        if !(1280..=MTU).contains(&mtu) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported AWDL MTU",
+            ));
+        }
+        let session = Arc::new(Session::open(dll, mac, mtu)?);
         let stopped = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let (tx, packets) = mpsc::channel(128);
@@ -354,5 +366,25 @@ impl Drop for Wintun {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtl8821cu_compact_mtu_leaves_margin_before_three_usb_packets() {
+        // Pinned devourer prepends a 48-byte TX descriptor after stripping radiotap.
+        const RTL8821CU_TX_DESCRIPTOR: usize = 48;
+        let mac = MacAddr([2, 1, 2, 3, 4, 5]);
+        let peer = MacAddr([2, 5, 4, 3, 2, 1]);
+        let length = |mtu| {
+            owly_awdl::frame::data_frame(mac, peer, 0, 0, &vec![0; mtu]).len()
+                + RTL8821CU_TX_DESCRIPTOR
+        };
+        assert_eq!(length(MTU as usize), 1538);
+        assert_eq!(length(1440), 1528);
+        assert!(length(1440) < 3 * 512);
     }
 }

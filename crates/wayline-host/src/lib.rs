@@ -97,6 +97,70 @@ pub fn identity_dir() -> Result<PathBuf> {
 pub fn settings_path() -> Result<PathBuf> {
     Ok(identity_dir()?.join("desktop.json"))
 }
+
+/// A local trust decision pins the TLS leaf fingerprint. The name is for display.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TrustedSender {
+    pub name: String,
+    pub certificate_sha256: [u8; 32],
+}
+
+const MAX_TRUSTED_SENDERS: usize = 32;
+
+pub fn load_trusted_senders() -> Result<Vec<TrustedSender>> {
+    trusted_senders_from(&read_settings(&settings_path()?)?)
+}
+
+pub fn trust_sender(sender: TrustedSender) -> Result<Vec<TrustedSender>> {
+    change_trusted_senders(&settings_path()?, |senders| {
+        let sender = TrustedSender {
+            name: normalize_name(&sender.name)?,
+            ..sender
+        };
+        senders.retain(|entry| entry.certificate_sha256 != sender.certificate_sha256);
+        ensure!(
+            senders.len() < MAX_TRUSTED_SENDERS,
+            "Trusted senders list is full"
+        );
+        senders.push(sender);
+        Ok(())
+    })
+}
+
+pub fn forget_trusted_sender(certificate_sha256: [u8; 32]) -> Result<Vec<TrustedSender>> {
+    change_trusted_senders(&settings_path()?, |senders| {
+        senders.retain(|entry| entry.certificate_sha256 != certificate_sha256);
+        Ok(())
+    })
+}
+
+fn trusted_senders_from(settings: &Map<String, Value>) -> Result<Vec<TrustedSender>> {
+    let Some(value) = settings.get("trusted_senders") else {
+        return Ok(Vec::new());
+    };
+    let senders: Vec<TrustedSender> = serde_json::from_value(value.clone())?;
+    ensure!(
+        senders.len() <= MAX_TRUSTED_SENDERS,
+        "Trusted senders list is full"
+    );
+    for sender in &senders {
+        normalize_name(&sender.name)?;
+    }
+    Ok(senders)
+}
+
+fn change_trusted_senders(
+    path: &Path,
+    change: impl FnOnce(&mut Vec<TrustedSender>) -> Result<()>,
+) -> Result<Vec<TrustedSender>> {
+    let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
+    let mut settings = read_settings(path)?;
+    let mut senders = trusted_senders_from(&settings)?;
+    change(&mut senders)?;
+    settings.insert("trusted_senders".into(), serde_json::to_value(&senders)?);
+    write_settings(path, &settings)?;
+    Ok(senders)
+}
 pub fn default_name() -> String {
     std::env::var("COMPUTERNAME")
         .ok()
@@ -343,6 +407,31 @@ pub fn save_pinned_to(path: &Path, pinned: bool) -> Result<bool> {
     settings.insert("pinned".into(), Value::Bool(pinned));
     write_settings(path, &settings)?;
     Ok(pinned)
+}
+
+/// Selects the compact device grid for sending after the next desktop launch.
+pub fn load_compact_send_view() -> Result<bool> {
+    load_compact_send_view_from(&settings_path()?)
+}
+
+pub fn load_compact_send_view_from(path: &Path) -> Result<bool> {
+    match read_settings(path)?.get("compact_send_view") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        _ => bail!("compact_send_view 设置必须是布尔值"),
+    }
+}
+
+pub fn save_compact_send_view(enabled: bool) -> Result<bool> {
+    save_compact_send_view_to(&settings_path()?, enabled)
+}
+
+pub fn save_compact_send_view_to(path: &Path, enabled: bool) -> Result<bool> {
+    let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
+    let mut settings = read_settings(path)?;
+    settings.insert("compact_send_view".into(), Value::Bool(enabled));
+    write_settings(path, &settings)?;
+    Ok(enabled)
 }
 
 /// Whether successful receives should show a desktop notification.
@@ -689,6 +778,42 @@ fn interfaces() -> Result<Vec<NetworkInterface>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_senders_persist_and_can_be_revoked_without_losing_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.json");
+        fs::write(&path, r#"{"language":"zh-CN"}"#).unwrap();
+        assert!(
+            trusted_senders_from(&read_settings(&path).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        let phone = TrustedSender {
+            name: "我的 iPhone".into(),
+            certificate_sha256: [42; 32],
+        };
+        change_trusted_senders(&path, |senders| {
+            senders.push(phone.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            trusted_senders_from(&read_settings(&path).unwrap()).unwrap(),
+            [phone]
+        );
+
+        change_trusted_senders(&path, |senders| {
+            senders.retain(|entry| entry.certificate_sha256 != [42; 32]);
+            Ok(())
+        })
+        .unwrap();
+        let settings = read_settings(&path).unwrap();
+        assert!(trusted_senders_from(&settings).unwrap().is_empty());
+        assert_eq!(settings["language"], "zh-CN");
+    }
+
     #[test]
     fn names_preserve_unicode_and_reject_controls() {
         assert_eq!(normalize_name("  工作电脑 🦉 ").unwrap(), "工作电脑 🦉");
@@ -908,6 +1033,12 @@ mod tests {
                 save_auto_open_download_dir_to,
             ),
             ("pinned", DEFAULT_PINNED, load_pinned_from, save_pinned_to),
+            (
+                "compact_send_view",
+                false,
+                load_compact_send_view_from,
+                save_compact_send_view_to,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("desktop.json");

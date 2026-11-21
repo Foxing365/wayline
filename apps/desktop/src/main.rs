@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     if launch.unregister {
         return integration::unregister();
     }
-    let Some(_instance) = native::Instance::acquire(&launch.files)? else {
+    let Some(_instance) = native::Instance::acquire(&launch.files, launch.background)? else {
         return Ok(());
     };
     Application::new().run(move |cx: &mut App| {
@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
                 window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| ui::Capsule::new(window, cx, launch.files)),
+            |window, cx| cx.new(|cx| ui::Capsule::new(window, cx, launch.files, launch.background)),
         )
         .expect("open Wayline capsule");
     });

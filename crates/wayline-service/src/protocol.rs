@@ -9,6 +9,8 @@ pub struct Request {
     pub port: Option<String>,
     #[serde(alias = "Channel")]
     pub channel: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtl8821cu_width_mhz: Option<u16>,
     #[serde(alias = "Exe")]
     pub exe: Option<String>,
 }
@@ -28,6 +30,8 @@ pub struct Status {
     pub state: String,
     pub port: Option<String>,
     pub channel: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtl8821cu_width_mhz: Option<u16>,
     #[serde(default)]
     pub target: Option<String>,
     pub awdl0: bool,
@@ -64,6 +68,7 @@ mod tests {
             state: "stopped".into(),
             port: None,
             channel: 6,
+            rtl8821cu_width_mhz: None,
             target: None,
             awdl0: false,
             error: None,
@@ -72,5 +77,25 @@ mod tests {
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["state"], "stopped");
         assert!(value.get("State").is_none());
+    }
+
+    #[test]
+    fn monitor_width_does_not_break_older_status_messages() {
+        let legacy = r#"{"state":"running","port":"RTL8821CU","channel":149,"target":"rtl8821cu","awdl0":true,"error":null,"enabled":true}"#;
+        let mut status: Status = serde_json::from_str(legacy).unwrap();
+        assert!(status.uses_rtl8821cu());
+        assert_eq!(status.rtl8821cu_width_mhz, None);
+        status.rtl8821cu_width_mhz = Some(80);
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["rtl8821cuWidthMhz"],
+            80
+        );
+
+        let mut request = Request::new(crate::config::SET_RTL8821CU_WIDTH);
+        request.rtl8821cu_width_mhz = Some(40);
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["rtl8821cuWidthMhz"],
+            40
+        );
     }
 }

@@ -62,6 +62,8 @@ pub enum Unpacked {
     Dir(RelPath),
     /// Create this file; its data follows.
     File(RelPath),
+    /// Create a distinct file to publish under this top-level name.
+    WrappedFile(RelPath),
     Data(Vec<u8>),
     EndFile,
     /// The archive's trailer: everything has been written.
@@ -145,6 +147,10 @@ impl Unpacker {
                         Item::File(path) => {
                             self.writing = Some(true);
                             Some(Unpacked::File(path))
+                        }
+                        Item::WrappedFile(name) => {
+                            self.writing = Some(true);
+                            Some(Unpacked::WrappedFile(name))
                         }
                         Item::Skip => {
                             self.writing = Some(false);

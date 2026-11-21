@@ -10,7 +10,7 @@
 //! Policy is the caller's: this machine prompts for every `/Ask` and never
 //! accepts on its own (ASK-3). It serves Everyone mode only.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +93,13 @@ pub enum Event {
     SetTimer(Option<Duration>),
     /// A sender saw this receiver.
     Discovered(DiscoverRequest),
+    /// The receiver parsed the `/Ask` headers and is waiting for the offer.
+    AskStarted,
+    /// The offer did not reach the user's consent prompt.
+    AskRejected {
+        status: u16,
+        reason: &'static str,
+    },
     /// Ask the user. Answer with [`Connection::accept`] or
     /// [`Connection::decline`]. Every field in it is the sender's, to be
     /// escaped before display (SEC-4).
@@ -111,6 +118,8 @@ pub enum Event {
     /// Create a file in staging, without replacing anything. `Data` and
     /// then `EndFile` follow.
     CreateFile(RelPath),
+    /// Create a distinct file for this top-level publication name.
+    CreateWrappedFile(RelPath),
     Data(Vec<u8>),
     EndFile,
     /// Everything is in staging. Move it into place, then call
@@ -337,6 +346,13 @@ impl Connection {
         self.close();
     }
 
+    fn fail_control(&mut self, route: Route, status: u16, reason: &'static str) {
+        if route == Route::Ask {
+            self.events.push_back(Event::AskRejected { status, reason });
+        }
+        self.fail(status);
+    }
+
     /// Makes what progress the input allows. False when stuck.
     fn step(&mut self) -> bool {
         match std::mem::replace(&mut self.state, State::Closed) {
@@ -400,6 +416,8 @@ impl Connection {
                     // A clean close between requests, or a truncated head.
                     if self.input.is_empty() {
                         self.close();
+                    } else if self.input.starts_with(b"POST /Ask ") {
+                        self.fail_control(Route::Ask, 400, "incomplete HTTP headers");
                     } else {
                         self.fail(400);
                     }
@@ -408,7 +426,11 @@ impl Connection {
                 return false;
             }
             Err(e) => {
-                self.fail(e.status());
+                if self.input.starts_with(b"POST /Ask ") {
+                    self.fail_control(Route::Ask, e.status(), "invalid HTTP headers");
+                } else {
+                    self.fail(e.status());
+                }
                 return true;
             }
         };
@@ -446,10 +468,11 @@ impl Connection {
             "/Ask" => {
                 self.slots.discover = false;
                 if self.slots.asked || self.slots.upload {
-                    self.fail(400);
+                    self.fail_control(Route::Ask, 400, "duplicate request on connection");
                     return;
                 }
                 self.slots.asked = true;
+                self.events.push_back(Event::AskStarted);
                 Route::Ask
             }
             "/Upload" => {
@@ -473,7 +496,7 @@ impl Connection {
                     body: Vec::new(),
                 };
             }
-            Err(e) => self.fail(e.status()),
+            Err(e) => self.fail_control(route, e.status(), "invalid body framing or size"),
         }
     }
 
@@ -487,7 +510,7 @@ impl Connection {
                     progressed = true;
                 }
                 Ok(_) if self.eof => {
-                    self.fail(400);
+                    self.fail_control(route, 400, "incomplete HTTP body");
                     return true;
                 }
                 Ok(_) => {
@@ -499,7 +522,7 @@ impl Connection {
                     return progressed;
                 }
                 Err(e) => {
-                    self.fail(e.status());
+                    self.fail_control(route, e.status(), "invalid body framing or size");
                     return true;
                 }
             }
@@ -512,7 +535,7 @@ impl Connection {
         };
         let Ok(value) = value else {
             // SEC-6: XML, too deep, too big or malformed.
-            self.fail(400);
+            self.fail_control(route, 400, "invalid binary property list");
             return true;
         };
         match route {
@@ -547,25 +570,35 @@ impl Connection {
     }
 
     fn ask(&mut self, value: &plist::Value) {
-        let Ok(request) = AskRequest::from_plist(value) else {
-            self.fail(400);
-            return;
+        let request = match AskRequest::from_plist(value) {
+            Ok(request) => request,
+            Err(error) => {
+                self.fail_control(Route::Ask, 400, error.0);
+                return;
+            }
         };
-        // ASK-5: every path is checked before anyone is asked about it, and
-        // what's written must be what the prompt names: `FileBomPath` is
-        // `./<FileName>`.
-        if let Offer::Files(files) = &request.offer
-            && files.iter().any(|f| {
-                let (Ok(name), Ok(path)) =
-                    (RelPath::file_name(&f.name), RelPath::parse(&f.bom_path))
-                else {
-                    return true;
+        // Photos can wrap each regular file in one folder in a multi-photo
+        // share. Extraction drops that folder, retaining the name shown here.
+        if let Offer::Files(files) = &request.offer {
+            let mut paths = HashSet::new();
+            for file in files {
+                let path = RelPath::parse(&file.bom_path).ok().filter(|path| {
+                    let depth = path.components().len();
+                    path.last() == file.name && (depth == 1 || depth == 2 && !file.is_directory)
+                });
+                let Some(path) = path else {
+                    self.fail_control(
+                        Route::Ask,
+                        400,
+                        "file name or archive path failed validation",
+                    );
+                    return;
                 };
-                name != path
-            })
-        {
-            self.fail(400);
-            return;
+                if !paths.insert(path) {
+                    self.fail_control(Route::Ask, 400, "duplicate archive path in offer");
+                    return;
+                }
+            }
         }
         self.events.push_back(Event::Ask(request.clone()));
         self.events
@@ -667,6 +700,7 @@ impl Connection {
                 let event = match step {
                     Unpacked::Dir(path) => Event::CreateDir(path),
                     Unpacked::File(path) => Event::CreateFile(path),
+                    Unpacked::WrappedFile(name) => Event::CreateWrappedFile(name),
                     Unpacked::Data(data) => Event::Data(data),
                     Unpacked::EndFile => Event::EndFile,
                     Unpacked::Complete => unreachable!(),

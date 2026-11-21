@@ -1,5 +1,9 @@
 use crate::{
-    config::{Config, RadioBackend},
+    channel_switch,
+    config::{
+        Config, RadioBackend, Rtl8821cuRateProfile, RTL8821CU_DEFAULT_MTU,
+        RTL8821CU_DEFAULT_WIDTH_MHZ,
+    },
     supervisor::{Backend, ManagedProcess},
 };
 use serialport::{SerialPortInfo, SerialPortType};
@@ -105,12 +109,36 @@ impl Backend for WindowsBackend {
             .open(self.data_dir.join("bridge-console.log"))?;
         let channel = config.channel.to_string();
         let mut command = Command::new(exe);
+        command.env_remove(channel_switch::CONTROL_DIR_ENV);
+        let mut channel_dir = None;
         match config.radio_backend {
             RadioBackend::Esp32 => {
                 command.args(["--port", port]);
             }
             RadioBackend::Rtl8821cu => {
                 command.arg("--rtl8821cu");
+                if config.rtl8821cu_rate_profile != Rtl8821cuRateProfile::Baseline {
+                    command.args(["--rtl-rate-profile", config.rtl8821cu_rate_profile.as_str()]);
+                }
+                if config.rtl8821cu_high_resolution_timer {
+                    command.arg("--rtl-timer-1ms");
+                }
+                if config.rtl8821cu_mtu != RTL8821CU_DEFAULT_MTU {
+                    command.args(["--rtl-mtu", &config.rtl8821cu_mtu.to_string()]);
+                }
+                if config.rtl8821cu_width_mhz == RTL8821CU_DEFAULT_WIDTH_MHZ {
+                    match channel_switch::PrivateDirectory::create() {
+                        Ok(dir) => {
+                            command.env(channel_switch::CONTROL_DIR_ENV, dir.path());
+                            channel_dir = Some(dir);
+                        }
+                        Err(error) => {
+                            eprintln!("RTL8821CU will use cold channel switches: {error}");
+                        }
+                    }
+                } else {
+                    command.args(["--rtl-width-mhz", &config.rtl8821cu_width_mhz.to_string()]);
+                }
             }
         }
         let mut child = command
@@ -142,6 +170,7 @@ impl Backend for WindowsBackend {
         Ok(BridgeProcess {
             child,
             event,
+            channel_dir,
             _job: job,
             _device: device,
         })
@@ -201,6 +230,7 @@ impl StopEvent {
 pub struct BridgeProcess {
     child: Child,
     event: StopEvent,
+    channel_dir: Option<channel_switch::PrivateDirectory>,
     _job: OwnedHandle,
     _device: crate::device_lock::DeviceGuard,
 }
@@ -212,6 +242,21 @@ impl ManagedProcess for BridgeProcess {
     }
     fn request_stop(&mut self) -> io::Result<()> {
         self.event.signal()
+    }
+    fn request_channel(&mut self, channel: u8) -> io::Result<bool> {
+        let Some(dir) = &self.channel_dir else {
+            return Ok(false);
+        };
+        if self.ready_channel()?.is_none() {
+            return Ok(false);
+        }
+        channel_switch::publish(&dir.path().join(channel_switch::REQUESTED), channel)?;
+        Ok(true)
+    }
+    fn ready_channel(&self) -> io::Result<Option<u8>> {
+        self.channel_dir.as_ref().map_or(Ok(None), |dir| {
+            channel_switch::read(&dir.path().join(channel_switch::READY))
+        })
     }
     fn kill_and_wait(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_none() {
