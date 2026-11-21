@@ -620,23 +620,21 @@ impl Capsule {
                         ));
                         let _ = request.decision.send(false);
                     } else {
-                        let trusted =
-                            request
-                                .transfer
-                                .file_offer_certificate()
-                                .is_some_and(|pin| {
-                                    self.trusted_senders
-                                        .iter()
-                                        .any(|entry| entry.certificate_sha256 == pin)
-                                });
+                        let trusted = crate::receiving::can_auto_accept(
+                            &request.transfer,
+                            &self.trusted_senders,
+                        );
+                        let has_links = !request.transfer.urls.is_empty();
                         self.receive.dismiss_notice();
                         self.incoming = Some(request);
                         self.trust_incoming = false;
                         self.receiver_declined_until = None;
                         if trusted {
-                            crate::receiving::log(
-                                "incoming files approved by matching saved certificate",
-                            );
+                            crate::receiving::log(if has_links {
+                                "incoming links approved by matching certificate with link permission"
+                            } else {
+                                "incoming files approved by matching saved certificate"
+                            });
                             self.answer_incoming(IncomingAnswer::AutoAccept, cx);
                         } else {
                             self.expand(true, window, cx);
@@ -658,6 +656,9 @@ impl Capsule {
                         wayline_core::ReceiverEvent::Received { files, .. } => files.clone(),
                         _ => Vec::new(),
                     };
+                    let web_links = self
+                        .receive
+                        .links_on_completion(&event, &self.trusted_senders);
                     let applied = self.receive.apply_at(&event, event_at, event_unix_ms);
                     let open_location = crate::receiving::auto_open_location(
                         &event,
@@ -684,8 +685,10 @@ impl Capsule {
                     if let Some(target) = open_location {
                         self.open_history_folder(target, cx);
                     }
-                    for url in crate::receiving::accepted_web_links(&event, applied) {
-                        cx.open_url(&url);
+                    if applied {
+                        for url in web_links {
+                            cx.open_url(&url);
+                        }
                     }
                     changed |= applied;
                     continue;
@@ -4424,7 +4427,8 @@ impl Capsule {
                     .enumerate()
                     .map(|(index, sender)| {
                         let pin = sender.certificate_sha256;
-                        div()
+                        let open_web_links = sender.open_web_links;
+                        let row = div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
@@ -4466,7 +4470,25 @@ impl Capsule {
                                         );
                                         cx.notify();
                                     })),
+                            );
+                        div().flex().flex_col().gap(px(5.)).child(row).child(
+                            checkbox(
+                                ("trusted-open-links", index),
+                                text.trusted_sender_open_links,
+                                open_web_links,
                             )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.update_trusted_senders(
+                                        wayline_host::set_trusted_sender_open_web_links(
+                                            pin,
+                                            !open_web_links,
+                                        ),
+                                    );
+                                    cx.notify();
+                                },
+                            )),
+                        )
                     }),
             )
     }
@@ -4509,6 +4531,9 @@ impl Capsule {
             if accepted && delivered {
                 self.receive.set_channel(channel);
                 self.receive.begin(&request.transfer, request.save_dir);
+                if matches!(answer, IncomingAnswer::AutoAccept) {
+                    self.receive.mark_automatic_acceptance();
+                }
                 if matches!(answer, IncomingAnswer::Accept) {
                     self.settings_open = false;
                     self.pending_send_layout = None;
@@ -4521,6 +4546,7 @@ impl Capsule {
                         wayline_host::TrustedSender {
                             name: request.transfer.sender_name,
                             certificate_sha256,
+                            open_web_links: false,
                         },
                     ));
                 }
@@ -4547,6 +4573,7 @@ impl Capsule {
         let text = self.language.strings();
         let request = self.incoming.as_ref().unwrap();
         let is_link_share = !request.transfer.urls.is_empty();
+        let has_files = !request.transfer.files.is_empty();
         let certificate = request
             .transfer
             .file_offer_certificate()
@@ -4562,7 +4589,9 @@ impl Capsule {
                 div()
                     .text_size(px(24.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(if is_link_share {
+                    .child(if is_link_share && has_files {
+                        text.receive_files_and_links_title
+                    } else if is_link_share {
                         self.language.shared_links()
                     } else {
                         text.receive_files_title
@@ -4572,7 +4601,7 @@ impl Capsule {
                 div()
                     .text_size(px(13.))
                     .whitespace_normal()
-                    .child(if is_link_share {
+                    .child(if !has_files {
                         request.transfer.sender_name.clone()
                     } else {
                         self.language.incoming_ask(
@@ -4598,7 +4627,7 @@ impl Capsule {
                         .map(|name| div().whitespace_normal().mb(px(6.)).child(name)),
                 ),
             )
-            .when(!is_link_share, |view| {
+            .when(has_files, |view| {
                 view.child(
                     div()
                         .text_size(px(10.))
@@ -4638,7 +4667,9 @@ impl Capsule {
             .child(
                 button(
                     "accept-incoming",
-                    if is_link_share {
+                    if is_link_share && has_files {
+                        text.accept_files_and_open_links
+                    } else if is_link_share {
                         self.language.open_shared_links()
                     } else {
                         text.accept
@@ -5271,7 +5302,7 @@ fn short_certificate_pin(pin: [u8; 32]) -> String {
     format!("SHA-256 {prefix}…")
 }
 
-fn checkbox(id: &'static str, label: &'static str, checked: bool) -> Stateful<Div> {
+fn checkbox(id: impl Into<ElementId>, label: &'static str, checked: bool) -> Stateful<Div> {
     div()
         .id(id)
         .flex_shrink_0()

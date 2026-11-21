@@ -283,6 +283,8 @@ pub struct AskRequest {
     pub sender_record: Option<Vec<u8>>,
     pub file_icon: Option<Vec<u8>>,
     pub offer: Offer,
+    /// Text and links that accompany an explicitly declared file upload.
+    pub file_share_items: Vec<String>,
     /// An explicit links offer carried a zero-byte URL descriptor for each item.
     pub has_link_metadata: bool,
     /// The whole request as received, for logs ([`Value::describe`]).
@@ -328,26 +330,36 @@ impl AskRequest {
             Some(_) => return Err(Error::Invalid("Items is not an array")),
         };
         let mut has_link_metadata = false;
+        let mut file_share_items = Vec::new();
         let offer = match (files.is_empty(), items.is_empty()) {
             (false, true) => Offer::Files(files),
             (true, false) => Offer::Urls(items),
             (true, true) => return Err(Error::Invalid("nothing offered")),
             (false, false) => {
                 let kind = TransferTypeKind::from_plist(d.get("TransferType"));
-                if kind != TransferTypeKind::Links
-                    || files.len() != items.len()
-                    || !files.iter().all(is_empty_web_link_metadata)
-                {
-                    return Err(Error::MixedOffer(MixedOfferShape::new(
-                        kind,
-                        &files,
-                        items.len(),
-                    )));
+                match kind {
+                    TransferTypeKind::Files => {
+                        file_share_items = items;
+                        Offer::Files(files)
+                    }
+                    TransferTypeKind::Links
+                        if files.len() == items.len()
+                            && files.iter().all(is_empty_web_link_metadata) =>
+                    {
+                        has_link_metadata = true;
+                        Offer::Urls(items)
+                    }
+                    _ => {
+                        return Err(Error::MixedOffer(MixedOfferShape::new(
+                            kind,
+                            &files,
+                            items.len(),
+                        )));
+                    }
                 }
-                has_link_metadata = true;
-                Offer::Urls(items)
             }
         };
+        let describe = !has_link_metadata && file_share_items.is_empty();
         Ok(AskRequest {
             transfer_id,
             transfer_type,
@@ -358,11 +370,12 @@ impl AskRequest {
             sender_record: data(d, "SenderRecordData")?,
             file_icon: data(d, "FileIcon")?,
             offer,
+            file_share_items,
             has_link_metadata,
-            described: if has_link_metadata {
-                String::new()
-            } else {
+            described: if describe {
                 value.describe()
+            } else {
+                String::new()
             },
         })
     }
@@ -406,7 +419,7 @@ impl AskRequest {
         );
         insert_opt(&mut d, "FileIcon", self.file_icon.clone().map(Value::Data));
         let (files, items) = match &self.offer {
-            Offer::Files(files) => (files.as_slice(), &[][..]),
+            Offer::Files(files) => (files.as_slice(), self.file_share_items.as_slice()),
             Offer::Urls(urls) => (&[][..], urls.as_slice()),
         };
         let files = files

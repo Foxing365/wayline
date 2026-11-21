@@ -333,3 +333,6 @@ apple_identity_required = "設定から Apple AirDrop ID を読み込み直し�
 switching_radio = "ワイヤレス設定を適用中…"
 err_radio_save = "ワイヤレス設定を保存できませんでした。 "
 radio_channel_44_hint = "44 で機器が見つからない場合は、149 を試してください。"
+trusted_sender_open_links = "この機器から共有されたウェブリンクを自動で開く"
+receive_files_and_links_title = "共有されたファイルとリンク"
+accept_files_and_open_links = "ファイルを受信してリンクを開く"

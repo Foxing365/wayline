@@ -783,7 +783,7 @@ fn tls_invalid_offer_is_rejected_before_consent_with_a_diagnostic() {
 }
 
 #[test]
-fn tls_rejects_mixed_offers_with_counts_and_no_sender_values() {
+fn tls_rejects_unrecognized_mixed_offers_with_counts_and_no_sender_values() {
     use owly_airdrop::proto::{
         messages::{AskFile, Offer},
         plist::{self, Dict, Value},
@@ -825,7 +825,6 @@ fn tls_rejects_mixed_offers_with_counts_and_no_sender_values() {
         ]),
     );
     for (transfer_type, expected) in [
-        (Some("files"), "files"),
         (Some("links"), "links"),
         (Some("private-type"), "other"),
         (None, "missing"),
@@ -862,6 +861,91 @@ fn tls_rejects_mixed_offers_with_counts_and_no_sender_values() {
                 },
             ]
         );
+    }
+}
+
+#[test]
+fn tls_file_share_with_a_web_link_requires_consent_and_uploads_the_attachment() {
+    use owly_airdrop::proto::plist::{self, Value};
+
+    const WEB_LINKS: &[&str] = &["https://b23.tv/wayline-test"];
+    for (item, decision, status, has_link) in [
+        (
+            "【Bilibili】https://b23.tv/wayline-test",
+            Some(true),
+            200,
+            true,
+        ),
+        (WEB_LINKS[0], Some(false), 403, true),
+        (WEB_LINKS[0], None, 403, true),
+        (
+            "bilibili://video/1 file:///C:/test.exe",
+            Some(true),
+            200,
+            false,
+        ),
+    ] {
+        let expected_links = if has_link { WEB_LINKS } else { &[] };
+        let (root, ask, upload) = protocol_upload(Compressor::DvZip, false);
+        let receiver = identity(&root.path().join("receiver"));
+        let sender = identity(&root.path().join("sender"));
+        let destination = root.path().join("received");
+        let (_, body) = read_request(&mut ask.as_slice());
+        let Value::Dict(mut offer) = plist::from_bytes(&body, &plist::Limits::default()).unwrap()
+        else {
+            panic!("expected an offer dictionary");
+        };
+        offer.insert("Items".into(), Value::Array(vec![item.into()]));
+        let body = plist::to_bytes(&Value::Dict(offer));
+        let head = http::post_head("/Ask", &[("Content-Length", &body.len().to_string())]);
+        let options = ReceiverOptions::new("receiver", "Windows", &destination).with_accept_all();
+        let mut core = ReceiverCore::new(options);
+        let prompted = Arc::new(AtomicBool::new(false));
+        if let Some(decision) = decision {
+            let prompted = Arc::clone(&prompted);
+            core = core.with_decision(move |transfer| {
+                prompted.store(true, Ordering::Release);
+                assert_eq!(transfer.files.len(), 1);
+                assert_eq!(transfer.files[0].name, "a.txt");
+                let actual = wayline_core::airdrop::web_links(&transfer.urls);
+                assert_eq!(actual, expected_links);
+                assert!(transfer.sender_certificate_sha256.is_some());
+                assert!(transfer.file_offer_certificate().is_none());
+                decision
+            });
+        }
+        let (peer, worker) = start(Arc::new(core), &receiver);
+        let mut tls = client_with_identity(peer.service.address, Some(&sender));
+        tls.write_all(&head).unwrap();
+        tls.write_all(&body).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, status);
+        assert_eq!(prompted.load(Ordering::Acquire), decision.is_some());
+        assert!(!destination.exists());
+        if status == 200 {
+            tls.write_all(&upload).unwrap();
+            tls.flush().unwrap();
+            assert_eq!(response(&mut tls).status, 200);
+        }
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        drop(tls);
+        let events = worker.join().unwrap().unwrap();
+        if status == 200 {
+            let saved = destination.join("a.txt");
+            assert_eq!(fs::read(&saved).unwrap(), b"verified");
+            assert!(
+                matches!(events.last(), Some(ReceiverEvent::Received { transfer, files })
+                if files == &[saved]
+                    && wayline_core::airdrop::web_links(&transfer.urls) == expected_links)
+            );
+        } else {
+            assert!(!destination.exists());
+            assert!(matches!(
+                events.last(),
+                Some(ReceiverEvent::Rejected { .. })
+            ));
+        }
     }
 }
 

@@ -19,16 +19,26 @@ pub fn web_url(value: &str) -> Option<String> {
     (url.has_host() && url.username().is_empty() && url.password().is_none()).then(|| url.into())
 }
 
-/// A share item can contain a display title on a separate line from its URL.
-/// Keep the HTTP(S) lines in their original order and ignore app-only links.
+/// A share item can include a title alongside its URL.
+/// Preserve the order of web links and ignore app-specific URLs.
 pub fn web_links(items: &[String]) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     items
         .iter()
-        .flat_map(|item| item.lines())
-        .filter_map(web_url)
+        .flat_map(|item| links_in_item(item))
         .filter(|url| seen.insert(url.clone()))
         .collect()
+}
+
+pub(crate) fn links_in_item(item: &str) -> impl Iterator<Item = String> + '_ {
+    item.split_whitespace().filter_map(|part| {
+        web_url(part).or_else(|| {
+            let (_, url) = part
+                .split_once(['】', '》'])
+                .filter(|(title, _)| !title.contains("://"))?;
+            web_url(url)
+        })
+    })
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingFile {
@@ -61,7 +71,7 @@ impl IncomingTransfer {
                         size: f.size,
                     })
                     .collect(),
-                Vec::new(),
+                ask.file_share_items.clone(),
             ),
             Offer::Urls(urls) => (Vec::new(), urls.clone()),
         };
@@ -93,3 +103,19 @@ impl IncomingTransfer {
     }
 }
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_punctuation_inside_urls_and_accepts_a_share_title() {
+        let whole = "https://example.org/作品【上集】?v=1";
+        let url = web_url(whole).unwrap();
+        assert_eq!(
+            web_links(&[whole.into(), format!("【标题】{whole}")]),
+            [url]
+        );
+        assert!(web_links(&["file:///example】https://example.org".into()]).is_empty());
+    }
+}

@@ -144,6 +144,7 @@ fn ask_request_with_record(
         sender_record: sender_record.map(<[u8]>::to_vec),
         file_icon: None,
         offer: offer.clone(),
+        file_share_items: Vec::new(),
         has_link_metadata: false,
         described: String::new(),
     };

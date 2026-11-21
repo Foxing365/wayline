@@ -333,3 +333,6 @@ apple_identity_required = "Importa de nuevo la identidad de Apple AirDrop en Aju
 switching_radio = "Aplicando los ajustes inalámbricos…"
 err_radio_save = "No se pudieron guardar los ajustes inalámbricos. "
 radio_channel_44_hint = "Si no aparecen dispositivos en el canal 44, prueba el canal 149."
+trusted_sender_open_links = "Abrir automáticamente los enlaces web de este dispositivo"
+receive_files_and_links_title = "Archivos y enlaces compartidos"
+accept_files_and_open_links = "Recibir archivos y abrir enlaces"

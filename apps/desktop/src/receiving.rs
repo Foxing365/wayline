@@ -16,7 +16,7 @@ use wayline_core::airdrop::web_links;
 use wayline_core::{IncomingTransfer, ReceiverCore, ReceiverEvent, ReceiverOptions};
 use wayline_host::{
     TransferDirection, TransferFailureReason, TransferFormat, TransferHistoryRecord,
-    TransferOutcome,
+    TransferOutcome, TrustedSender,
 };
 
 pub struct IncomingRequest {
@@ -38,6 +38,21 @@ pub fn save_directory() -> Result<PathBuf> {
     wayline_host::download_dir()
 }
 
+/// Match the certificate proven during TLS. Opening links has its own permission.
+pub fn can_auto_accept(transfer: &IncomingTransfer, trusted: &[TrustedSender]) -> bool {
+    let Some(pin) = transfer.sender_certificate_sha256 else {
+        return false;
+    };
+    trusted.iter().any(|sender| {
+        sender.certificate_sha256 == pin
+            && if transfer.urls.is_empty() {
+                !transfer.files.is_empty()
+            } else {
+                sender.open_web_links
+            }
+    })
+}
+
 /// Only a successful event accepted by the receive model may open Explorer.
 pub fn auto_open_location(
     event: &ReceiverEvent,
@@ -49,22 +64,16 @@ pub fn auto_open_location(
         return None;
     }
     match event {
-        ReceiverEvent::Received { transfer, files } if transfer.urls.is_empty() => files
-            .first()
-            .cloned()
-            .or_else(|| fallback.map(std::path::Path::to_path_buf)),
+        ReceiverEvent::Received { transfer, files }
+            if !files.is_empty() || transfer.urls.is_empty() =>
+        {
+            files
+                .first()
+                .cloned()
+                .or_else(|| fallback.map(std::path::Path::to_path_buf))
+        }
         _ => None,
     }
-}
-
-/// Called after the user approved the offer and its completion was applied.
-pub fn accepted_web_links(event: &ReceiverEvent, applied: bool) -> Vec<String> {
-    if let ReceiverEvent::Received { transfer, .. } = event
-        && applied
-    {
-        return web_links(&transfer.urls);
-    }
-    Vec::new()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,6 +96,7 @@ pub struct Transfer {
     pub transferred_bytes: u64,
     pub channel: Option<u16>,
     pub format: Option<TransferFormat>,
+    automatically_accepted: bool,
 }
 
 impl Transfer {
@@ -279,7 +289,11 @@ impl Model {
         self.active = Some(Transfer {
             id: transfer.id.clone(),
             sender: transfer.sender_name.clone(),
-            files: file_names.len(),
+            files: if transfer.files.is_empty() {
+                file_names.len()
+            } else {
+                transfer.files.len()
+            },
             file_names,
             save_dir,
             phase: Phase::Waiting,
@@ -289,9 +303,40 @@ impl Model {
             transferred_bytes: 0,
             channel: self.channel,
             format: None,
+            automatically_accepted: false,
         });
         self.reset_speed();
         self.notice = None;
+    }
+
+    pub fn mark_automatic_acceptance(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.automatically_accepted = true;
+        }
+    }
+
+    /// Resolve links against the still-active consent before applying the completion.
+    pub fn links_on_completion(
+        &self,
+        event: &ReceiverEvent,
+        trusted: &[TrustedSender],
+    ) -> Vec<String> {
+        let ReceiverEvent::Received { transfer, .. } = event else {
+            return Vec::new();
+        };
+        let approved = self
+            .active
+            .as_ref()
+            .or(self.interrupted.as_ref())
+            .is_some_and(|active| {
+                active.id == transfer.id
+                    && (!active.automatically_accepted || can_auto_accept(transfer, trusted))
+            });
+        if approved {
+            web_links(&transfer.urls)
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn interrupt(&mut self, message: String) -> bool {
@@ -398,7 +443,7 @@ impl Model {
             }
             ReceiverEvent::Received { transfer, files } if transfer.id == active.id => {
                 let language = crate::i18n::current();
-                let message = if transfer.urls.is_empty() {
+                let message = if !files.is_empty() {
                     language.received_notice(
                         &active.sender,
                         files.len(),
@@ -599,7 +644,11 @@ pub fn declined_history_record(
         finished_at_unix_ms: finished_at_unix_ms.max(request.started_at_unix_ms),
         direction: TransferDirection::Receive,
         peer: request.transfer.sender_name.clone(),
-        file_count: file_names.len(),
+        file_count: if request.transfer.files.is_empty() {
+            file_names.len()
+        } else {
+            request.transfer.files.len()
+        },
         file_names,
         file_paths: Vec::new(),
         channel: None,
@@ -996,8 +1045,11 @@ mod tests {
             transfer: share,
             files: Vec::new(),
         };
-        assert!(accepted_web_links(&event, false).is_empty());
-        assert_eq!(accepted_web_links(&event, true), ["https://b23.tv/short"]);
+        assert!(Model::default().links_on_completion(&event, &[]).is_empty());
+        assert_eq!(
+            model.links_on_completion(&event, &[]),
+            ["https://b23.tv/short"]
+        );
         let record = model
             .history_record_for_event(&event, Instant::now(), 0)
             .unwrap();
@@ -1007,6 +1059,55 @@ mod tests {
             auto_open_location(&event, true, true, Some(std::path::Path::new("downloads")))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn web_link_automation_requires_explicit_permission_for_the_matching_certificate() {
+        let mut sender = TrustedSender {
+            name: "phone".into(),
+            certificate_sha256: [42; 32],
+            open_web_links: false,
+        };
+        let mut share = transfer("one");
+        share.files.push(wayline_core::IncomingFile {
+            name: "one.txt".into(),
+            kind: "public.plain-text".into(),
+            size: Some(1),
+        });
+        share.sender_certificate_sha256 = Some([42; 32]);
+        assert!(can_auto_accept(&share, std::slice::from_ref(&sender)));
+
+        share.urls.push("https://b23.tv/short".into());
+        assert!(!can_auto_accept(&share, std::slice::from_ref(&sender)));
+        sender.open_web_links = true;
+        assert!(can_auto_accept(&share, std::slice::from_ref(&sender)));
+        let mut model = Model::default();
+        model.begin(&share, PathBuf::from("downloads"));
+        model.mark_automatic_acceptance();
+        let event = ReceiverEvent::Received {
+            transfer: share.clone(),
+            files: vec![PathBuf::from("downloads/one.txt")],
+        };
+        assert_eq!(
+            model.links_on_completion(&event, std::slice::from_ref(&sender)),
+            ["https://b23.tv/short"]
+        );
+        sender.open_web_links = false;
+        assert!(
+            model
+                .links_on_completion(&event, std::slice::from_ref(&sender))
+                .is_empty()
+        );
+        assert!(model.links_on_completion(&event, &[]).is_empty());
+        sender.open_web_links = true;
+        share.files.clear();
+        assert!(can_auto_accept(&share, std::slice::from_ref(&sender)));
+
+        share.sender_name = sender.name.clone();
+        for wrong_pin in [Some([41; 32]), None] {
+            share.sender_certificate_sha256 = wrong_pin;
+            assert!(!can_auto_accept(&share, std::slice::from_ref(&sender)));
+        }
     }
 
     #[test]

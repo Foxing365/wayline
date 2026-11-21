@@ -110,6 +110,8 @@ pub fn settings_path() -> Result<PathBuf> {
 pub struct TrustedSender {
     pub name: String,
     pub certificate_sha256: [u8; 32],
+    #[serde(default)]
+    pub open_web_links: bool,
 }
 
 const MAX_TRUSTED_SENDERS: usize = 32;
@@ -137,6 +139,20 @@ pub fn trust_sender(sender: TrustedSender) -> Result<Vec<TrustedSender>> {
 pub fn forget_trusted_sender(certificate_sha256: [u8; 32]) -> Result<Vec<TrustedSender>> {
     change_trusted_senders(&settings_path()?, |senders| {
         senders.retain(|entry| entry.certificate_sha256 != certificate_sha256);
+        Ok(())
+    })
+}
+
+pub fn set_trusted_sender_open_web_links(
+    certificate_sha256: [u8; 32],
+    enabled: bool,
+) -> Result<Vec<TrustedSender>> {
+    change_trusted_senders(&settings_path()?, |senders| {
+        let sender = senders
+            .iter_mut()
+            .find(|entry| entry.certificate_sha256 == certificate_sha256)
+            .context("Trusted device no longer exists")?;
+        sender.open_web_links = enabled;
         Ok(())
     })
 }
@@ -800,7 +816,14 @@ mod tests {
         let phone = TrustedSender {
             name: "我的 iPhone".into(),
             certificate_sha256: [42; 32],
+            open_web_links: false,
         };
+        let mut legacy = serde_json::to_value(&phone).unwrap();
+        legacy.as_object_mut().unwrap().remove("open_web_links");
+        assert_eq!(
+            serde_json::from_value::<TrustedSender>(legacy).unwrap(),
+            phone
+        );
         change_trusted_senders(&path, |senders| {
             senders.push(phone.clone());
             Ok(())

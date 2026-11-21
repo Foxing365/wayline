@@ -1,6 +1,6 @@
 //! Application lifecycle and blocking Windows workers around Owly's receiver.
 use crate::{
-    airdrop::web_url,
+    airdrop::links_in_item,
     mdns::{MdnsResponder, NetworkInterface},
     IncomingTransfer, TransferFailureKind,
 };
@@ -303,7 +303,9 @@ impl ReceiverCore {
                                 || transfer
                                     .urls
                                     .iter()
-                                    .all(|item| item.lines().any(|line| web_url(line).is_some()));
+                                    .all(|item| links_in_item(item).next().is_some());
+                            let can_auto_accept =
+                                !ask.has_link_metadata && ask.file_share_items.is_empty();
                             transfer.sender_certificate_sha256 = tls
                                 .conn
                                 .peer_certificates()
@@ -318,12 +320,13 @@ impl ReceiverCore {
                                 transfer.files.len(),
                             ));
                             let before = Instant::now();
-                            let accepted = supported_link_items
-                                && core.decide.as_ref().map_or(
-                                    core.options.accept_all && !ask.has_link_metadata,
-                                    |decide| decide(&transfer),
-                                )
-                                && before.elapsed() < core.options.decision_timeout;
+                            let accepted =
+                                supported_link_items
+                                    && core.decide.as_ref().map_or(
+                                        core.options.accept_all && can_auto_accept,
+                                        |decide| decide(&transfer),
+                                    )
+                                    && before.elapsed() < core.options.decision_timeout;
                             incoming = Some(transfer.clone());
                             if accepted {
                                 connection.accept();

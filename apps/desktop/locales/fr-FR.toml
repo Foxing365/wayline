@@ -333,3 +333,6 @@ apple_identity_required = "Importez de nouveau l’identité Apple AirDrop dans 
 switching_radio = "Application des réglages sans fil…"
 err_radio_save = "Impossible d’enregistrer les réglages sans fil. "
 radio_channel_44_hint = "Essayez le canal 149 si aucun appareil n’apparaît sur le canal 44."
+trusted_sender_open_links = "Ouvrir automatiquement les liens web de cet appareil"
+receive_files_and_links_title = "Fichiers et liens partagés"
+accept_files_and_open_links = "Recevoir les fichiers et ouvrir les liens"

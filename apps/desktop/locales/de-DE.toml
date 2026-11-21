@@ -333,3 +333,6 @@ apple_identity_required = "Importiere die Apple-AirDrop-Identität erneut in den
 switching_radio = "WLAN-Einstellungen werden übernommen…"
 err_radio_save = "Die WLAN-Einstellungen konnten nicht gespeichert werden. "
 radio_channel_44_hint = "Wenn auf Kanal 44 keine Geräte erscheinen, versuche es mit Kanal 149."
+trusted_sender_open_links = "Weblinks dieses Geräts automatisch öffnen"
+receive_files_and_links_title = "Geteilte Dateien und Links"
+accept_files_and_open_links = "Dateien empfangen und Links öffnen"
