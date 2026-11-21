@@ -214,7 +214,9 @@ Identity creation and advertisement rename history in `receiver-services.json` a
 `download_directory` defaults to Downloads/Wayline; changing it leaves existing files in place
 and is blocked during receiving. `language` stores `zh-CN`, `zh-TW`, `en-US`, `ja-JP`, `ko-KR`,
 `fr-FR`, `de-DE` or `es-ES`; when absent, Windows UI language selects it and unsupported locales
-fall back to English. `desktop_notifications_enabled` controls separate notifications for receive connection failures and defaults to `true`.
+fall back to English. `desktop_notifications_enabled` controls separate notifications for file
+receive starts and connection failures and defaults to `true`. The start notice appears once at
+the bottom right when upload progress first arrives.
 Successful transfers show their result in the sharing card for 10 seconds. The appearance flags
 `compact_send_view` and `compact_send_dark` are written together. With no dark preference,
 an existing compact layout remains light. Launch at sign-in uses the current user's Startup folder.

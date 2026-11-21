@@ -698,7 +698,20 @@ impl Capsule {
                         .active
                         .as_ref()
                         .is_some_and(|active| active.web_links_opened);
+                    let receive_start = self.receive.starting_receive(&event).map(|active| {
+                        let count = self.language.file_count(active.files);
+                        format!("{} · {count}", active.sender)
+                    });
                     let applied = self.receive.apply_at(&event, event_at, event_unix_ms);
+                    if applied && let Some(message) = receive_start {
+                        self.show_desktop_notification(
+                            self.language.strings().receiving_title,
+                            message.clone(),
+                            message,
+                            crate::settings::NotificationPosition::BottomRight,
+                            cx,
+                        );
+                    }
                     let open_location = crate::receiving::auto_open_location(
                         &event,
                         applied,
@@ -742,6 +755,7 @@ impl Capsule {
                                 "Wayline",
                                 notice.message.clone(),
                                 notice.full_text.clone(),
+                                self.notification_position,
                                 cx,
                             ),
                             _ => {}
@@ -3493,6 +3507,7 @@ impl Capsule {
         title: &'static str,
         message: String,
         full_text: String,
+        position: crate::settings::NotificationPosition,
         cx: &mut Context<Self>,
     ) {
         if !self.desktop_notifications_enabled {
@@ -3507,7 +3522,6 @@ impl Capsule {
         let text = self.language.strings();
         let copy = text.copy;
         let copied = text.copied;
-        let position = self.notification_position;
         let duration_seconds = self.notification_duration_seconds;
         let fallback_title = title;
         let fallback_message = message.clone();

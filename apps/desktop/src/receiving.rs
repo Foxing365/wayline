@@ -174,6 +174,15 @@ pub struct Model {
 }
 
 impl Model {
+    pub(super) fn starting_receive(&self, event: &ReceiverEvent) -> Option<&Transfer> {
+        let ReceiverEvent::Receiving { transfer_id, .. } = event else {
+            return None;
+        };
+        self.active
+            .as_ref()
+            .filter(|active| &active.id == transfer_id && active.phase == Phase::Waiting)
+    }
+
     pub fn show_notice(&mut self, message: impl Into<String>, kind: NoticeKind) {
         self.show_notice_at(message.into(), kind, Instant::now());
     }
@@ -1273,15 +1282,24 @@ mod tests {
         let mut model = Model::default();
         model.begin(&offer, PathBuf::from("chosen folder"));
         assert_eq!(model.active.as_ref().unwrap().phase, Phase::Waiting);
-        assert!(model.apply(&ReceiverEvent::Receiving {
+        let start = ReceiverEvent::Receiving {
             transfer_id: offer.id.clone(),
-            received: 512,
+            received: 0,
             total: None,
-        }));
+        };
+        let stale = ReceiverEvent::Receiving {
+            transfer_id: "previous".into(),
+            received: 0,
+            total: None,
+        };
+        assert!(model.starting_receive(&stale).is_none());
+        assert!(model.starting_receive(&start).is_some());
+        assert!(model.apply(&start));
+        assert!(model.starting_receive(&start).is_none());
         assert_eq!(
             model.active.as_ref().unwrap().phase,
             Phase::Receiving {
-                received: 512,
+                received: 0,
                 total: None
             }
         );
