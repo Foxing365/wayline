@@ -36,6 +36,10 @@ pub struct Status {
 }
 
 impl Status {
+    pub fn uses_rtl8821cu(&self) -> bool {
+        self.port.as_deref() == Some(crate::config::RTL8821CU_PORT)
+    }
+
     pub fn with_error(mut self, error: impl ToString) -> Self {
         self.error = Some(error.to_string());
         self

@@ -208,7 +208,7 @@ pub fn send_to_receiver_cancellable(
             &hex[20..]
         );
         let mut transfer = Transfer::new(&cfg, &id, &offer, Some((compressor, len)));
-        let client = client_config(identity)?;
+        let client = client_config()?;
         let mut tls = connect(selected.service.address, &client, options.timeout, cancel)?;
         event(SendEvent::WaitingForAcceptance {
             receiver: selected.name.clone(),
@@ -389,11 +389,11 @@ fn select_format(requested: SendFormat, receiver_flags: Option<u32>) -> SendForm
     }
 }
 
-pub(crate) fn client_config(identity: &Identity) -> Result<Arc<ClientConfig>, SendError> {
+pub(crate) fn client_config() -> Result<Arc<ClientConfig>, SendError> {
     crate::tls::install_provider();
-    Ok(owly_airdrop::driver::tls::client_config(Some(
-        &crate::tls::upstream_identity(identity),
-    ))?)
+    // AirDrop's Everyone mode accepts a sender without a TLS client
+    // certificate. Some iPhones refuse the generated Windows certificate.
+    Ok(owly_airdrop::driver::tls::client_config(None)?)
 }
 fn connect(
     address: SocketAddrV6,

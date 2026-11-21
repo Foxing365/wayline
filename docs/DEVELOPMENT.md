@@ -72,6 +72,9 @@ Run `just --list` for task shortcuts.
 
 ### Rust AWDL backend
 
+The optional RTL8821CU backend uses radio_link v3 and the same Owly/Wintun stack.
+See the [USB setup and rollback procedure](RTL8821CU.zh-CN.md).
+
 `apps/bridge` is the supervised wireless child. `crates/wayline-awdl` implements
 ESP32 serial I/O, Wintun, IPv6 and board feedback. The AWDL protocol comes from
 pinned Owly 0.4.0; [source and adaptation notes](../vendor/owly-awdl/README.md)

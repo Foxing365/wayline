@@ -1,12 +1,11 @@
 use crate::{
-    config::Config,
+    config::{Config, RadioBackend, RTL8821CU_PORT},
     protocol::{Request, Status},
 };
 use std::{io, path::PathBuf, time::Duration};
 
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
-const STOP_GRACE: Duration = Duration::from_secs(5);
 
 pub trait ManagedProcess {
     /// Polls and reaps an exited child. None means it is still alive.
@@ -45,7 +44,7 @@ impl<B: Backend> Supervisor<B> {
     pub fn new(backend: B, config: Config, config_path: PathBuf) -> Self {
         let status = Status {
             state: "stopped".into(),
-            port: None,
+            port: (config.radio_backend == RadioBackend::Rtl8821cu).then(|| RTL8821CU_PORT.into()),
             channel: config.channel,
             target: None,
             awdl0: false,
@@ -153,7 +152,7 @@ impl<B: Backend> Supervisor<B> {
     fn begin_stop(&mut self, now: Duration) {
         if self.stopping.is_none() {
             if let Some(child) = &mut self.child {
-                self.stopping = Some(now + STOP_GRACE);
+                self.stopping = Some(now + self.config.radio_backend.stop_grace());
                 self.status.state = "stopping".into();
                 self.status.error = child
                     .request_stop()
@@ -242,14 +241,17 @@ impl<B: Backend> Supervisor<B> {
         }
         if self.shutdown || !self.config.enabled {
             self.status.state = "stopped".into();
-            self.status.port = None;
+            self.status.port = (self.config.radio_backend == RadioBackend::Rtl8821cu)
+                .then(|| RTL8821CU_PORT.into());
             self.status.error = None;
             return;
         }
         if now < self.retry_at {
             return;
         }
-        let port = if self.config.port == "auto" {
+        let port = if self.config.radio_backend == RadioBackend::Rtl8821cu {
+            Some(RTL8821CU_PORT.into())
+        } else if self.config.port == "auto" {
             match self.backend.find_port() {
                 Ok(port) => port,
                 Err(e) => {
@@ -297,7 +299,7 @@ fn validate_target_channel(status: &Status, channel: u16) -> io::Result<()> {
     }
     let target = status.target.as_deref();
     if channel == 6
-        || (matches!((target, channel), (Some("esp32c5"), 44 | 149))
+        || (matches!((target, channel), (Some("esp32c5" | "rtl8821cu"), 44 | 149))
             && status.state == "running"
             && status.awdl0
             && status.error.is_none())
@@ -306,10 +308,10 @@ fn validate_target_channel(status: &Status, channel: u16) -> io::Result<()> {
     }
     let message = if target == Some("esp32s3") {
         "ESP32-S3 supports only channel 6"
-    } else if target == Some("esp32c5") {
-        "5 GHz requires a running ESP32-C5 radio"
+    } else if matches!(target, Some("esp32c5" | "rtl8821cu")) {
+        "5 GHz requires a running ESP32-C5 or RTL8821CU radio"
     } else {
-        "5 GHz requires a running ESP32-C5 radio; board capabilities are unknown"
+        "5 GHz requires a running ESP32-C5 or RTL8821CU radio; radio capabilities are unknown"
     };
     Err(io::Error::new(io::ErrorKind::InvalidInput, message))
 }
@@ -438,6 +440,35 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn rtl8821cu_shutdown_leaves_time_for_in_progress_usb_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let obs = Rc::new(RefCell::new(Observed::default()));
+        let mut supervisor = Supervisor::new(
+            Fake(obs.clone()),
+            Config {
+                radio_backend: RadioBackend::Rtl8821cu,
+                ..Config::default()
+            },
+            dir.path().join("config.json"),
+        );
+        assert!(supervisor.status().uses_rtl8821cu());
+        supervisor.tick(secs(0));
+        assert_eq!(
+            obs.borrow().starts.as_slice(),
+            &[(RTL8821CU_PORT.to_owned(), 6)]
+        );
+        supervisor.shutdown(secs(2));
+        supervisor.tick(secs(120));
+        assert_eq!(supervisor.status().state, "stopping");
+        assert_eq!(obs.borrow().stops, 1);
+        assert_eq!(obs.borrow().kills, 0);
+        obs.borrow_mut().exited = true;
+        supervisor.tick(secs(121));
+        assert!(supervisor.stopped());
+        assert_eq!(obs.borrow().kills, 0);
     }
 
     #[test]

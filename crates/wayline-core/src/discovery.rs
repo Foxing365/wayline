@@ -122,7 +122,7 @@ pub fn discover_receivers_live(
 
 pub fn discover_receivers_live_cancellable(
     interface: NetworkInterface,
-    identity: &Identity,
+    _identity: &Identity,
     timeout: Duration,
     ble_wake: bool,
     legacy_ble: bool,
@@ -145,7 +145,7 @@ pub fn discover_receivers_live_cancellable(
     };
     #[cfg(not(windows))]
     let _ = (ble_wake, legacy_ble);
-    let client = client_config(identity)?;
+    let client = client_config()?;
     let mut browser = MdnsBrowser::bind(interface.clone(), Some(interface.link_local))?;
     let start = Instant::now();
     let mut next_query = Duration::ZERO;

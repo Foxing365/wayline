@@ -604,6 +604,9 @@ impl Capsule {
                     if let Some(target) = open_location {
                         self.open_history_folder(target, cx);
                     }
+                    for url in crate::receiving::accepted_web_links(&event, applied) {
+                        cx.open_url(&url);
+                    }
                     changed |= applied;
                     continue;
                 }
@@ -1067,7 +1070,9 @@ impl Capsule {
         }
         match channel {
             6 => true,
-            44 | 149 => status.target.as_deref() == Some("esp32c5") && status.ready(),
+            44 | 149 => {
+                matches!(status.target.as_deref(), Some("esp32c5" | "rtl8821cu")) && status.ready()
+            }
             _ => false,
         }
     }
@@ -2419,6 +2424,7 @@ impl Capsule {
         let target_label = match target {
             Some("esp32s3") => "ESP32-S3",
             Some("esp32c5") => "ESP32-C5",
+            Some("rtl8821cu") => "RTL8821CU (USB)",
             _ => text.radio_unknown_board,
         };
         let current_label = channel.map(|channel| match channel {
@@ -2441,7 +2447,7 @@ impl Capsule {
             _ => text.radio_reading.into(),
         };
         let choices: &[u16] = match target {
-            Some("esp32c5") => &[6, 44, 149],
+            Some("esp32c5" | "rtl8821cu") => &[6, 44, 149],
             Some("esp32s3") | None => &[6],
             _ => &[6],
         };
@@ -4174,6 +4180,7 @@ impl Capsule {
     fn incoming_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
         let request = self.incoming.as_ref().unwrap();
+        let is_link_share = !request.transfer.urls.is_empty();
         div()
             .flex_1()
             .min_h_0()
@@ -4185,13 +4192,24 @@ impl Capsule {
                 div()
                     .text_size(px(24.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(text.receive_files_title),
+                    .child(if is_link_share {
+                        self.language.shared_links()
+                    } else {
+                        text.receive_files_title
+                    }),
             )
             .child(
-                div().text_size(px(13.)).whitespace_normal().child(
-                    self.language
-                        .incoming_ask(&request.transfer.sender_name, request.transfer.files.len()),
-                ),
+                div()
+                    .text_size(px(13.))
+                    .whitespace_normal()
+                    .child(if is_link_share {
+                        request.transfer.sender_name.clone()
+                    } else {
+                        self.language.incoming_ask(
+                            &request.transfer.sender_name,
+                            request.transfer.files.len(),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -4200,26 +4218,45 @@ impl Capsule {
                     .visible_scrollbar()
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
-                    .children(request.transfer.files.iter().map(|file| {
-                        div()
-                            .whitespace_normal()
-                            .mb(px(6.))
-                            .child(file.name.clone())
-                    })),
-            )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(
-                        self.language
-                            .accepted_save_to(&request.save_dir.display().to_string()),
+                    .children(
+                        request
+                            .transfer
+                            .files
+                            .iter()
+                            .map(|file| file.name.clone())
+                            .chain(
+                                request
+                                    .transfer
+                                    .urls
+                                    .iter()
+                                    .filter_map(|url| wayline_core::airdrop::web_url(url)),
+                            )
+                            .map(|name| div().whitespace_normal().mb(px(6.)).child(name)),
                     ),
             )
+            .when(!is_link_share, |view| {
+                view.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .whitespace_normal()
+                        .child(
+                            self.language
+                                .accepted_save_to(&request.save_dir.display().to_string()),
+                        ),
+                )
+            })
             .child(
-                button("accept-incoming", text.accept, true)
-                    .on_click(cx.listener(|this, _, _, cx| this.answer_incoming(true, cx))),
+                button(
+                    "accept-incoming",
+                    if is_link_share {
+                        self.language.open_shared_links()
+                    } else {
+                        text.accept
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.answer_incoming(true, cx))),
             )
             .child(
                 button("decline-incoming", text.decline, true)

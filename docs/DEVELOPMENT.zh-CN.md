@@ -59,6 +59,8 @@ cargo test -p wayline-service installed_service_lifecycle_without_administrator_
 
 ### Rust AWDL 后端
 
+RTL8821CU 可选后端的配置、依赖和恢复步骤见 [USB 网卡配置](RTL8821CU.zh-CN.md)。
+
 `apps/bridge` 是服务管理的无线子进程；`crates/wayline-awdl` 实现 ESP32 串口、
 Wintun、IPv6 和板端反馈适配。AWDL 协议来自固定的 Owly 0.4.0，
 [源码与本地适配说明](../vendor/owly-awdl/README.md)记录版本和许可证。

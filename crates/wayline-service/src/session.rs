@@ -47,6 +47,8 @@ pub(crate) struct Reply {
     pub outcome: ReleaseOutcome,
     pub error: Option<String>,
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rtl8821cu: bool,
 }
 impl Reply {
     pub(crate) fn error(code: &str, message: impl ToString) -> Self {
@@ -216,7 +218,12 @@ mod lease {
                         _ = pipe.read(&mut closed) => {},
                         action = action_rx.recv() => {
                             if let Some((device_ready, result)) = action {
-                                let released = tokio::time::timeout(config.timeout,async {
+                                let timeout = if reply.rtl8821cu {
+                                    config.timeout.max(crate::config::RTL8821CU_OPERATION + std::time::Duration::from_secs(5))
+                                } else {
+                                    config.timeout
+                                };
+                                let released = tokio::time::timeout(timeout,async {
                                     pipe.write_all(&client::encode(&Release { instance:reply.instance,token:reply.token,device_ready })?).await.map_err(client::io_error)?;
                                     let reply = client::read_json::<Reply>(&mut pipe).await?.check()?;
                                     // The server waits for this acknowledgment before it tears down the pipe.

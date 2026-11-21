@@ -401,21 +401,29 @@ fn wait_for_service_state(
     service: &windows_service::service::Service,
     expected: windows_service::service::ServiceState,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    use std::time::{Duration, Instant};
+    use windows_service::service::ServiceState;
+    let timeout = Duration::from_secs(20);
+    let mut deadline = Instant::now() + timeout;
+    let mut checkpoint = 0;
     loop {
-        let state = service
+        let status = service
             .query_status()
-            .map_err(|error| format!("cannot query Wayline state: {error}"))?
-            .current_state;
-        if state == expected {
+            .map_err(|error| format!("cannot query Wayline state: {error}"))?;
+        if status.current_state == expected {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        let now = Instant::now();
+        if status.current_state == ServiceState::StopPending && status.checkpoint > checkpoint {
+            checkpoint = status.checkpoint;
+            deadline = now + timeout;
+        }
+        if now >= deadline {
             return Err(format!(
                 "timed out waiting for Wayline to become {expected:?}"
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -705,7 +713,10 @@ fn service_uninstall() {
             eprintln!("cannot open Windows service manager: {error}");
             std::process::exit(1);
         });
-    match manager.open_service("Wayline", ServiceAccess::DELETE | ServiceAccess::STOP) {
+    match manager.open_service(
+        "Wayline",
+        ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
         Ok(service) => {
             if let Ok(status) = service.query_status() {
                 if status.current_state != windows_service::service::ServiceState::Stopped {

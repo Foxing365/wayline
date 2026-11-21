@@ -1,6 +1,7 @@
-//! AWDL on the host, with the ESP32 as a raw-frame radio.
+//! AWDL on the host, using a raw-frame radio.
 
 mod network;
+pub mod radio_link;
 pub mod serial;
 #[cfg(windows)]
 pub mod windows;
@@ -19,7 +20,7 @@ pub fn configuration(mac: [u8; 6], name: &str, target: &str, channel: u8) -> io:
     }
     if !matches!(
         (target, channel),
-        ("esp32s3", 6) | ("esp32c5", 6 | 44 | 149)
+        ("esp32s3", 6) | ("esp32c5" | "rtl8821cu", 6 | 44 | 149)
     ) {
         return Err(invalid(format!(
             "unsupported radio/channel: {target}/{channel}"
@@ -40,7 +41,7 @@ pub fn configuration(mac: [u8; 6], name: &str, target: &str, channel: u8) -> io:
     );
     config.max_frame = wayline_proto::PROTO_MAX_FRAME;
     config.rate = TxRate::BASIC;
-    // The ESP32 wire protocol does not expose a no-ACK transmission flag.
+    // Request normal acknowledgements for unicast frames.
     config.no_ack = false;
     // Block Ack is a firmware capability; never impersonate it from the host.
     config.accept_addba = false;

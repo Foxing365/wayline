@@ -94,9 +94,12 @@ fn integration() {
     wayline_service::service::runtime()
         .unwrap()
         .block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(90), checks::run())
-                .await
-                .expect("integration suite timed out");
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                checks::run().await;
+                checks::usb_leases_ignore_esp32_recovery_marker().await;
+            })
+            .await
+            .expect("integration suite timed out");
         });
     println!("Windows integration passed: real bridge child/events/reaping, config persistence, crash backoff, forced stop, pipe isolation and shutdown");
 }
@@ -120,6 +123,57 @@ mod checks {
         server,
         service::{self, Options},
     };
+
+    pub async fn usb_leases_ignore_esp32_recovery_marker() {
+        use wayline_service::{
+            client::{Client, ClientConfig},
+            config::RadioBackend,
+            session::{RunMode, SessionKind},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("maintenance-failed");
+        fs::write(&marker, b"ESP32 recovery pending").unwrap();
+        Config {
+            enabled: false,
+            radio_backend: RadioBackend::Rtl8821cu,
+            ..Config::default()
+        }
+        .save(&dir.path().join("config.json"))
+        .unwrap();
+        let pipe = format!("wayline-usb-test-{}", std::process::id());
+        let client = Client::new(ClientConfig {
+            pipe_name: pipe.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let (stop, _) = watch::channel(false);
+        let (ready, initialized) = oneshot::channel();
+        let running = tokio::spawn(service::run(
+            Options {
+                data_dir: dir.path().into(),
+                pipe,
+                scm: false,
+                mode: RunMode::OnDemand,
+            },
+            stop,
+            || {
+                let _ = ready.send(());
+                Ok(())
+            },
+        ));
+        initialized.await.unwrap();
+        assert!(client
+            .acquire_async(SessionKind::Maintenance)
+            .await
+            .is_err());
+        let send = client.acquire_async(SessionKind::Send).await.unwrap();
+        let receive = client.acquire_async(SessionKind::Receive).await.unwrap();
+        assert!(!send.release_async().await.unwrap().service_stopping);
+        assert!(receive.release_async().await.unwrap().service_stopping);
+        running.await.unwrap().unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), b"ESP32 recovery pending");
+    }
 
     async fn connect(name: &str) -> NamedPipeClient {
         let start = Instant::now();

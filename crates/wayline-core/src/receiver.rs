@@ -513,7 +513,12 @@ impl ReceiverCore {
     ) -> io::Result<()> {
         let listener = std::net::TcpListener::bind(interface.endpoint(port))?;
         listener.set_nonblocking(true)?;
-        let responder = MdnsResponder::bind(interface, service_id, port, 137)?;
+        let responder = MdnsResponder::bind(
+            interface,
+            service_id,
+            port,
+            owly_airdrop::proto::mdns::RECEIVER_FLAGS,
+        )?;
         let mut workers = ReceiverWorkers {
             shutdown: shutdown.clone(),
             active: Vec::new(),

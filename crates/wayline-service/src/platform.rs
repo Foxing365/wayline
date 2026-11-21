@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, RadioBackend},
     supervisor::{Backend, ManagedProcess},
 };
 use serialport::{SerialPortInfo, SerialPortType};
@@ -59,21 +59,28 @@ impl Backend for WindowsBackend {
         match target.trim() {
             "esp32s3" => Some("esp32s3".into()),
             "esp32c5" => Some("esp32c5".into()),
+            "rtl8821cu" => Some("rtl8821cu".into()),
             _ => None,
         }
     }
     fn spawn(&mut self, config: &Config, port: &str) -> io::Result<BridgeProcess> {
-        let device = crate::device_lock::DeviceGuard::try_acquire(port)?;
-        let failed_port = if config.port == "auto" {
-            crate::device_lock::first_failed_port()?
-        } else {
-            crate::device_lock::has_failed(port)?.then(|| port.to_owned())
+        let device = match config.radio_backend {
+            RadioBackend::Rtl8821cu => crate::device_lock::DeviceGuard::try_acquire_rtl8821cu()?,
+            RadioBackend::Esp32 => {
+                let device = crate::device_lock::DeviceGuard::try_acquire(port)?;
+                let failed_port = if config.port == "auto" {
+                    crate::device_lock::first_failed_port()?
+                } else {
+                    crate::device_lock::has_failed(port)?.then(|| port.to_owned())
+                };
+                if let Some(failed_port) = failed_port {
+                    return Err(io::Error::other(crate::device_lock::DeviceNotReady(
+                        failed_port,
+                    )));
+                }
+                device
+            }
         };
-        if let Some(failed_port) = failed_port {
-            return Err(io::Error::other(crate::device_lock::DeviceNotReady(
-                failed_port,
-            )));
-        }
         let exe = config
             .bridge_path
             .as_ref()
@@ -97,9 +104,17 @@ impl Backend for WindowsBackend {
             .append(true)
             .open(self.data_dir.join("bridge-console.log"))?;
         let channel = config.channel.to_string();
-        let args = ["--port", port, "--channel", &channel, "--managed"];
-        let mut child = Command::new(exe)
-            .args(args)
+        let mut command = Command::new(exe);
+        match config.radio_backend {
+            RadioBackend::Esp32 => {
+                command.args(["--port", port]);
+            }
+            RadioBackend::Rtl8821cu => {
+                command.arg("--rtl8821cu");
+            }
+        }
+        let mut child = command
+            .args(["--channel", &channel, "--managed"])
             .current_dir(&self.data_dir)
             .env("WAYLINE_BRIDGE_STOP_EVENT", &event.name)
             .env("WAYLINE_BRIDGE_TARGET_FILE", &self.target_file)

@@ -1,5 +1,7 @@
 # Wayline
 
+For a dedicated Realtek RTL8821CU USB radio (`0BDA:C820`), see the [optional USB setup](docs/RTL8821CU.zh-CN.md). This path needs device interoperability testing.
+
 AirDrop between Windows and Apple devices through a USB-attached ESP32. The desktop app,
 service, AirDrop core and firmware use Rust. AWDL and AirDrop use the pinned Owly crates.
 

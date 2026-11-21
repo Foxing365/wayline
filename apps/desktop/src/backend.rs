@@ -240,8 +240,15 @@ pub fn change_radio_channel(
             .transpose()
             .map(|_| ())
             .and_then(|()| {
-                Client::default()
-                    .set_channel_and_wait(channel, Duration::from_secs(45))
+                let client = Client::default();
+                let status = client.status().map_err(|error| error.to_string())?;
+                let timeout = if status.uses_rtl8821cu() {
+                    wayline_service::config::RTL8821CU_OPERATION * 2
+                } else {
+                    Duration::from_secs(45)
+                };
+                client
+                    .set_channel_and_wait(channel, timeout)
                     .map_err(|error| format!("{error}"))
             });
         let _ = tx.send(Event::RadioChannelChanged(result));
@@ -292,7 +299,9 @@ pub fn shutdown(
 // ensuing shutdown or release a fresh lease; never infer cleanup from disconnection.
 fn settle_service_session() -> Result<ReleaseOutcome, String> {
     use wayline_service::service_control::ServiceState;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let start = Instant::now();
+    let default_budget = Duration::from_secs(30);
+    let mut budget = default_budget;
     let client = Client::new(ClientConfig {
         timeout: Duration::from_secs(3),
         ..Default::default()
@@ -318,7 +327,16 @@ fn settle_service_session() -> Result<ReleaseOutcome, String> {
                         if matches!(
                             error.kind(),
                             ClientErrorKind::Stopping | ClientErrorKind::Connect
-                        ) => {}
+                        ) =>
+                    {
+                        if error.kind() == ClientErrorKind::Stopping
+                            && budget == default_budget
+                            && client.status().is_ok_and(|status| status.uses_rtl8821cu())
+                        {
+                            budget = wayline_service::config::RTL8821CU_OPERATION
+                                + Duration::from_secs(10);
+                        }
+                    }
                     Err(error) => {
                         return Err(format!(
                             "{}{error}",
@@ -329,7 +347,7 @@ fn settle_service_session() -> Result<ReleaseOutcome, String> {
             }
             Ok(_) => {}
         }
-        if Instant::now() >= deadline {
+        if start.elapsed() >= budget {
             return Err(crate::i18n::current()
                 .strings()
                 .backend_release_pending

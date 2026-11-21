@@ -28,16 +28,16 @@ pub fn status() -> io::Result<ServiceState> {
         .map_err(error)
 }
 trait Control {
-    fn state(&mut self) -> io::Result<ServiceState>;
+    fn state(&mut self) -> io::Result<(ServiceState, u32)>;
     fn start(&mut self) -> io::Result<()>;
     fn stop(&mut self) -> io::Result<()>;
 }
 struct Installed(Service);
 impl Control for Installed {
-    fn state(&mut self) -> io::Result<ServiceState> {
+    fn state(&mut self) -> io::Result<(ServiceState, u32)> {
         self.0
             .query_status()
-            .map(|s| s.current_state)
+            .map(|s| (s.current_state, s.checkpoint))
             .map_err(error)
     }
     fn start(&mut self) -> io::Result<()> {
@@ -63,14 +63,21 @@ fn transition(
     mut wait: impl FnMut(),
 ) -> io::Result<()> {
     let mut requested = false;
+    let mut stop_checkpoint = 0;
+    let mut deadline = TIMEOUT;
     loop {
-        let state = service.state()?;
+        let (state, checkpoint) = service.state()?;
         if (running && state == ServiceState::Running)
             || (!running && state == ServiceState::Stopped)
         {
             return Ok(());
         }
-        if elapsed() >= TIMEOUT {
+        let now = elapsed();
+        if state == ServiceState::StopPending && checkpoint > stop_checkpoint {
+            stop_checkpoint = checkpoint;
+            deadline = now + TIMEOUT;
+        }
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "waiting for Wayline service transition timed out",
@@ -123,7 +130,7 @@ mod tests {
     use super::*;
     use std::{cell::Cell, collections::VecDeque};
     struct Fake {
-        states: VecDeque<ServiceState>,
+        states: VecDeque<(ServiceState, u32)>,
         starts: usize,
         stops: usize,
         deny_stop: bool,
@@ -131,7 +138,7 @@ mod tests {
     impl Fake {
         fn new(states: &[ServiceState]) -> Self {
             Self {
-                states: states.iter().copied().collect(),
+                states: states.iter().map(|&state| (state, 0)).collect(),
                 starts: 0,
                 stops: 0,
                 deny_stop: false,
@@ -148,7 +155,7 @@ mod tests {
         }
     }
     impl Control for Fake {
-        fn state(&mut self) -> io::Result<ServiceState> {
+        fn state(&mut self) -> io::Result<(ServiceState, u32)> {
             Ok(if self.states.len() > 1 {
                 self.states.pop_front().unwrap()
             } else {
@@ -181,6 +188,17 @@ mod tests {
         let mut s = Fake::new(&[StopPending, Stopped, StartPending, Running]);
         s.run(true).unwrap();
         assert_eq!((s.starts, s.stops), (1, 0));
+    }
+    #[test]
+    fn stop_progress_keeps_waiting_past_the_first_deadline() {
+        use ServiceState::*;
+        let mut service = Fake::new(&[Running]);
+        for checkpoint in 1..=8 {
+            service.states.extend([(StopPending, checkpoint); 5]);
+        }
+        service.states.push_back((Stopped, 0));
+        service.run(false).unwrap();
+        assert_eq!(service.stops, 1);
     }
     #[test]
     fn completed_states_need_no_mutation() {

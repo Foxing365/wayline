@@ -1,5 +1,27 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io, io::Write, path::Path};
+use std::{fs, io, io::Write, path::Path, time::Duration};
+
+pub const RTL8821CU_PORT: &str = "RTL8821CU";
+pub const RTL8821CU_STARTUP: Duration = Duration::from_secs(150);
+pub const RTL8821CU_HELPER_CLEANUP: Duration = Duration::from_secs(12);
+pub const RTL8821CU_OPERATION: Duration = Duration::from_secs(170);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RadioBackend {
+    #[default]
+    Esp32,
+    Rtl8821cu,
+}
+
+impl RadioBackend {
+    pub(crate) fn stop_grace(self) -> Duration {
+        match self {
+            Self::Esp32 => Duration::from_secs(5),
+            Self::Rtl8821cu => RTL8821CU_OPERATION,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -11,6 +33,7 @@ pub struct Config {
     #[serde(alias = "Enabled")]
     pub enabled: bool,
     pub bridge_path: Option<String>,
+    pub radio_backend: RadioBackend,
 }
 
 impl Default for Config {
@@ -20,6 +43,7 @@ impl Default for Config {
             channel: 6,
             enabled: true,
             bridge_path: None,
+            radio_backend: RadioBackend::Esp32,
         }
     }
 }
@@ -27,11 +51,12 @@ impl Default for Config {
 impl Config {
     pub fn validate(&mut self) -> io::Result<()> {
         self.port = normalize_port(&self.port)?;
+        if self.radio_backend == RadioBackend::Rtl8821cu && self.port != "auto" {
+            return Err(invalid("RTL8821CU uses port=auto and connects over WinUSB"));
+        }
         // OWL's AWDL channel table and the ESP32 firmware support these channels.
         if !matches!(self.channel, 6 | 44 | 149) {
-            return Err(invalid(
-                "channel must be 6 (ESP32-S3), 44 or 149 (ESP32-C5)",
-            ));
+            return Err(invalid("channel must be 6, 44 or 149"));
         }
         if let Some(path) = &self.bridge_path {
             if path.is_empty() || path.contains('\0') || !Path::new(path).is_absolute() {

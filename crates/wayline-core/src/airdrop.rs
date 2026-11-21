@@ -1,5 +1,22 @@
 //! Application values converted from Owly's validated protocol messages.
 use owly_airdrop::proto::messages::{AskRequest, Offer};
+
+/// Normalize a browser URL from a peer before presenting or opening it.
+/// Windows can dispatch custom schemes and local file paths to other programs.
+pub fn web_url(value: &str) -> Option<String> {
+    if value
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return None;
+    }
+    let (scheme, _) = value.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    (url.has_host() && url.username().is_empty() && url.password().is_none()).then(|| url.into())
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingFile {
     pub name: String,

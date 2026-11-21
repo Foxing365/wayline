@@ -26,6 +26,7 @@ use wayline_service::client::Client;
 #[cfg(windows)]
 use wayline_service::{
     client::ClientErrorKind,
+    config::RTL8821CU_OPERATION,
     session::{ClientLease, SessionKind},
 };
 
@@ -116,11 +117,17 @@ fn run(args: Args, output: Output, signals: &Signals) -> Result<(), Failure> {
             let band = args.band.as_deref().expect("validated band");
             let lease = acquire(SessionKind::Client, signals)?;
             with_lease(lease, output, signals, || {
+                let client = Client::default();
+                let usb = client.status()?.uses_rtl8821cu();
                 if channel != 6 {
-                    wait_radio_ready(signals, Duration::from_secs(30))?;
+                    wait_radio_ready(signals, radio_wait(usb, 30))?;
                 }
-                let status =
-                    Client::default().set_channel_and_wait(channel, Duration::from_secs(45))?;
+                let timeout = if usb {
+                    RTL8821CU_OPERATION * 2
+                } else {
+                    Duration::from_secs(45)
+                };
+                let status = client.set_channel_and_wait(channel, timeout)?;
                 output.event(
                     "radioConfigured",
                     json!({"band":band,"channel":channel,"status":status}),
@@ -202,7 +209,7 @@ fn wait_radio_ready(signals: &Signals, timeout: Duration) -> Result<(), Failure>
     loop {
         signals.check()?;
         let status = Client::default().status()?;
-        if status.target.as_deref() == Some("esp32c5")
+        if matches!(status.target.as_deref(), Some("esp32c5" | "rtl8821cu"))
             && status.state == "running"
             && status.awdl0
             && status.error.is_none()
@@ -210,7 +217,9 @@ fn wait_radio_ready(signals: &Signals, timeout: Duration) -> Result<(), Failure>
             return Ok(());
         }
         if status.target.as_deref() == Some("esp32s3") {
-            return Err(Failure::policy("5ghz 需要 ESP32-C5；当前识别到 ESP32-S3"));
+            return Err(Failure::policy(
+                "当前识别到 ESP32-S3。使用 5 GHz 需要 ESP32-C5 或 RTL8821CU",
+            ));
         }
         if Instant::now() >= deadline {
             return Err(Failure::unavailable(
@@ -226,18 +235,29 @@ fn wait_radio_ready(signals: &Signals, timeout: Duration) -> Result<(), Failure>
 #[cfg(windows)]
 fn acquire(kind: SessionKind, signals: &Signals) -> Result<ClientLease, Failure> {
     signals.check()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let client = Client::default();
+    let start = Instant::now();
+    let mut budget = Duration::from_secs(30);
     loop {
         wayline_service::service_control::start().map_err(Failure::unavailable)?;
         signals.check()?;
-        match Client::default().acquire(kind) {
+        match client.acquire(kind) {
             Ok(lease) => return Ok(lease),
             Err(error)
                 if matches!(
                     error.kind(),
                     ClientErrorKind::Stopping | ClientErrorKind::Connect
-                ) && Instant::now() < deadline =>
+                ) =>
             {
+                if error.kind() == ClientErrorKind::Stopping
+                    && budget < RTL8821CU_OPERATION
+                    && client.status().is_ok_and(|status| status.uses_rtl8821cu())
+                {
+                    budget = RTL8821CU_OPERATION + Duration::from_secs(10);
+                }
+                if start.elapsed() >= budget {
+                    return Err(error.into());
+                }
                 thread::sleep(Duration::from_millis(200))
             }
             Err(error) => return Err(error.into()),
@@ -282,18 +302,76 @@ fn with_lease(
 }
 
 #[cfg(windows)]
+fn radio_wait(usb: bool, esp32_seconds: u64) -> Duration {
+    if usb {
+        RTL8821CU_OPERATION
+    } else {
+        Duration::from_secs(esp32_seconds)
+    }
+}
+
+#[cfg(windows)]
 fn wait_interface(args: &Args, signals: &Signals) -> Result<NetworkInterface, Failure> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let timeout = if args.address.is_some() {
+        Duration::ZERO
+    } else {
+        radio_wait(Client::default().status()?.uses_rtl8821cu(), 15)
+    };
+    let start = Instant::now();
+    poll_interface(
+        signals,
+        timeout,
+        || wayline_host::select_interface(args.address, args.index),
+        || start.elapsed(),
+        || thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+#[cfg(windows)]
+fn poll_interface<E: std::fmt::Display>(
+    signals: &Signals,
+    timeout: Duration,
+    mut select: impl FnMut() -> Result<NetworkInterface, E>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut wait: impl FnMut(),
+) -> Result<NetworkInterface, Failure> {
     loop {
         signals.check()?;
-        match wayline_host::select_interface(args.address, args.index) {
+        match select() {
             Ok(interface) => return Ok(interface),
-            Err(error) if args.address.is_some() || Instant::now() >= deadline => {
-                return Err(Failure::unavailable(error))
-            }
-            Err(_) => thread::sleep(Duration::from_millis(100)),
+            Err(error) if elapsed() >= timeout => return Err(Failure::unavailable(error)),
+            Err(_) => wait(),
         }
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn cold_usb_interface_can_become_ready_after_the_serial_timeout() {
+    use std::cell::Cell;
+
+    let attempt = |usb| {
+        let elapsed = Cell::new(Duration::ZERO);
+        poll_interface(
+            &Signals::default(),
+            radio_wait(usb, 15),
+            || {
+                if elapsed.get() < Duration::from_secs(90) {
+                    Err("AWDL is starting")
+                } else {
+                    Ok(NetworkInterface {
+                        name: "awdl0".into(),
+                        index: 3,
+                        link_local: "fe80::2".parse().unwrap(),
+                    })
+                }
+            },
+            || elapsed.get(),
+            || elapsed.set(elapsed.get() + Duration::from_secs(1)),
+        )
+    };
+    assert!(attempt(false).is_err());
+    assert_eq!(attempt(true).unwrap().name, "awdl0");
 }
 
 #[cfg(windows)]
@@ -506,7 +584,7 @@ fn receiver_event(event: ReceiverEvent, output: Output) {
         ReceiverEvent::ArchiveBoundary { transfer_id } => output.event("uploadArchiveBoundary", json!({"direction":"receive","transferId":transfer_id})),
         ReceiverEvent::Confirming { transfer_id } => output.event("confirming", json!({"direction":"receive","transferId":transfer_id})),
         ReceiverEvent::TransferFailed { transfer_id, error, kind } => output.event("transferFailed", json!({"direction":"receive","transferId":transfer_id,"category":kind.as_str(),"message":error})),
-        ReceiverEvent::Received { transfer, files } => output.event("transferCompleted", json!({"direction":"receive","sender":transfer.sender_name,"transferId":transfer.id,"files":files})),
+        ReceiverEvent::Received { transfer, files } => output.event("transferCompleted", json!({"direction":"receive","sender":transfer.sender_name,"transferId":transfer.id,"files":files,"urls":transfer.urls})),
         ReceiverEvent::Rejected { path, status } => output.event("transferRejected", json!({"direction":"receive","path":path,"status":status})),
     }
 }

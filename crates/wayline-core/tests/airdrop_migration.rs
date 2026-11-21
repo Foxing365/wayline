@@ -364,6 +364,49 @@ fn response(stream: &mut impl Read) -> sender::Response {
 }
 
 #[test]
+fn tls_url_offers_finish_after_acceptance_without_uploading_files() {
+    use owly_airdrop::proto::messages::Offer;
+    let root = tempfile::tempdir().unwrap();
+    let id = identity(root.path());
+    let dest = root.path().join("received");
+    let url = "https://b23.tv/wayline-test";
+    let ask = sender::ask_request(
+        &sender::Config::new("iPhone", "abcdef123456"),
+        "LINK123",
+        &Offer::Urls(vec![url.into()]),
+    );
+    for accept in [true, false] {
+        let core = Arc::new(
+            ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", &dest)).with_decision(
+                move |offer| {
+                    assert!(offer.files.is_empty());
+                    assert_eq!(offer.urls, [url]);
+                    accept
+                },
+            ),
+        );
+        let (peer, worker) = start(core, &id);
+        let mut tls = client(peer.service.address);
+        tls.write_all(&ask).unwrap();
+        tls.flush().unwrap();
+        assert_eq!(response(&mut tls).status, if accept { 200 } else { 403 });
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        drop(tls);
+        let events = worker.join().unwrap().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ReceiverEvent::Received { transfer, files }
+            if files.is_empty() && transfer.urls == [url]))
+                .count(),
+            usize::from(accept)
+        );
+        assert!(!dest.exists() || fs::read_dir(&dest).unwrap().next().is_none());
+    }
+}
+
+#[test]
 fn tls_validated_dvzip_boundary_finishes_without_zero_chunk_or_eof() {
     let (_source, offer, wire) = protocol_upload(Compressor::DvZip, true);
     let root = tempfile::tempdir().unwrap();

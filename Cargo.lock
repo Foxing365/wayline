@@ -6329,6 +6329,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "tokio",
+ "url",
  "wayline-board",
  "windows 0.62.2",
 ]

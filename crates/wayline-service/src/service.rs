@@ -127,8 +127,10 @@ pub async fn run(
     fs::create_dir_all(&options.data_dir)?;
     let config_path = options.data_dir.join("config.json");
     let config = Config::load(&config_path)?;
+    let backend = config.radio_backend;
     let maintenance_path = options.data_dir.join("maintenance-failed");
-    let maintenance_failed = maintenance_path.try_exists()?;
+    let maintenance_failed =
+        backend == crate::config::RadioBackend::Esp32 && maintenance_path.try_exists()?;
     // Bind before starting wireless bridge. A duplicate service must not launch another radio.
     let listener = server::listen(&options.pipe, true)?;
     let session_name = format!("{}.sessions", options.pipe);
@@ -210,6 +212,7 @@ pub async fn run(
         instance: instance.clone(),
         token,
         capabilities: CAPABILITIES.iter().map(|s| (*s).into()).collect(),
+        rtl8821cu: backend == crate::config::RadioBackend::Rtl8821cu,
         ..Reply::default()
     };
     let outcome = loop {
@@ -230,6 +233,10 @@ pub async fn run(
                 match event {
                     SessionEvent::Acquire { kind, response } => {
                         if response.is_closed() { continue; }
+                        if kind == SessionKind::Maintenance && backend == crate::config::RadioBackend::Rtl8821cu {
+                            let _ = response.send(Reply::error("service", "ESP32 firmware maintenance requires the ESP32 backend"));
+                            continue;
+                        }
                         let previous_maintenance_failed = registry.maintenance_failed;
                         match registry.acquire(kind) {
                             Err(code) => { let _ = response.send(Reply::error(code, if code == "stopping" { "service is stopping; wait for restart" } else { "requested radio role is busy or device recovery is required" })); }
@@ -364,7 +371,8 @@ pub async fn run(
         let _ = sessions.await;
     }
     radio.shutdown(start.elapsed());
-    let stop_deadline = Instant::now() + Duration::from_secs(10);
+    let stop_budget = backend.stop_grace() + Duration::from_secs(5);
+    let stop_deadline = Instant::now() + stop_budget;
     while !radio.stopped() {
         radio.tick(start.elapsed());
         if Instant::now() >= stop_deadline {
@@ -372,7 +380,10 @@ pub async fn run(
             // return a failure to SCM rather than remaining StopPending forever.
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "wireless bridge did not stop within 10 seconds",
+                format!(
+                    "wireless bridge did not stop within {} seconds",
+                    stop_budget.as_secs()
+                ),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -443,10 +454,12 @@ fn scm_main(_args: Vec<OsString>) {
                 if !*stopping.borrow() {
                     let _ = stopping.changed().await;
                 }
-                let _ = handle.set_service_status(status(
-                    ServiceState::StopPending,
-                    ServiceExitCode::Win32(0),
-                ));
+                let mut pending = status(ServiceState::StopPending, ServiceExitCode::Win32(0));
+                loop {
+                    let _ = handle.set_service_status(pending.clone());
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    pending.checkpoint += 1;
+                }
             });
             let result = run(options, shutdown, || {
                 handle

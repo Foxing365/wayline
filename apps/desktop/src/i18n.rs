@@ -249,6 +249,32 @@ impl Language {
         )
     }
 
+    pub fn shared_links(self) -> &'static str {
+        match self {
+            Self::ZhCn => "分享的链接",
+            Self::ZhTw => "分享的連結",
+            Self::EnUs => "Shared links",
+            Self::JaJp => "共有リンク",
+            Self::KoKr => "공유된 링크",
+            Self::FrFr => "Liens partagés",
+            Self::DeDe => "Geteilte Links",
+            Self::EsEs => "Enlaces compartidos",
+        }
+    }
+
+    pub fn open_shared_links(self) -> &'static str {
+        match self {
+            Self::ZhCn => "接受并打开链接",
+            Self::ZhTw => "接受並開啟連結",
+            Self::EnUs => "Accept and open links",
+            Self::JaJp => "受け入れてリンクを開く",
+            Self::KoKr => "수락하고 링크 열기",
+            Self::FrFr => "Accepter et ouvrir les liens",
+            Self::DeDe => "Annehmen und Links öffnen",
+            Self::EsEs => "Aceptar y abrir enlaces",
+        }
+    }
+
     pub fn accepted_save_to(self, path: &str) -> String {
         fill(self.strings().accepted_save_to, &[("path", path.into())])
     }

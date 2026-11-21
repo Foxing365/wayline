@@ -17,6 +17,7 @@ sha2 = "0.10"
 socket2 = "0.6"
 tempfile = "3"
 getrandom = "0.4"
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

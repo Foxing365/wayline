@@ -117,16 +117,7 @@ fn terminal_worker(pending: Receiver<Prompt>, save: PathBuf, cancel: SendCancell
         }
         let mut output = io::stderr().lock();
         let shown = (|| -> io::Result<()> {
-            writeln!(
-                output,
-                "\n发送方：{:?}\n保存到：{}",
-                prompt.transfer.sender_name,
-                save.display()
-            )?;
-            for file in &prompt.transfer.files {
-                writeln!(output, "  {:?} ({:?} 字节)", file.name, file.size)?;
-            }
-            write!(output, "接受这次传输？[y/N] ")?;
+            write_offer(&mut output, &prompt.transfer, &save)?;
             output.flush()
         })()
         .is_ok();
@@ -150,6 +141,28 @@ fn terminal_worker(pending: Receiver<Prompt>, save: PathBuf, cancel: SendCancell
     }
 }
 
+fn write_offer(
+    output: &mut impl io::Write,
+    transfer: &IncomingTransfer,
+    save: &std::path::Path,
+) -> io::Result<()> {
+    writeln!(output, "\n发送方：{:?}", transfer.sender_name)?;
+    if !transfer.files.is_empty() {
+        writeln!(output, "保存到：{}", save.display())?;
+        for file in &transfer.files {
+            writeln!(output, "  {:?} ({:?} 字节)", file.name, file.size)?;
+        }
+    }
+    for url in transfer
+        .urls
+        .iter()
+        .filter_map(|value| wayline_core::airdrop::web_url(value))
+    {
+        writeln!(output, "  网页链接 {:?}", url.as_str())?;
+    }
+    write!(output, "接受这次传输？[y/N] ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +176,16 @@ mod tests {
             icon: None,
             sender_record_data: None,
         }
+    }
+    #[test]
+    fn link_preview_only_prints_web_urls_before_asking() {
+        let mut offer = offer();
+        offer.urls = vec!["https://b23.tv/test".into(), "file:///C:/file".into()];
+        let mut prompt = Vec::new();
+        write_offer(&mut prompt, &offer, std::path::Path::new("downloads")).unwrap();
+        let prompt = String::from_utf8(prompt).unwrap();
+        assert!(prompt.find("https://b23.tv/test").unwrap() < prompt.find("[y/N]").unwrap());
+        assert!(!prompt.contains("file://") && !prompt.contains("downloads"));
     }
     #[test]
     fn full_queue_denies_immediately_and_timeout_expires_the_pending_prompt() {

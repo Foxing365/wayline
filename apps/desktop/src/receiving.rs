@@ -12,6 +12,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use wayline_core::airdrop::web_url;
 use wayline_core::{IncomingTransfer, ReceiverCore, ReceiverEvent, ReceiverOptions};
 use wayline_host::{
     TransferDirection, TransferFailureReason, TransferFormat, TransferHistoryRecord,
@@ -48,12 +49,26 @@ pub fn auto_open_location(
         return None;
     }
     match event {
-        ReceiverEvent::Received { files, .. } => files
+        ReceiverEvent::Received { transfer, files } if transfer.urls.is_empty() => files
             .first()
             .cloned()
             .or_else(|| fallback.map(std::path::Path::to_path_buf)),
         _ => None,
     }
+}
+
+/// Called after the user approved the offer and its completion was applied.
+pub fn accepted_web_links(event: &ReceiverEvent, applied: bool) -> Vec<String> {
+    if let ReceiverEvent::Received { transfer, .. } = event
+        && applied
+    {
+        return transfer
+            .urls
+            .iter()
+            .filter_map(|url| web_url(url))
+            .collect();
+    }
+    Vec::new()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -262,17 +277,14 @@ impl Model {
 
     pub fn begin(&mut self, transfer: &IncomingTransfer, save_dir: PathBuf) {
         let file_bytes = offered_file_bytes(transfer);
+        let file_names = offered_names(transfer);
         self.interrupted = None;
         self.finished_elapsed = None;
         self.active = Some(Transfer {
             id: transfer.id.clone(),
             sender: transfer.sender_name.clone(),
-            files: transfer.files.len(),
-            file_names: transfer
-                .files
-                .iter()
-                .map(|file| file.name.clone())
-                .collect(),
+            files: file_names.len(),
+            file_names,
             save_dir,
             phase: Phase::Waiting,
             started_at: None,
@@ -389,15 +401,25 @@ impl Model {
                 active.phase = Phase::Confirming;
             }
             ReceiverEvent::Received { transfer, files } if transfer.id == active.id => {
-                let message = crate::i18n::current().received_notice(
-                    &active.sender,
-                    files.len(),
-                    &active.save_dir.display().to_string(),
-                );
+                let language = crate::i18n::current();
+                let message = if transfer.urls.is_empty() {
+                    language.received_notice(
+                        &active.sender,
+                        files.len(),
+                        &active.save_dir.display().to_string(),
+                    )
+                } else {
+                    format!("{} · {}", active.sender, language.shared_links())
+                };
+                let details = if transfer.urls.is_empty() {
+                    message.clone()
+                } else {
+                    format!("{message}\n{}", active.file_names.join("\n"))
+                };
                 self.finished_elapsed = active.elapsed(now);
                 self.active = None;
                 self.reset_speed();
-                self.show_notice(message, NoticeKind::Success);
+                self.show_notice_with_details(message, details, NoticeKind::Success);
             }
             ReceiverEvent::TransferFailed {
                 transfer_id,
@@ -490,7 +512,12 @@ impl Model {
                 .min(u64::MAX as u128) as u64,
             outcome,
             failure_reason,
-            destination: (outcome == TransferOutcome::Completed).then(|| transfer.save_dir.clone()),
+            destination: match event {
+                ReceiverEvent::Received { files, .. } if !files.is_empty() => {
+                    Some(transfer.save_dir.clone())
+                }
+                _ => None,
+            },
         })
     }
 
@@ -543,24 +570,29 @@ fn offered_file_bytes(transfer: &IncomingTransfer) -> Option<u64> {
         .try_fold(0u64, |total, file| total.checked_add(file.size?))
 }
 
+fn offered_names(transfer: &IncomingTransfer) -> Vec<String> {
+    transfer
+        .files
+        .iter()
+        .map(|file| file.name.clone())
+        .chain(transfer.urls.iter().filter_map(|url| web_url(url)))
+        .collect()
+}
+
 pub fn declined_history_record(
     request: &IncomingRequest,
     finished_at_unix_ms: u64,
     _finished_at: Instant,
 ) -> TransferHistoryRecord {
     let file_bytes = offered_file_bytes(&request.transfer);
+    let file_names = offered_names(&request.transfer);
     TransferHistoryRecord {
         started_at_unix_ms: request.started_at_unix_ms,
         finished_at_unix_ms: finished_at_unix_ms.max(request.started_at_unix_ms),
         direction: TransferDirection::Receive,
         peer: request.transfer.sender_name.clone(),
-        file_count: request.transfer.files.len(),
-        file_names: request
-            .transfer
-            .files
-            .iter()
-            .map(|file| file.name.clone())
-            .collect(),
+        file_count: file_names.len(),
+        file_names,
         file_paths: Vec::new(),
         channel: None,
         format: None,
@@ -742,7 +774,10 @@ fn run(
     let prompt_events = events.clone();
     let prompt_stop = stop.clone();
     let core = Arc::new(ReceiverCore::new(options).with_decision(move |transfer| {
-        if prompt_stop.load(Ordering::Acquire) || transfer.files.is_empty() {
+        if prompt_stop.load(Ordering::Acquire)
+            || (transfer.files.is_empty() && transfer.urls.is_empty())
+            || transfer.urls.iter().any(|url| web_url(url).is_none())
+        {
             return false;
         }
         let (decision, answer) = mpsc::channel();
@@ -888,6 +923,33 @@ mod tests {
             icon: None,
             sender_record_data: None,
         }
+    }
+
+    #[test]
+    fn accepted_link_opens_in_browser_instead_of_explorer() {
+        let mut share = transfer("web-share");
+        share.files.clear();
+        share.urls = vec![
+            "https://b23.tv/short".into(),
+            "file:///C:/Windows/test.exe".into(),
+        ];
+        let mut model = Model::default();
+        model.begin(&share, PathBuf::from("downloads"));
+        let event = ReceiverEvent::Received {
+            transfer: share,
+            files: Vec::new(),
+        };
+        assert!(accepted_web_links(&event, false).is_empty());
+        assert_eq!(accepted_web_links(&event, true), ["https://b23.tv/short"]);
+        let record = model
+            .history_record_for_event(&event, Instant::now(), 0)
+            .unwrap();
+        assert_eq!(record.file_count, 1);
+        assert!(record.destination.is_none());
+        assert!(
+            auto_open_location(&event, true, true, Some(std::path::Path::new("downloads")))
+                .is_none()
+        );
     }
 
     #[test]

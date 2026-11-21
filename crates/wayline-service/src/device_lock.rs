@@ -177,6 +177,14 @@ impl DeviceGuard {
                 "device exclusion requires an explicit COM port",
             ));
         }
+        Self::acquire_named(port)
+    }
+
+    pub fn try_acquire_rtl8821cu() -> io::Result<Self> {
+        Self::acquire_named("RTL8821CU".into())
+    }
+
+    fn acquire_named(port: String) -> io::Result<Self> {
         let (ready, result) = mpsc::sync_channel(1);
         let (release, done) = mpsc::channel();
         let owner = thread::spawn(move || {

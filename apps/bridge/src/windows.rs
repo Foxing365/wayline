@@ -17,30 +17,47 @@ use windows_sys::Win32::{
     System::Threading::{OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE},
 };
 
+mod rtl8821cu;
+
+enum RadioSource {
+    Esp32(String),
+    Rtl8821cu,
+}
+
 struct Options {
-    port: String,
+    source: RadioSource,
     channel: u8,
     managed: bool,
 }
 impl Options {
     fn parse(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Self>> {
         let mut args = args.into_iter();
-        let mut port = None;
+        let mut source = None;
         let mut channel = 6;
         let mut managed = false;
         while let Some(arg) = args.next() {
             match arg.to_str() {
                 Some("--help" | "-h") => {
-                    println!("wayline-bridge --port COM<n> [--channel 6|44|149] [--managed]\nRequires the verified wintun.dll beside the executable. --managed is for service launches.");
+                    println!("wayline-bridge (--port COM<n> | --rtl8821cu) [--channel 6|44|149] [--managed]\nRequires the verified wintun.dll beside the executable. --managed is for service launches.");
                     return Ok(None);
                 }
                 Some("--port") => {
                     let value = args
                         .next()
                         .ok_or_else(|| invalid("--port requires a value"))?;
-                    port = Some(wayline_service::config::normalize_port(
+                    let port = wayline_service::config::normalize_port(
                         value.to_str().ok_or_else(|| invalid("invalid port"))?,
-                    )?);
+                    )?;
+                    if port == "auto" || source.replace(RadioSource::Esp32(port)).is_some() {
+                        return Err(invalid(
+                            "select exactly one radio and use an explicit COM port",
+                        ));
+                    }
+                }
+                Some("--rtl8821cu") => {
+                    if source.replace(RadioSource::Rtl8821cu).is_some() {
+                        return Err(invalid("select exactly one radio"));
+                    }
                 }
                 Some("--channel") => {
                     channel = args
@@ -57,14 +74,12 @@ impl Options {
                 }
             }
         }
-        let port = port
-            .filter(|p| p != "auto")
-            .ok_or_else(|| invalid("--port requires an explicit COM port"))?;
+        let source = source.ok_or_else(|| invalid("select --port COM<n> or --rtl8821cu"))?;
         if ![6, 44, 149].contains(&channel) {
             return Err(invalid("unsupported channel"));
         }
         Ok(Some(Self {
-            port,
+            source,
             channel,
             managed,
         }))
@@ -117,25 +132,32 @@ pub fn main() -> io::Result<()> {
             return Ok(());
         }
     }
+    let executable = std::env::current_exe()?;
+    let dll = executable.with_file_name("wintun.dll");
+    if !dll.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "verified wintun.dll is required beside wayline-bridge.exe",
+        ));
+    }
+    let RadioSource::Esp32(port) = options.source else {
+        let helper = executable
+            .with_file_name("usb-radio")
+            .join("airbridge_radio.exe");
+        return rtl8821cu::run(options.channel, options.managed, helper, dll, stop);
+    };
     // The service owns the device guard for managed children. Foreground use
     // acquires the same guard before any serial/driver access.
     let _guard = if options.managed {
         None
     } else {
         Some(wayline_service::device_lock::DeviceGuard::try_acquire(
-            &options.port,
+            &port,
         )?)
     };
-    if wayline_service::device_lock::has_failed(&options.port)? {
+    if wayline_service::device_lock::has_failed(&port)? {
         return Err(io::Error::other(
             "device readiness is unconfirmed; complete firmware maintenance before starting AWDL",
-        ));
-    }
-    let dll = std::env::current_exe()?.with_file_name("wintun.dll");
-    if !dll.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "verified wintun.dll is required beside wayline-bridge.exe",
         ));
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async move {
@@ -149,7 +171,7 @@ pub fn main() -> io::Result<()> {
             Ok(())
         };
         let (radio,hello)=tokio::select! {
-            result=Radio::open_with_target(&options.port,options.channel,publish_target)=>result?,
+            result=Radio::open_with_target(&port,options.channel,publish_target)=>result?,
             result=&mut stopping=>return result,
         };
         let config=wayline_awdl::configuration(hello.mac,"Wayline",&hello.target,options.channel)?;
@@ -164,7 +186,7 @@ pub fn main() -> io::Result<()> {
         let feedback=tokio::spawn(async move {
             if let Err(e)=feedback::serve(feedback::PIPE,control,feedback_stop).await {tracing::warn!("board feedback unavailable: {e}");}
         });
-        tracing::info!("Rust AWDL ready on {} channel {}",options.port,options.channel);
+        tracing::info!("Rust AWDL ready on {} channel {}",port,options.channel);
         let result=loop {
             if let Some(e)=failed.borrow().as_ref() {break Err(io::Error::other(e.clone()));}
             tokio::select! {
@@ -182,7 +204,7 @@ pub fn main() -> io::Result<()> {
 }
 
 fn publish_radio_target(path: &Path, target: &str) -> io::Result<()> {
-    if !matches!(target, "esp32s3" | "esp32c5") {
+    if !matches!(target, "esp32s3" | "esp32c5" | "rtl8821cu") {
         return Err(invalid("unsupported radio target"));
     }
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -218,6 +240,7 @@ mod tests {
             vec![],
             vec!["--port", "auto"],
             vec!["--port", "COM0"],
+            vec!["--rtl8821cu", "--port", "COM1"],
             vec!["--port", "COM1", "--channel", "5"],
             vec!["--port", "COM1", "--unknown"],
         ] {
@@ -226,7 +249,7 @@ mod tests {
         let o = Options::parse(args(&["--port", "com004", "--channel", "149", "--managed"]))
             .unwrap()
             .unwrap();
-        assert_eq!(o.port, "COM4");
+        assert!(matches!(o.source, RadioSource::Esp32(ref port) if port == "COM4"));
         assert_eq!(o.channel, 149);
         assert!(o.managed);
     }
