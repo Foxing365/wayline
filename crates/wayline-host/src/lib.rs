@@ -433,10 +433,6 @@ pub fn save_pinned_to(path: &Path, pinned: bool) -> Result<bool> {
 }
 
 /// Selects the compact device grid for sending after the next desktop launch.
-pub fn load_compact_send_view() -> Result<bool> {
-    load_compact_send_view_from(&settings_path()?)
-}
-
 pub fn load_compact_send_view_from(path: &Path) -> Result<bool> {
     match read_settings(path)?.get("compact_send_view") {
         None | Some(Value::Null) => Ok(false),
@@ -445,16 +441,34 @@ pub fn load_compact_send_view_from(path: &Path) -> Result<bool> {
     }
 }
 
-pub fn save_compact_send_view(enabled: bool) -> Result<bool> {
-    save_compact_send_view_to(&settings_path()?, enabled)
-}
-
 pub fn save_compact_send_view_to(path: &Path, enabled: bool) -> Result<bool> {
     let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
     let mut settings = read_settings(path)?;
     settings.insert("compact_send_view".into(), Value::Bool(enabled));
     write_settings(path, &settings)?;
     Ok(enabled)
+}
+
+pub fn load_send_appearance() -> Result<(bool, bool)> {
+    let settings = read_settings(&settings_path()?)?;
+    let read_flag = |key| match settings.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        _ => bail!("{key} 设置必须是布尔值"),
+    };
+    Ok((
+        read_flag("compact_send_view")?,
+        read_flag("compact_send_dark")?,
+    ))
+}
+
+pub fn save_send_appearance(compact: bool, dark: bool) -> Result<()> {
+    let path = settings_path()?;
+    let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
+    let mut settings = read_settings(&path)?;
+    settings.insert("compact_send_view".into(), Value::Bool(compact));
+    settings.insert("compact_send_dark".into(), Value::Bool(dark));
+    write_settings(&path, &settings)
 }
 
 /// Whether successful receives should show a desktop notification.

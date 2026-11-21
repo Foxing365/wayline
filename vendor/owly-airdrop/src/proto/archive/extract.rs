@@ -232,21 +232,25 @@ impl Rules {
         if !(entry.is_file() && entry.nlink <= 1 || entry.is_dir() && entry.size == 0) {
             return Err(unsupported());
         }
-        let listed = self
-            .allowed
-            .iter()
-            .any(|a| path == a.path && a.is_directory == entry.is_dir());
+        let offered = self.allowed.iter().find(|item| item.path == path);
+        if offered.is_some_and(|item| item.is_directory != entry.is_dir()) {
+            return Err(Error::NotAsked(entry.name.clone()));
+        }
+        let listed = offered.is_some();
+        let inside_directory = !listed && self.is_inside_directory(&path);
         let wrapper = !listed
+            && !inside_directory
             && entry.is_dir()
-            && path.components().len() == 1
             && self.allowed.iter().any(|a| {
-                !a.is_directory && a.path.components().len() == 2 && a.path.starts_with(&path)
+                !a.is_directory
+                    && a.path.components().len() > path.components().len()
+                    && a.path.starts_with(&path)
             });
         let item = if wrapper || !listed && entry.is_file() && self.is_sidecar(&path) {
             Item::Skip
-        } else if listed && entry.is_file() && path.components().len() == 2 {
+        } else if listed && entry.is_file() && path.components().len() > 1 {
             Item::WrappedFile(RelPath::file_name(path.last())?)
-        } else if listed || self.is_inside_directory(&path) {
+        } else if listed || inside_directory {
             if entry.is_dir() {
                 Item::Dir(path.clone())
             } else {
@@ -466,6 +470,12 @@ mod tests {
             r.check(&entry("./a/x", MODE_FILE | 0o644, 0)),
             Err(Error::NotAsked(_))
         ));
+        // Authorizing the parent folder does not change the declared type.
+        let mut r = rules(&[("d", true), ("d/wrapper/photo.jpg", false)]);
+        assert!(matches!(
+            r.check(&entry("./d/wrapper/photo.jpg", MODE_DIR | 0o755, 0)),
+            Err(Error::NotAsked(_))
+        ));
     }
 
     #[test]
@@ -480,32 +490,43 @@ mod tests {
 
     #[test]
     fn same_name_wrapped_files_are_distinct_only_when_both_paths_are_offered() {
-        let mut r = rules(&[("first/photo.jpg", false), ("second/photo.jpg", false)]);
+        let mut r = rules(&[
+            ("shared/first/photo.jpg", false),
+            ("shared/second/photo.jpg", false),
+        ]);
         let photo = Item::WrappedFile(RelPath::file_name("photo.jpg").unwrap());
         assert_eq!(
-            r.check(&entry("./first", MODE_DIR | 0o755, 0)),
+            r.check(&entry("./shared", MODE_DIR | 0o755, 0)),
+            Ok(Item::Skip)
+        );
+        assert!(matches!(
+            r.check(&entry("./shared/first", MODE_FILE | 0o644, 0)),
+            Err(Error::NotAsked(_))
+        ));
+        assert_eq!(
+            r.check(&entry("./shared/first", MODE_DIR | 0o755, 0)),
             Ok(Item::Skip)
         );
         assert!(matches!(r.finish(), Err(Error::Missing(_))));
         assert_eq!(
-            r.check(&entry("./first/photo.jpg", MODE_FILE | 0o644, 1)),
+            r.check(&entry("./shared/first/photo.jpg", MODE_FILE | 0o644, 1)),
             Ok(photo.clone())
         );
         assert_eq!(
-            r.check(&entry("./first/._photo.jpg", MODE_FILE | 0o644, 1)),
+            r.check(&entry("./shared/first/._photo.jpg", MODE_FILE | 0o644, 1)),
             Ok(Item::Skip)
         );
         assert!(matches!(
-            r.check(&entry("./first/unlisted.jpg", MODE_FILE | 0o644, 1)),
+            r.check(&entry("./shared/first/unlisted.jpg", MODE_FILE | 0o644, 1)),
             Err(Error::NotAsked(_))
         ));
         assert_eq!(
-            r.check(&entry("./second/photo.jpg", MODE_FILE | 0o644, 1)),
+            r.check(&entry("./shared/second/photo.jpg", MODE_FILE | 0o644, 1)),
             Ok(photo)
         );
         assert!(r.finish().is_ok());
         assert!(matches!(
-            r.check(&entry("first/photo.jpg", MODE_FILE | 0o644, 1)),
+            r.check(&entry("shared/first/photo.jpg", MODE_FILE | 0o644, 1)),
             Err(Error::Duplicate(_))
         ));
     }

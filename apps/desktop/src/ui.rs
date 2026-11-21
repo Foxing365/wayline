@@ -1,6 +1,7 @@
 mod apple_identity;
 mod compact_send;
 mod live_transfer;
+mod share_result;
 
 use crate::{
     backend::{self, Event, RadioChange},
@@ -10,11 +11,13 @@ use crate::{
     preview::{FileKind, MAX_PREVIEWS},
     scroll_area::{ScrollbarExt, client_area_animation_enabled},
 };
+use compact_send::SendLayout;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use share_result::ShareResult;
 use std::{
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use wayline_core::SendCancellation;
@@ -23,6 +26,7 @@ const BLUE: u32 = 0x0a84ff;
 const INK: u32 = 0xf5f5f7;
 const MUTED: u32 = 0xa0a0a8;
 const SURFACE: u32 = 0x27272b;
+const SHARE_RESULT_DURATION: Duration = Duration::from_secs(10);
 enum ExitState {
     Stopping,
     FlushingHistory(bool),
@@ -60,8 +64,8 @@ pub struct Capsule {
     name_input: Option<Entity<crate::name_input::NameInput>>,
     name_input_subscription: Option<Subscription>,
     settings_open: bool,
-    compact_send_view: bool,
-    pending_send_layout: Option<bool>,
+    send_layout: SendLayout,
+    pending_send_layout: Option<SendLayout>,
     animate_send_view: bool,
     startup_prewarm: bool,
     history_open: bool,
@@ -92,6 +96,7 @@ pub struct Capsule {
     exit_state: Option<ExitState>,
     receiver_status: Result<(), String>,
     receive: crate::receiving::Model,
+    share_result: Option<ShareResult>,
     download_directory: Option<PathBuf>,
     receiver_declined_until: Option<Instant>,
     incoming: Option<crate::receiving::IncomingRequest>,
@@ -177,15 +182,18 @@ impl Capsule {
                 None
             }
         };
+        let mut report_preference_error = |error: anyhow::Error, label| {
+            let message = format!("{}{label}: {error:#}", text.err_behavior_setting_load);
+            if let Some(previous) = &mut settings_error {
+                previous.push('\n');
+                previous.push_str(&message);
+            } else {
+                settings_error = Some(message);
+            }
+        };
         let mut load_preference = |result: anyhow::Result<bool>, default, label| {
             result.unwrap_or_else(|error| {
-                let message = format!("{}{label}: {error:#}", text.err_behavior_setting_load);
-                if let Some(previous) = &mut settings_error {
-                    previous.push('\n');
-                    previous.push_str(&message);
-                } else {
-                    settings_error = Some(message);
-                }
+                report_preference_error(error, label);
                 default
             })
         };
@@ -204,11 +212,15 @@ impl Capsule {
             crate::settings::DEFAULT_DRAG_ACTIVATE,
             text.drag_activate,
         );
-        let compact_send_view = load_preference(
-            crate::settings::load_compact_send_view(),
-            false,
-            text.send_layout_title,
-        );
+        let (compact, dark) = wayline_host::load_send_appearance().unwrap_or_else(|error| {
+            report_preference_error(error, text.send_layout_title);
+            (false, false)
+        });
+        let send_layout = match (compact, dark) {
+            (false, _) => SendLayout::Classic,
+            (true, false) => SendLayout::NekoLight,
+            (true, true) => SendLayout::NekoDark,
+        };
         let trusted_senders = wayline_host::load_trusted_senders().unwrap_or_else(|error| {
             settings_error = Some(format!("{} {error:#}", text.trusted_senders_error));
             Vec::new()
@@ -268,7 +280,7 @@ impl Capsule {
             name_input: None,
             name_input_subscription: None,
             settings_open: false,
-            compact_send_view,
+            send_layout,
             pending_send_layout: None,
             animate_send_view: client_area_animation_enabled(),
             startup_prewarm: crate::integration::startup_prewarm_enabled(),
@@ -300,6 +312,7 @@ impl Capsule {
             exit_state: None,
             receiver_status: Err(text.receiver_starting.into()),
             receive: crate::receiving::Model::default(),
+            share_result: None,
             download_directory,
             receiver_declined_until: None,
             incoming: None,
@@ -372,7 +385,7 @@ impl Capsule {
                             event_unix_ms,
                         );
                     }
-                    Event::ReceiverActivity(event) => {
+                    Event::ReceiverActivity(event, _) => {
                         let record =
                             self.receive
                                 .history_record_for_event(&event, event_at, event_unix_ms);
@@ -643,11 +656,25 @@ impl Capsule {
                     changed = true;
                     continue;
                 }
-                Event::ReceiverActivity(event) => {
+                Event::ReceiverActivity(event, image) => {
                     if let wayline_core::ReceiverEvent::WebLinksAccepted(transfer) = &event {
                         let urls = self
                             .receive
                             .links_after_acceptance(transfer, &self.trusted_senders);
+                        changed |= !urls.is_empty();
+                        if !urls.is_empty() {
+                            let original = transfer
+                                .share_text
+                                .clone()
+                                .unwrap_or_else(|| urls.join("\n"));
+                            self.show_share_result(
+                                self.language.strings().receive_web_opened.into(),
+                                transfer.sender_name.clone(),
+                                Some(original),
+                                image,
+                                window,
+                            );
+                        }
                         Self::open_received_web_links(urls, cx);
                         continue;
                     }
@@ -666,6 +693,11 @@ impl Capsule {
                     let web_links = self
                         .receive
                         .links_on_completion(&event, &self.trusted_senders);
+                    let opened_early = self
+                        .receive
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.web_links_opened);
                     let applied = self.receive.apply_at(&event, event_at, event_unix_ms);
                     let open_location = crate::receiving::auto_open_location(
                         &event,
@@ -679,23 +711,41 @@ impl Capsule {
                     {
                         worker.append(record, received_files);
                     }
-                    if applied
-                        && matches!(
-                            event,
-                            wayline_core::ReceiverEvent::Received { .. }
-                                | wayline_core::ReceiverEvent::TransferFailed {
-                                    kind: wayline_core::TransferFailureKind::Interrupted
-                                        | wayline_core::TransferFailureKind::Connection,
-                                    ..
-                                }
-                        )
-                        && let Some(notice) = &self.receive.notice
-                    {
-                        self.show_desktop_notification(
-                            notice.message.clone(),
-                            notice.full_text.clone(),
-                            cx,
-                        );
+                    if applied && let Some(notice) = &self.receive.notice {
+                        match &event {
+                            wayline_core::ReceiverEvent::Received {
+                                transfer, files, ..
+                            } => {
+                                let text = self.language.strings();
+                                let title = if !files.is_empty() {
+                                    text.notice_files_received
+                                } else if wayline_core::airdrop::web_links(&transfer.urls)
+                                    .is_empty()
+                                {
+                                    text.receive_shared_text
+                                } else {
+                                    self.language.shared_links()
+                                };
+                                self.show_share_result(
+                                    title.into(),
+                                    notice.message.clone(),
+                                    transfer.share_text.clone(),
+                                    image,
+                                    window,
+                                );
+                                self.receive.notice = None;
+                            }
+                            wayline_core::ReceiverEvent::TransferFailed {
+                                kind: wayline_core::TransferFailureKind::Connection,
+                                ..
+                            } if !opened_early => self.show_desktop_notification(
+                                "Wayline",
+                                notice.message.clone(),
+                                notice.full_text.clone(),
+                                cx,
+                            ),
+                            _ => {}
+                        }
                     }
                     if let Some(target) = open_location {
                         self.open_history_folder(target, cx);
@@ -762,6 +812,7 @@ impl Capsule {
                 Action::Close => self.expand(false, window, cx),
                 Action::Deactivate => {
                     let interacting = self.picker_open
+                        || self.share_result.is_some()
                         || self.incoming.is_some()
                         || self.firmware.busy
                         || self.drag_active
@@ -890,6 +941,20 @@ impl Capsule {
             changed = true;
         }
         let now = Instant::now();
+        if self
+            .share_result
+            .as_ref()
+            .is_some_and(|result| now >= result.deadline)
+        {
+            self.finish_share_result(window, cx);
+        }
+        if self
+            .model
+            .send_completion_expired(now, SHARE_RESULT_DURATION)
+            && self.queued_at.is_none()
+        {
+            self.reset(window, cx);
+        }
         changed |= self.receive.expire_notice(now);
         changed |= self.model.expire_speed(now);
         changed |= self.receive.expire_speed(now);
@@ -1041,20 +1106,23 @@ impl Capsule {
         cx.notify();
     }
 
-    fn set_compact_send_view(&mut self, compact: bool, cx: &mut Context<Self>) {
-        if compact != self.compact_send_view {
-            self.pending_send_layout = Some(compact);
+    fn set_send_layout(&mut self, layout: SendLayout, cx: &mut Context<Self>) {
+        if layout != self.send_layout {
+            self.pending_send_layout = Some(layout);
             cx.notify();
         }
     }
 
     fn refresh_send_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(compact) = self.pending_send_layout.take() else {
+        let Some(layout) = self.pending_send_layout.take() else {
             return;
         };
-        self.settings_error = match crate::settings::save_compact_send_view(compact) {
-            Ok(saved) => {
-                self.compact_send_view = saved;
+        self.settings_error = match wayline_host::save_send_appearance(
+            layout != SendLayout::Classic,
+            layout == SendLayout::NekoDark,
+        ) {
+            Ok(()) => {
+                self.send_layout = layout;
                 self.back(window, cx);
                 None
             }
@@ -1094,6 +1162,7 @@ impl Capsule {
 
     fn expand(&mut self, expanded: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !expanded {
+            self.clear_share_result(window);
             self.receive.reset_notice_hover();
             self.answer_incoming(IncomingAnswer::Decline, cx);
         }
@@ -1414,6 +1483,8 @@ impl Capsule {
             self.name_saved = false;
             self.focus.focus(window);
             cx.notify();
+        } else if self.share_result.is_some() {
+            self.finish_share_result(window, cx);
         } else {
             self.reset(window, cx);
         }
@@ -1760,12 +1831,20 @@ impl Capsule {
                 .as_ref()
                 .filter(|_| link.state == "starting")
         });
-        let compact_theme = self.compact_send_view
+        let compact_theme = self.send_layout == SendLayout::NekoLight
             && !self.settings_open
             && !self.history_open
             && !self.firmware.open
+            && self.share_result.is_none()
             && self.incoming.is_none();
-        let backdrop = if compact_theme { 0xf8fafc } else { 0x1c1c1f };
+        let neko_dark = self.send_layout == SendLayout::NekoDark;
+        let backdrop = if compact_theme {
+            0xf8fafc
+        } else if neko_dark {
+            0x111821
+        } else {
+            0x1c1c1f
+        };
         let surface = if compact_theme { 0xe9eef4 } else { SURFACE };
         let hover = if compact_theme { 0xdce8f6 } else { 0x393940 };
         let ink = if compact_theme { 0x172538 } else { INK };
@@ -2002,7 +2081,7 @@ impl Capsule {
                     ),
             )
             .children(self.settings_error.as_ref().map(|error| {
-                if compact_theme {
+                if self.send_layout != SendLayout::Classic {
                     self.compact_send_error(error)
                 } else {
                     self.error_view(error)
@@ -2092,6 +2171,8 @@ impl Capsule {
                         self.history_view(cx)
                     } else if self.settings_open {
                         self.settings_view(cx)
+                    } else if self.share_result.is_some() && !self.model.phase.busy() {
+                        self.share_result_view(cx)
                     } else if self.model.phase == Phase::Ready
                         && self.receive.active.is_some()
                         && self.model.files.is_empty()
@@ -2161,6 +2242,7 @@ impl Capsule {
             )
             .children(
                 (self.incoming.is_none()
+                    && self.share_result.is_none()
                     && !self.settings_open
                     && !self.history_open
                     && !self.firmware.open)
@@ -3357,8 +3439,58 @@ impl Capsule {
             .into_any_element()
     }
 
+    fn show_share_result(
+        &mut self,
+        title: String,
+        message: String,
+        original: Option<String>,
+        image: Option<Arc<RenderImage>>,
+        window: &mut Window,
+    ) {
+        let previous_visibility = self.clear_share_result(window).unwrap_or(self.visibility);
+        self.share_result = Some(ShareResult {
+            title,
+            message,
+            original,
+            image,
+            copied: false,
+            deadline: Instant::now() + SHARE_RESULT_DURATION,
+            previous_visibility,
+        });
+        if self.visibility != Visibility::Share {
+            self.visibility = Visibility::Share;
+            self.place();
+        }
+    }
+
+    fn clear_share_result(&mut self, window: &mut Window) -> Option<Visibility> {
+        let result = self.share_result.take()?;
+        if let Some(image) = result.image {
+            let _ = window.drop_image(image);
+        }
+        Some(result.previous_visibility)
+    }
+
+    fn finish_share_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clear_share_result(window) == Some(Visibility::Hidden)
+            && self.visibility == Visibility::Share
+            && self.incoming.is_none()
+            && !self.picker_open
+            && !self.settings_open
+            && !self.history_open
+            && !self.firmware.open
+            && !self.model.phase.busy()
+            && self.model.files.is_empty()
+        {
+            self.visibility = Visibility::Hidden;
+            self.place();
+        }
+        cx.notify();
+    }
+
     fn show_desktop_notification(
         &mut self,
+        title: &'static str,
         message: String,
         full_text: String,
         cx: &mut Context<Self>,
@@ -3373,7 +3505,6 @@ impl Capsule {
             return;
         };
         let text = self.language.strings();
-        let title = text.notice_files_received;
         let copy = text.copy;
         let copied = text.copied;
         let position = self.notification_position;
@@ -3381,12 +3512,13 @@ impl Capsule {
         let fallback_title = title;
         let fallback_message = message.clone();
         let positioning_fallback_message = message.clone();
+        let height = crate::notification::DesktopNotification::height();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(0.), px(0.)),
                 size(
                     px(crate::notification::DesktopNotification::width()),
-                    px(crate::notification::DesktopNotification::height()),
+                    px(height),
                 ),
             ))),
             titlebar: None,
@@ -3425,7 +3557,7 @@ impl Capsule {
                                 window,
                                 position,
                                 crate::notification::DesktopNotification::width(),
-                                crate::notification::DesktopNotification::height(),
+                                height,
                                 fallback_title,
                                 &positioning_fallback_message,
                             )
@@ -4599,6 +4731,7 @@ impl Capsule {
         let request = self.incoming.as_ref().unwrap();
         let is_link_share = !request.transfer.urls.is_empty();
         let has_files = !request.transfer.files.is_empty();
+        let share_text = request.transfer.share_text.as_ref();
         let certificate = request
             .transfer
             .file_offer_certificate()
@@ -4618,6 +4751,8 @@ impl Capsule {
                         text.receive_files_and_links_title
                     } else if is_link_share {
                         self.language.shared_links()
+                    } else if !has_files && share_text.is_some() {
+                        text.receive_shared_text
                     } else {
                         text.receive_files_title
                     }),
@@ -4652,6 +4787,17 @@ impl Capsule {
                         .map(|name| div().whitespace_normal().mb(px(6.)).child(name)),
                 ),
             )
+            .when_some(share_text, |view, original| {
+                view.child(
+                    div()
+                        .id("incoming-share-text")
+                        .max_h(px(100.))
+                        .visible_scrollbar()
+                        .whitespace_normal()
+                        .text_size(px(12.))
+                        .child(original.clone()),
+                )
+            })
             .when(has_files, |view| {
                 view.child(
                     div()
@@ -4725,7 +4871,7 @@ impl Capsule {
             self.model.phase == Phase::Ready,
             self.model.files.is_empty(),
         );
-        let page = if self.compact_send_view {
+        let page = if self.send_layout != SendLayout::Classic {
             self.compact_send_panel(cx)
         } else if !ready {
             self.transfer_view(cx)
@@ -5241,7 +5387,8 @@ impl Drop for Capsule {
 impl Render for Capsule {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let show_orb = self.visibility == Visibility::Share
-            && !self.compact_send_view
+            && self.send_layout == SendLayout::Classic
+            && self.share_result.is_none()
             && self.exit_state.is_none()
             && self.incoming.is_none()
             && self.receive.active.is_none()

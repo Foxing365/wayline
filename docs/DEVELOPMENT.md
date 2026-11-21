@@ -214,8 +214,11 @@ Identity creation and advertisement rename history in `receiver-services.json` a
 `download_directory` defaults to Downloads/Wayline; changing it leaves existing files in place
 and is blocked during receiving. `language` stores `zh-CN`, `zh-TW`, `en-US`, `ja-JP`, `ko-KR`,
 `fr-FR`, `de-DE` or `es-ES`; when absent, Windows UI language selects it and unsupported locales
-fall back to English. `desktop_notifications_enabled` controls the separate receive notification
-window and defaults to `true`. `notification_position` stores one of six screen positions and
+fall back to English. `desktop_notifications_enabled` controls separate notifications for receive connection failures and defaults to `true`.
+Successful transfers show their result in the sharing card for 10 seconds. The appearance flags
+`compact_send_view` and `compact_send_dark` are written together. With no dark preference,
+an existing compact layout remains light. Launch at sign-in uses the current user's Startup folder.
+`notification_position` stores one of six screen positions and
 defaults to `top-right`; `notification_duration_seconds` stores an allowed delay of 3, 5, 8, 10,
 15 or 30 seconds and defaults to 8. The notification fades in and out. Switching
 language updates the window, tray, system dialogs and notifications immediately and re-registers Explorer entries. UI copy lives in

@@ -11,7 +11,7 @@
 //! accepts on its own (ASK-3). It serves Everyone mode only.
 
 use std::borrow::Cow;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -591,27 +591,49 @@ impl Connection {
                 return;
             }
         };
-        // Photos can wrap each regular file in one folder in a multi-photo
-        // share. Extraction drops that folder, retaining the name shown here.
+        // Photos can wrap each regular file in several archive directories.
+        // Extraction drops the wrappers and keeps the name shown for consent.
         if let Offer::Files(files) = &request.offer {
-            let mut paths = HashSet::new();
+            let mut paths = BTreeMap::new();
             for file in files {
-                let path = RelPath::parse(&file.bom_path).ok().filter(|path| {
-                    let depth = path.components().len();
-                    path.last() == file.name && (depth == 1 || depth == 2 && !file.is_directory)
-                });
-                let Some(path) = path else {
+                let Ok(path) = RelPath::parse(&file.bom_path) else {
                     self.fail_control(
                         Route::Ask,
                         400,
-                        "file name or archive path failed validation",
+                        "unsupported archive path component or length",
                     );
                     return;
                 };
-                if !paths.insert(path) {
+                if path.last() != file.name {
+                    self.fail_control(Route::Ask, 400, "file name does not match archive path");
+                    return;
+                }
+                if file.is_directory && path.components().len() != 1 {
+                    self.fail_control(
+                        Route::Ask,
+                        400,
+                        "directory offer must name a top-level path",
+                    );
+                    return;
+                }
+                if paths.insert(path, file.is_directory).is_some() {
                     self.fail_control(Route::Ask, 400, "duplicate archive path in offer");
                     return;
                 }
+            }
+            // Sorted descendants immediately follow their ancestor. A regular
+            // file cannot be a directory wrapping another offered entry.
+            if paths
+                .iter()
+                .zip(paths.keys().skip(1))
+                .any(|((path, is_directory), next)| !is_directory && next.starts_with(path))
+            {
+                self.fail_control(
+                    Route::Ask,
+                    400,
+                    "file path conflicts with an offered descendant",
+                );
+                return;
             }
         }
         self.events.push_back(Event::Ask(request.clone()));

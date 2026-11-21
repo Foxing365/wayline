@@ -3,10 +3,72 @@ use crate::scroll_area::ScrollbarExt;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
-const SEND_SHEET: u32 = 0xeef2f7;
-const SEND_INK: u32 = 0x172538;
-const SEND_MUTED: u32 = 0x4d5d74;
-const SEND_ACCENT: u32 = 0x205da9;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SendLayout {
+    #[default]
+    Classic,
+    NekoLight,
+    NekoDark,
+}
+
+impl SendLayout {
+    fn label(self, text: &crate::i18n::Strings) -> &'static str {
+        match self {
+            Self::Classic => text.send_layout_classic,
+            Self::NekoLight => text.send_layout_compact,
+            Self::NekoDark => text.send_layout_compact_dark,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SendPalette {
+    sheet: u32,
+    surface: u32,
+    border: u32,
+    ink: u32,
+    muted: u32,
+    accent: u32,
+    hover: u32,
+    hover_border: u32,
+    tint: u32,
+    tint_hover: u32,
+    error: u32,
+}
+
+impl SendPalette {
+    fn for_layout(layout: SendLayout) -> Self {
+        if layout == SendLayout::NekoLight {
+            Self {
+                sheet: 0xeef2f7,
+                surface: 0xffffff,
+                border: 0xd7e2ee,
+                ink: 0x172538,
+                muted: 0x4d5d74,
+                accent: 0x205da9,
+                hover: 0xf6faff,
+                hover_border: 0x80a7d4,
+                tint: 0xe5effa,
+                tint_hover: 0xd9e8fa,
+                error: 0x97451d,
+            }
+        } else {
+            Self {
+                sheet: 0x1c222b,
+                surface: 0x242c37,
+                border: 0x384657,
+                ink: 0xeff4fc,
+                muted: 0xafbbcd,
+                accent: 0x8abfff,
+                hover: 0x2c3b4e,
+                hover_border: 0x6489b1,
+                tint: 0x293b52,
+                tint_hover: 0x334c69,
+                error: 0xffba93,
+            }
+        }
+    }
+}
 
 impl Capsule {
     pub(super) fn send_layout_settings_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -21,20 +83,23 @@ impl Capsule {
             .gap(px(8.))
             .child(div().text_size(px(13.)).child(text.send_layout_title))
             .child(
-                div().flex().gap(px(6.)).children(
+                div().flex().flex_col().gap(px(6.)).children(
                     [
-                        ("classic-send-layout", text.send_layout_classic, false),
-                        ("compact-send-layout", text.send_layout_compact, true),
+                        ("classic-send-layout", SendLayout::Classic),
+                        ("compact-send-layout", SendLayout::NekoLight),
+                        ("dark-compact-send-layout", SendLayout::NekoDark),
                     ]
-                    .map(|(id, label, compact)| {
-                        button(id, label, self.compact_send_view == compact)
+                    .map(|(id, layout)| {
+                        button(id, layout.label(&text), self.send_layout == layout)
                             .h(px(32.))
-                            .min_w_0()
-                            .flex_1()
+                            .w_full()
                             .rounded(px(8.))
                             .text_size(px(11.))
+                            .when(self.send_layout == layout, |choice| {
+                                choice.text_color(rgb(0x101a27))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_compact_send_view(compact, cx);
+                                this.set_send_layout(layout, cx);
                             }))
                     }),
                 ),
@@ -44,11 +109,10 @@ impl Capsule {
 
     pub(super) fn send_layout_refresh_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
-        let layout = if self.pending_send_layout == Some(true) {
-            text.send_layout_compact
-        } else {
-            text.send_layout_classic
-        };
+        let layout = self
+            .pending_send_layout
+            .unwrap_or(self.send_layout)
+            .label(&text);
         div()
             .flex_1()
             .min_h_0()
@@ -102,6 +166,7 @@ impl Capsule {
 
     pub(super) fn compact_send_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
+        let color = SendPalette::for_layout(self.send_layout);
         if self.model.phase != Phase::Ready {
             return self.compact_transfer_card(cx);
         }
@@ -110,8 +175,8 @@ impl Capsule {
             .min_h_0()
             .w_full()
             .rounded(px(15.))
-            .bg(rgb(SEND_SHEET))
-            .text_color(rgb(SEND_INK))
+            .bg(rgb(color.sheet))
+            .text_color(rgb(color.ink))
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -131,7 +196,7 @@ impl Capsule {
                     div()
                         .text_center()
                         .text_size(px(11.))
-                        .text_color(rgb(SEND_MUTED))
+                        .text_color(rgb(color.muted))
                         .child(text.share_hint),
                 )
                 .child(
@@ -146,6 +211,13 @@ impl Capsule {
                         },
                         true,
                     )
+                    .bg(rgb(color.accent))
+                    .text_color(rgb(if self.send_layout == SendLayout::NekoLight {
+                        0xffffff
+                    } else {
+                        0x101a27
+                    }))
+                    .hover(move |button| button.bg(rgb(color.accent)).opacity(0.9))
                     .when(choosing, |button| button.opacity(0.5))
                     .on_click(cx.listener(|this, _, window, cx| this.choose(window, cx))),
                 )
@@ -158,7 +230,7 @@ impl Capsule {
                 .into_any_element();
         }
         sheet
-            .child(self.compact_file_summary(cx))
+            .child(self.compact_file_summary(color, cx))
             .child(
                 div()
                     .flex()
@@ -180,7 +252,7 @@ impl Capsule {
                             .py(px(3.))
                             .px(px(4.))
                             .text_size(px(10.))
-                            .text_color(rgb(SEND_ACCENT))
+                            .text_color(rgb(color.accent))
                             .when(!self.model.scanning, |item| item.cursor_pointer())
                             .child(if self.model.scanning {
                                 text.searching
@@ -190,7 +262,7 @@ impl Capsule {
                             .on_click(cx.listener(|this, _, _, cx| this.scan(cx))),
                     ),
             )
-            .child(self.compact_device_grid(cx))
+            .child(self.compact_device_list(color, cx))
             .children(
                 self.model
                     .error
@@ -200,7 +272,7 @@ impl Capsule {
             .into_any_element()
     }
 
-    fn compact_file_summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn compact_file_summary(&self, color: SendPalette, cx: &mut Context<Self>) -> impl IntoElement {
         let text = self.language.strings();
         let title = if self.model.files.len() == 1 {
             self.model.files[0]
@@ -212,7 +284,7 @@ impl Capsule {
             self.language.file_count(self.model.files.len())
         };
         let can_open = self.can_open_files();
-        compact_send_card()
+        compact_send_card(color)
             .flex_shrink_0()
             .items_center()
             .gap(px(8.))
@@ -234,7 +306,7 @@ impl Capsule {
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(SEND_MUTED))
+                            .text_color(rgb(color.muted))
                             .child(file_size(self.model.bytes)),
                     )
                     .child(
@@ -247,9 +319,9 @@ impl Capsule {
                                 div()
                                     .id("compact-open-file")
                                     .text_color(rgb(if can_open {
-                                        SEND_ACCENT
+                                        color.accent
                                     } else {
-                                        SEND_MUTED
+                                        color.muted
                                     }))
                                     .when(can_open, |button| button.cursor_pointer())
                                     .child(if self.opening_files.is_some() {
@@ -265,7 +337,7 @@ impl Capsule {
                                 div()
                                     .id("compact-replace-files")
                                     .cursor_pointer()
-                                    .text_color(rgb(SEND_ACCENT))
+                                    .text_color(rgb(color.accent))
                                     .child(if self.picker_open {
                                         text.selecting
                                     } else if self.model.validating {
@@ -281,17 +353,17 @@ impl Capsule {
             )
     }
 
-    fn compact_device_grid(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn compact_device_list(&self, color: SendPalette, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
-        let device_grid = div().flex_1().min_h_0().flex().flex_col();
+        let devices = div().flex_1().min_h_0().flex().flex_col();
         if self.model.peers.is_empty() {
             let disconnected = self.model.status.is_some() && !self.model.connection_ready();
-            return device_grid
+            return devices
                 .justify_center()
                 .gap(px(5.))
                 .items_center()
                 .text_center()
-                .text_color(rgb(SEND_MUTED))
+                .text_color(rgb(color.muted))
                 .child(div().text_size(px(12.)).child(if disconnected {
                     text.connection_not_ready
                 } else if self.model.scanning {
@@ -311,58 +383,56 @@ impl Capsule {
             && !self.picker_open
             && !self.firmware.busy
             && self.queued_at.is_none();
-        device_grid
+        devices
             .id("compact-nearby-devices")
             .visible_scrollbar()
             .gap(px(7.))
-            .children(self.model.peers.chunks(2).map(|pair| {
-                div()
-                    .flex()
+            .children(self.model.peers.iter().map(|peer| {
+                let instance = peer.service.instance.clone();
+                compact_send_card(color)
+                    .id(SharedString::from(format!("compact-peer-{instance}")))
                     .flex_shrink_0()
-                    .gap(px(7.))
-                    .children(pair.iter().map(|peer| {
-                        let instance = peer.service.instance.clone();
-                        compact_send_card()
-                            .id(SharedString::from(format!("compact-peer-{instance}")))
+                    .items_center()
+                    .gap(px(9.))
+                    .when(can_send, |card| {
+                        card.cursor_pointer().hover(move |card| {
+                            card.bg(rgb(color.hover))
+                                .border_color(rgb(color.hover_border))
+                        })
+                    })
+                    .when(!can_send, |card| card.opacity(0.6))
+                    .child(compact_device_glyph(color))
+                    .child(
+                        div()
                             .flex_1()
                             .min_w_0()
-                            .flex_col()
-                            .gap(px(5.))
-                            .when(can_send, |card| {
-                                card.cursor_pointer().hover(|card| {
-                                    card.bg(rgb(0xf6faff)).border_color(rgb(0x80a7d4))
-                                })
-                            })
-                            .when(!can_send, |card| card.opacity(0.6))
-                            .child(compact_device_glyph())
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(peer.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(SEND_ACCENT))
-                                    .child(text.send),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if can_send {
-                                    this.model.selected = Some(instance.clone());
-                                    this.send(cx);
-                                    cx.notify();
-                                }
-                            }))
+                            .truncate()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(peer.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(color.accent))
+                            .child(text.send),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if can_send {
+                            this.model.selected = Some(instance.clone());
+                            this.send(cx);
+                            cx.notify();
+                        }
                     }))
-                    .when(pair.len() == 1, |row| row.child(div().flex_1().min_w_0()))
             }))
             .into_any_element()
     }
 
     fn compact_transfer_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
+        let color = SendPalette::for_layout(self.send_layout);
         let complete = self.model.phase == Phase::Complete;
         let cancelling = self.model.phase == Phase::Cancelling;
         let busy = self.model.phase.busy();
@@ -402,16 +472,16 @@ impl Capsule {
                     div()
                         .id("compact-transfer-action")
                         .rounded(px(10.))
-                        .bg(rgb(0xe6eef9))
+                        .bg(rgb(color.tint))
                         .px(px(17.))
                         .py(px(8.))
                         .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(SEND_ACCENT))
+                        .text_color(rgb(color.accent))
                         .when(!cancelling, |action| {
                             action
                                 .cursor_pointer()
-                                .hover(|action| action.bg(rgb(0xd9e8fa)))
+                                .hover(move |action| action.bg(rgb(color.tint_hover)))
                         })
                         .child(action)
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -434,30 +504,31 @@ impl Capsule {
     }
 
     pub(super) fn compact_send_error(&self, error: &str) -> AnyElement {
+        let color = SendPalette::for_layout(self.send_layout);
         div()
             .id("compact-send-error")
             .flex_shrink_0()
             .max_h(px(52.))
             .visible_scrollbar()
             .text_size(px(10.))
-            .text_color(rgb(0x97451d))
+            .text_color(rgb(color.error))
             .whitespace_normal()
             .child(error.to_owned())
             .into_any_element()
     }
 }
 
-fn compact_send_card() -> Div {
+fn compact_send_card(color: SendPalette) -> Div {
     div()
         .flex()
         .rounded(px(10.))
         .border_1()
-        .border_color(rgb(0xd7e2ee))
-        .bg(rgb(0xffffff))
+        .border_color(rgb(color.border))
+        .bg(rgb(color.surface))
         .p(px(8.))
 }
 
-fn compact_device_glyph() -> impl IntoElement {
+fn compact_device_glyph(color: SendPalette) -> impl IntoElement {
     div()
         .size(px(30.))
         .rounded(px(8.))
@@ -465,14 +536,14 @@ fn compact_device_glyph() -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(0xe5effa))
+        .bg(rgb(color.tint))
         .child(
             div()
                 .w(px(10.))
                 .h(px(16.))
                 .rounded(px(3.))
                 .border_1()
-                .border_color(rgb(SEND_ACCENT))
+                .border_color(rgb(color.accent))
                 .flex()
                 .items_end()
                 .justify_center()
@@ -482,7 +553,7 @@ fn compact_device_glyph() -> impl IntoElement {
                         .w(px(3.))
                         .h(px(1.))
                         .rounded_full()
-                        .bg(rgb(SEND_ACCENT)),
+                        .bg(rgb(color.accent)),
                 ),
         )
 }

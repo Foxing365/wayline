@@ -60,7 +60,10 @@ pub enum Event {
     Transfer(u64, SendEvent),
     SendDone(u64, Result<(), SendFailure>),
     ReceiverStatus(Result<(), String>),
-    ReceiverActivity(wayline_core::ReceiverEvent),
+    ReceiverActivity(
+        wayline_core::ReceiverEvent,
+        Option<std::sync::Arc<gpui::RenderImage>>,
+    ),
     HistoryLoaded(Result<Vec<wayline_host::TransferHistoryRecord>, String>),
     HistoryUpdated(Result<Vec<wayline_host::TransferHistoryRecord>, String>),
     HistoryDeleted(Result<Vec<wayline_host::TransferHistoryRecord>, String>),

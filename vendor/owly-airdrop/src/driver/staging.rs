@@ -70,19 +70,21 @@ impl Staging {
 
     pub async fn create_dir(&mut self, path: &RelPath) -> io::Result<()> {
         let path = self.join(path);
-        fs::create_dir_all(path).await
+        fs::create_dir_all(path).await.map_err(staging_path_error)
     }
 
     pub async fn create_file(&mut self, path: &RelPath) -> io::Result<()> {
         let path = self.join(path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(staging_path_error)?;
         }
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o644);
-        self.file = Some(options.open(path).await?);
+        self.file = Some(options.open(path).await.map_err(staging_path_error)?);
         Ok(())
     }
 
@@ -148,6 +150,16 @@ impl Staging {
         .await
         .map_err(io::Error::other)?
         // `self.dir` is dropped here, removing staging and anything left in it.
+    }
+}
+
+fn staging_path_error(error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory => io::Error::new(
+            error.kind(),
+            "received archive entries collide at the same staging path",
+        ),
+        _ => error,
     }
 }
 
@@ -285,9 +297,11 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         let mut s = Staging::new(dest.path()).await.unwrap();
         s.create_file(&path("x")).await.unwrap();
+        let error = s.create_file(&path("x")).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
-            s.create_file(&path("x")).await.unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
+            error.to_string(),
+            "received archive entries collide at the same staging path"
         );
     }
 }

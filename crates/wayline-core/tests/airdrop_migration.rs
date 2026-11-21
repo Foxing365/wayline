@@ -523,43 +523,58 @@ fn receiver_distinguishes_active_peer_disconnect_from_a_malformed_upload() {
 #[test]
 fn tls_url_offers_finish_after_acceptance_without_uploading_files() {
     use owly_airdrop::proto::messages::Offer;
+    use wayline_core::airdrop::web_links;
     let root = tempfile::tempdir().unwrap();
     let id = identity(root.path());
     let dest = root.path().join("received");
-    let url = "https://b23.tv/wayline-test";
-    let ask = sender::ask_request(
-        &sender::Config::new("iPhone", "abcdef123456"),
-        "LINK123",
-        &Offer::Urls(vec![url.into()]),
-    );
-    for accept in [true, false] {
-        let core = Arc::new(
-            ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", &dest)).with_decision(
-                move |offer| {
-                    assert!(offer.files.is_empty());
-                    assert_eq!(offer.urls, [url]);
-                    accept
-                },
-            ),
+    const URL: &str = "https://b23.tv/wayline-test";
+    const CASES: [(&str, &str, &[&str]); 3] = [
+        (URL, URL, &[URL]),
+        (
+            "复制打开抖音，看看【示例】的作品：https://v.douyin.com/WaylineTest/ 04/09\r\n第二行",
+            "复制打开抖音，看看【示例】的作品：https://v.douyin.com/WaylineTest/ 04/09\n第二行",
+            &["https://v.douyin.com/WaylineTest/"],
+        ),
+        ("分享文字\r\n没有链接", "分享文字\n没有链接", &[]),
+    ];
+    for (item, text, links) in CASES {
+        let ask = sender::ask_request(
+            &sender::Config::new("iPhone", "abcdef123456"),
+            "LINK123",
+            &Offer::Urls(vec![item.into()]),
         );
-        let (peer, worker) = start(core, &id);
-        let mut tls = client(peer.service.address);
-        tls.write_all(&ask).unwrap();
-        tls.flush().unwrap();
-        assert_eq!(response(&mut tls).status, if accept { 200 } else { 403 });
-        tls.conn.send_close_notify();
-        let _ = tls.flush();
-        drop(tls);
-        let events = worker.join().unwrap().unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ReceiverEvent::Received { transfer, files }
-            if files.is_empty() && transfer.urls == [url]))
-                .count(),
-            usize::from(accept)
-        );
-        assert!(!dest.exists() || fs::read_dir(&dest).unwrap().next().is_none());
+        for accept in [true, false] {
+            let core = Arc::new(
+                ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", &dest))
+                    .with_decision(move |offer| {
+                        assert!(offer.files.is_empty());
+                        assert_eq!(offer.urls, [item]);
+                        assert_eq!(offer.share_text.as_deref(), Some(text));
+                        assert_eq!(web_links(&offer.urls), links);
+                        accept
+                    }),
+            );
+            let (peer, worker) = start(core, &id);
+            let mut tls = client(peer.service.address);
+            tls.write_all(&ask).unwrap();
+            tls.flush().unwrap();
+            assert_eq!(response(&mut tls).status, if accept { 200 } else { 403 });
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            drop(tls);
+            let events = worker.join().unwrap().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, ReceiverEvent::Received { transfer, files }
+                        if files.is_empty()
+                            && transfer.share_text.as_deref() == Some(text)
+                            && web_links(&transfer.urls) == links))
+                    .count(),
+                usize::from(accept)
+            );
+            assert!(!dest.exists() || fs::read_dir(&dest).unwrap().next().is_none());
+        }
     }
 }
 
@@ -725,35 +740,148 @@ fn tls_receive_publishes_both_top_level_files_from_one_offer() {
 }
 
 #[test]
+fn tls_batch_of_59_photos_with_nested_wrappers_publishes_all_files() {
+    use owly_airdrop::proto::{
+        archive::{compress::Encoder, cpio},
+        messages::{AskFile, Offer},
+    };
+
+    const PHOTO_COUNT: u8 = 59;
+    let root = tempfile::tempdir().unwrap();
+    let id = identity(root.path());
+    let destination = root.path().join("received");
+    let header = |name: &str, mode, size| {
+        cpio::odc_header(&cpio::Entry {
+            name: name.into(),
+            mode,
+            size,
+            nlink: 1,
+            ino: 1,
+            uid: 501,
+            gid: 20,
+            mtime: 0,
+        })
+    };
+    let mut archive = Vec::new();
+    for directory in [".", "./Photos", "./Photos/Export"] {
+        archive.extend(header(directory, cpio::MODE_DIR | 0o755, 0));
+    }
+    let mut photos = Vec::new();
+    for index in 0..PHOTO_COUNT {
+        let wrapper = format!("./Photos/Export/{index}");
+        let name = format!("IMG_{index:03}.HEIC");
+        let bom_path = format!("{wrapper}/{name}");
+        // Apple can include the prefix directories or omit them.
+        if index % 2 == 0 {
+            archive.extend(header(&wrapper, cpio::MODE_DIR | 0o755, 0));
+        }
+        archive.extend(header(&bom_path, cpio::MODE_FILE | 0o644, 1));
+        archive.push(index);
+        photos.push(AskFile {
+            name,
+            file_type: "public.heic".into(),
+            size: Some(1),
+            bom_path,
+            is_directory: false,
+        });
+    }
+    archive.extend(cpio::odc_trailer());
+    let compressor = Compressor::DvZip;
+    let mut encoder = Encoder::new(compressor, flate2::Compression::fast());
+    let mut upload = encoder.write(&archive);
+    upload.extend(encoder.finish());
+
+    let core = ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", &destination))
+        .with_decision(|offer| {
+            assert_eq!(offer.files.len(), usize::from(PHOTO_COUNT));
+            assert_eq!(offer.files[58].name, "IMG_058.HEIC");
+            true
+        });
+    let (peer, worker) = start(Arc::new(core), &id);
+    let mut tls = client(peer.service.address);
+    let ask = sender::ask_request(
+        &sender::Config::new("iPhone", "abcdef123456"),
+        "PHOTO_BATCH",
+        &Offer::Files(photos),
+    );
+    let (_, ask_body) = read_request(&mut ask.as_slice());
+    tls.write_all(&http::post_head(
+        "/Ask",
+        &[("Transfer-Encoding", "chunked")],
+    ))
+    .unwrap();
+    for chunk in ask_body.chunks(1024) {
+        tls.write_all(&http::chunk(chunk)).unwrap();
+    }
+    tls.write_all(b"0\r\n\r\n").unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 200);
+    tls.write_all(&sender::upload_head(
+        "PHOTO_BATCH",
+        compressor,
+        upload.len() as u64,
+    ))
+    .unwrap();
+    tls.write_all(&upload).unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 200);
+    let events = worker.join().unwrap().unwrap();
+    assert!(
+        matches!(events.last(), Some(ReceiverEvent::Received { transfer, files })
+        if transfer.files.len() == usize::from(PHOTO_COUNT) && files.len() == usize::from(PHOTO_COUNT))
+    );
+    assert_eq!(
+        fs::read_dir(&destination).unwrap().count(),
+        usize::from(PHOTO_COUNT)
+    );
+    for index in 0..PHOTO_COUNT {
+        assert_eq!(
+            fs::read(destination.join(format!("IMG_{index:03}.HEIC"))).unwrap(),
+            [index]
+        );
+    }
+}
+
+#[test]
 fn tls_invalid_offer_is_rejected_before_consent_with_a_diagnostic() {
     use owly_airdrop::proto::messages::{AskFile, Offer};
 
     let root = tempfile::tempdir().unwrap();
     let id = identity(root.path());
-    let file = |bom_path: &str, is_directory| AskFile {
-        name: "IMG_001.jpg".into(),
+    let file = |name: &str, bom_path: &str, is_directory| AskFile {
+        name: name.into(),
         file_type: "public.jpeg".into(),
         size: Some(9),
         bom_path: bom_path.into(),
         is_directory,
     };
-    let invalid_path = "file name or archive path failed validation";
+    const NAME: &str = "IMG_001.jpg";
     for (files, reason) in [
         (
-            vec![file("./photo/different-name.jpg", false)],
-            invalid_path,
+            vec![file(NAME, "./photo/different-name.jpg", false)],
+            "file name does not match archive path",
         ),
         (
-            vec![file("./photo/nested/IMG_001.jpg", false)],
-            invalid_path,
+            vec![file(NAME, "./photo/nested/../IMG_001.jpg", false)],
+            "unsupported archive path component or length",
         ),
-        (vec![file("./photo/IMG_001.jpg", true)], invalid_path),
+        (
+            vec![file(NAME, "./photo/IMG_001.jpg", true)],
+            "directory offer must name a top-level path",
+        ),
         (
             vec![
-                file("./photo/IMG_001.jpg", false),
-                file("photo/IMG_001.jpg", false),
+                file(NAME, "./photo/nested/IMG_001.jpg", false),
+                file(NAME, "photo/nested/IMG_001.jpg", false),
             ],
             "duplicate archive path in offer",
+        ),
+        (
+            vec![
+                file(NAME, "./photo/nested/IMG_001.jpg", false),
+                file("nested", "./photo/nested", false),
+            ],
+            "file path conflicts with an offered descendant",
         ),
     ] {
         let core = ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", root.path()))
@@ -909,8 +1037,12 @@ fn tls_file_share_with_a_web_link_requires_consent_and_uploads_the_attachment() 
                 assert_eq!(transfer.files[0].name, "a.txt");
                 let actual = wayline_core::airdrop::web_links(&transfer.urls);
                 assert_eq!(actual, expected_links);
+                assert_eq!(transfer.share_text.as_deref(), Some(item));
                 assert!(transfer.sender_certificate_sha256.is_some());
                 assert!(transfer.file_offer_certificate().is_none());
+                let mut normalized = transfer.clone();
+                normalized.urls = actual;
+                assert!(normalized.file_offer_certificate().is_none());
                 decision
             });
         }
@@ -931,19 +1063,24 @@ fn tls_file_share_with_a_web_link_requires_consent_and_uploads_the_attachment() 
         let _ = tls.flush();
         drop(tls);
         let events = worker.join().unwrap().unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ReceiverEvent::WebLinksAccepted(_)))
-                .count(),
-            usize::from(status == 200 && has_link)
-        );
+        let accepted_links: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ReceiverEvent::WebLinksAccepted(transfer) => Some(transfer),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(accepted_links.len(), usize::from(status == 200 && has_link));
+        for transfer in accepted_links {
+            assert_eq!(transfer.share_text.as_deref(), Some(item));
+        }
         if status == 200 {
             let saved = destination.join("a.txt");
             assert_eq!(fs::read(&saved).unwrap(), b"verified");
             assert!(
                 matches!(events.last(), Some(ReceiverEvent::Received { transfer, files })
                 if files == &[saved]
+                    && transfer.share_text.as_deref() == Some(item)
                     && wayline_core::airdrop::web_links(&transfer.urls) == expected_links)
             );
         } else {

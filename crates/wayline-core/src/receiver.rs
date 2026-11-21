@@ -278,6 +278,10 @@ impl ReceiverCore {
                                     let mut transfer = incoming.clone().unwrap();
                                     transfer.urls = web_links(&transfer.urls);
                                     if !transfer.urls.is_empty() {
+                                        // A share can deliver its webpage without ever starting
+                                        // the attachment. A subsequent read restores the normal
+                                        // idle limit for the upload.
+                                        idle = Instant::now() + Duration::from_secs(30);
                                         notify(ReceiverEvent::WebLinksAccepted(transfer));
                                     }
                                 }
@@ -389,6 +393,7 @@ impl ReceiverCore {
                             active = None;
                         }
                         Event::UploadStarted { compressor } => {
+                            idle = Instant::now() + Duration::from_secs(120);
                             notify(ReceiverEvent::ModeSelected(match compressor {
                                 owly_airdrop::proto::archive::compress::Compressor::Gzip => {
                                     TransferFormat::Gzip
@@ -513,14 +518,14 @@ impl ReceiverCore {
                 Some(kind) => kind,
                 None => TransferFailureKind::from_io(&e),
             };
-            if let Some(b) = &mut board {
-                if kind == TransferFailureKind::Cancelled {
-                    b.phase(Phase::Cancelled);
-                } else {
-                    b.fail(Reason::Interrupted);
+            if let (Some(_), Some(transfer)) = (&active, &incoming) {
+                if let Some(b) = &mut board {
+                    if kind == TransferFailureKind::Cancelled {
+                        b.phase(Phase::Cancelled);
+                    } else {
+                        b.fail(Reason::Interrupted);
+                    }
                 }
-            }
-            if let Some(transfer) = &incoming {
                 notify(ReceiverEvent::TransferFailed {
                     transfer_id: transfer.id.clone(),
                     error: e.to_string(),

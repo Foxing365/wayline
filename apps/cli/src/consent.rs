@@ -169,6 +169,7 @@ mod tests {
             sender_model: None,
             files: Vec::new(),
             urls: Vec::new(),
+            share_text: None,
             icon: None,
             sender_record_data: None,
             sender_certificate_sha256: None,

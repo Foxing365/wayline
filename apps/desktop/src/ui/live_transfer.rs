@@ -1,4 +1,4 @@
-use super::{Capsule, Phase, file_size};
+use super::{Capsule, Phase, compact_send::SendLayout, file_size};
 use crate::receiving::Phase as ReceivePhase;
 use crate::scroll_area::ScrollbarExt;
 use gpui::prelude::FluentBuilder;
@@ -115,6 +115,12 @@ impl Capsule {
         let text = self.language.strings();
         let transfer = self.receive.active.as_ref().unwrap();
         let (title, bytes, total, note) = match transfer.phase {
+            ReceivePhase::Waiting if transfer.web_links_opened => (
+                text.receive_web_opened,
+                None,
+                None,
+                Some(text.receive_web_attachment_wait),
+            ),
             ReceivePhase::Waiting => (
                 text.receive_waiting_title,
                 None,
@@ -179,7 +185,7 @@ impl Capsule {
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(if self.compact_send_view {
+                            .text_color(rgb(if self.send_layout == SendLayout::NekoLight {
                                 0x526278
                             } else {
                                 0xa5b1c0
@@ -195,11 +201,12 @@ impl Capsule {
     }
 
     fn transfer_readout(&self, data: Readout, mini: bool) -> AnyElement {
-        let light = self.compact_send_view;
-        let (surface, border, ink, muted, track) = if light {
-            (0xffffff, 0xd0dfef, 0x17293c, 0x475d73, 0xdce6f1)
-        } else {
-            (0x20252d, 0x36404d, 0xf2f6fc, 0xa5b1c0, 0x394452)
+        let light = self.send_layout == SendLayout::NekoLight;
+        let compact = self.send_layout != SendLayout::Classic;
+        let (surface, border, ink, muted, track) = match self.send_layout {
+            SendLayout::NekoLight => (0xffffff, 0xd0dfef, 0x17293c, 0x475d73, 0xdce6f1),
+            SendLayout::NekoDark => (0x242c37, 0x384657, 0xeff4fc, 0xafbbcd, 0x39495d),
+            SendLayout::Classic => (0x20252d, 0x36404d, 0xf2f6fc, 0xa5b1c0, 0x394452),
         };
         let accent = match (data.mark, light) {
             (Mark::Done, true) => 0x157355,
@@ -220,7 +227,13 @@ impl Capsule {
             .flex()
             .items_center()
             .gap(px(if mini { 7. } else { 10. }))
-            .child(status_glyph(data.mark, light, accent, mini, animate))
+            .child(status_glyph(
+                data.mark,
+                compact,
+                accent,
+                mini,
+                animate && !compact,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -512,10 +525,10 @@ fn activity_phase() -> f32 {
         as f32
 }
 
-// The moving ring indicates activity. Progress and rate use protocol counters.
+// The classic ring indicates activity. The compact themes use a fixed status tile.
 fn status_glyph(
     mark: Mark,
-    light: bool,
+    compact: bool,
     accent: u32,
     mini: bool,
     animate: bool,
@@ -541,25 +554,39 @@ fn status_glyph(
                     .corner_radii(radius),
                 );
             };
-            let phase = if animate { activity_phase() } else { 0.35 };
-            disc(window, 16. + 5. * phase, tint.opacity(0.14 * (1. - phase)));
-            disc(window, 15., tint.opacity(if light { 0.12 } else { 0.18 }));
-            if matches!(mark, Mark::Send | Mark::Receive) {
-                let direction = if matches!(mark, Mark::Receive) {
-                    -1.
-                } else {
-                    1.
-                };
-                let angle = phase * std::f32::consts::TAU * direction;
-                let bead = px(2.1 * unit);
-                let position = at(17.5 * angle.cos(), 17.5 * angle.sin());
+            if compact {
+                let radius = px(17. * unit);
                 window.paint_quad(
                     fill(
-                        Bounds::new(position - point(bead, bead), size(bead * 2., bead * 2.)),
-                        tint,
+                        Bounds::new(
+                            center - point(radius, radius),
+                            size(radius * 2., radius * 2.),
+                        ),
+                        tint.opacity(0.14),
                     )
-                    .corner_radii(bead),
+                    .corner_radii(px(7. * unit)),
                 );
+            } else {
+                let phase = if animate { activity_phase() } else { 0.35 };
+                disc(window, 16. + 5. * phase, tint.opacity(0.14 * (1. - phase)));
+                disc(window, 15., tint.opacity(0.18));
+                if matches!(mark, Mark::Send | Mark::Receive) {
+                    let direction = if matches!(mark, Mark::Receive) {
+                        -1.
+                    } else {
+                        1.
+                    };
+                    let angle = phase * std::f32::consts::TAU * direction;
+                    let bead = px(2.1 * unit);
+                    let position = at(17.5 * angle.cos(), 17.5 * angle.sin());
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(position - point(bead, bead), size(bead * 2., bead * 2.)),
+                            tint,
+                        )
+                        .corner_radii(bead),
+                    );
+                }
             }
             let mut glyph = PathBuilder::stroke(px(1.7 * unit));
             let mut stroke = |points: &[(f32, f32)]| {
@@ -571,7 +598,7 @@ fn status_glyph(
                     }
                 }
             };
-            if light {
+            if compact {
                 // The compact theme's cat face frames the live direction or outcome.
                 stroke(&[
                     (-10., 2.),
@@ -587,7 +614,7 @@ fn status_glyph(
                     (-10., 2.),
                 ]);
             }
-            let y = if light { 2. } else { 0. };
+            let y = if compact { 2. } else { 0. };
             match mark {
                 Mark::Send | Mark::Receive => {
                     let direction = if matches!(mark, Mark::Send) { -1. } else { 1. };
@@ -597,7 +624,7 @@ fn status_glyph(
                         (0., y + 4.5 * direction),
                         (4., y + 0.5 * direction),
                     ]);
-                    if !light {
+                    if !compact {
                         stroke(&[
                             (-7., -4. * direction),
                             (-7., -8. * direction),

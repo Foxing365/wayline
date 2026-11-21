@@ -18,7 +18,7 @@ unicode-segmentation = "1"
 raw-window-handle = "0.6"
 resvg = { version = "0.45.1", default-features = false }
 windows-core = "0.62"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation", "Win32_Security", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock",

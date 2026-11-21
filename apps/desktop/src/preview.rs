@@ -1,8 +1,15 @@
 //! Bounded shell thumbnails/icons, extracted off the GPUI thread.
 use anyhow::{Result, ensure};
 use gpui::RenderImage;
-use image::{Frame, RgbaImage};
-use std::{mem::size_of, path::Path, sync::Arc};
+use image::{Frame, ImageFormat, ImageReader, Limits, RgbaImage};
+use std::{
+    fs::{self, OpenOptions},
+    io::{Cursor, Read},
+    mem::size_of,
+    os::windows::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use windows::{
     Win32::{Foundation::SIZE, Graphics::Gdi::*, UI::Shell::*},
     core::HSTRING,
@@ -10,6 +17,11 @@ use windows::{
 
 pub const MAX_PREVIEWS: usize = 4;
 const PREVIEW_PIXELS: i32 = 96;
+const SHARE_PREVIEW_PIXELS: u32 = 480;
+const SHARE_ICON_BYTES: usize = 4 * 1024 * 1024;
+const SHARE_FILE_BYTES: u64 = 24 * 1024 * 1024;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
@@ -87,6 +99,86 @@ pub fn load(path: &Path) -> Result<Arc<RenderImage>> {
     }
 }
 
+/// A small raster preview from a received image or the sender's inline icon.
+/// Untrusted shares are decoded in memory without asking the shell for an icon.
+pub fn share_image(icon: Option<&[u8]>, files: &[PathBuf]) -> Option<Arc<RenderImage>> {
+    files
+        .iter()
+        .filter(|path| FileKind::for_path(path) == FileKind::Image)
+        .take(MAX_PREVIEWS)
+        .find_map(|path| share_file_image(path))
+        .or_else(|| {
+            let icon = icon.filter(|bytes| bytes.len() <= SHARE_ICON_BYTES)?;
+            decode_share_image(icon, 2048, 24 * 1024 * 1024)
+        })
+}
+
+fn share_file_image(path: &Path) -> Option<Arc<RenderImage>> {
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > SHARE_FILE_BYTES
+    {
+        return None;
+    }
+    let mut encoded = vec![0; metadata.len() as usize];
+    file.read_exact(&mut encoded).ok()?;
+    decode_share_image(&encoded, 8192, 64 * 1024 * 1024)
+}
+
+fn decode_share_image(
+    encoded: &[u8],
+    max_dimension: u32,
+    max_alloc: u64,
+) -> Option<Arc<RenderImage>> {
+    let mut reader = ImageReader::new(Cursor::new(encoded))
+        .with_guessed_format()
+        .ok()?;
+    if !matches!(
+        reader.format(),
+        Some(
+            ImageFormat::Png
+                | ImageFormat::Jpeg
+                | ImageFormat::Tiff
+                | ImageFormat::WebP
+                | ImageFormat::Gif
+                | ImageFormat::Bmp
+        )
+    ) {
+        return None;
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
+    limits.max_alloc = Some(max_alloc);
+    reader.limits(limits);
+    let mut image = reader.decode().ok()?;
+    if image.width() == 0 || image.height() == 0 {
+        return None;
+    }
+    if image.width() > SHARE_PREVIEW_PIXELS || image.height() > SHARE_PREVIEW_PIXELS {
+        image = image.thumbnail(SHARE_PREVIEW_PIXELS, SHARE_PREVIEW_PIXELS);
+    }
+    let mut buffer = image.into_rgba8();
+    // GPUI expects straight-alpha BGRA bytes inside its RgbaImage storage.
+    for pixel in buffer.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Some(render_image(buffer))
+}
+
+fn render_image(buffer: RgbaImage) -> Arc<RenderImage> {
+    Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
+}
+
 struct Bitmap(HBITMAP);
 impl Drop for Bitmap {
     fn drop(&mut self) {
@@ -151,7 +243,7 @@ fn bitmap_image(bitmap: &Bitmap) -> Result<Arc<RenderImage>> {
         // The shell returns BGRA; GPUI RenderImage also expects BGRA, despite
         // using image::RgbaImage as its underlying buffer container.
         let buffer = RgbaImage::from_raw(width as u32, height, pixels).unwrap();
-        Ok(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+        Ok(render_image(buffer))
     }
 }
 
@@ -174,6 +266,61 @@ fn normalize_alpha(pixels: &mut [u8], has_alpha: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_preview_prefers_actual_raster_content_and_falls_back_to_the_offer() {
+        let directory = tempfile::tempdir().unwrap();
+        let photo = directory.path().join("screenshot.PNG");
+        RgbaImage::from_pixel(3, 2, image::Rgba([230, 60, 22, 240]))
+            .save(&photo)
+            .unwrap();
+        let mut icon = Cursor::new(Vec::new());
+        RgbaImage::from_pixel(1, 1, image::Rgba([20, 100, 200, 255]))
+            .write_to(&mut icon, ImageFormat::Png)
+            .unwrap();
+        let icon = icon.into_inner();
+        assert_eq!(
+            &share_image(Some(&icon), &[photo])
+                .unwrap()
+                .as_bytes(0)
+                .unwrap()[..4],
+            &[22, 60, 230, 240]
+        );
+
+        let renamed = directory.path().join("document.jpg");
+        fs::write(&renamed, b"plain text").unwrap();
+        assert!(share_image(None, std::slice::from_ref(&renamed)).is_none());
+        assert_eq!(
+            share_image(Some(&icon), &[renamed])
+                .unwrap()
+                .as_bytes(0)
+                .unwrap(),
+            &[200, 100, 20, 255]
+        );
+    }
+
+    #[test]
+    fn share_preview_accepts_jpeg_and_tiff_icons_and_enforces_dimension_limits() {
+        for format in [ImageFormat::Jpeg, ImageFormat::Tiff] {
+            let mut icon = Cursor::new(Vec::new());
+            image::RgbImage::from_pixel(5, 3, image::Rgb([20, 40, 60]))
+                .write_to(&mut icon, format)
+                .unwrap();
+            assert_eq!(
+                share_image(Some(icon.get_ref()), &[])
+                    .unwrap()
+                    .as_bytes(0)
+                    .unwrap()
+                    .len(),
+                5 * 3 * 4
+            );
+        }
+        let mut too_wide = Cursor::new(Vec::new());
+        RgbaImage::new(2049, 1)
+            .write_to(&mut too_wide, ImageFormat::Png)
+            .unwrap();
+        assert!(share_image(Some(too_wide.get_ref()), &[]).is_none());
+    }
     #[test]
     fn windows_shell_extracts_a_real_thumbnail_and_document_icon() {
         let directory = tempfile::tempdir().unwrap();

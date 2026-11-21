@@ -77,10 +77,12 @@ Before updating, finish transfers, quit Wayline from the tray, and close CLI com
   share the device name, identity and save directory.
 - On the first file offer, choose to accept files from your device automatically. Wayline remembers
   the TLS certificate proved during that connection. Revoke it under Trusted devices in Settings.
-  New certificates, offers without a certificate, and web links require approval.
-- Receive results can appear in a separate, dismissible desktop notification window. Settings lets
-  you enable or disable it, choose among six screen positions, and set a 3–30 second dismissal delay.
-- Both themes display transferred and total bytes, smoothed speed, elapsed time, and progress during
+  Open shared HTTP(S) links after approval or grant link-opening permission to a trusted certificate.
+- Completion appears in the sharing card for 10 seconds. Incoming shares can show a picture and
+  copyable original text. Receive connection errors can use the desktop notification settings.
+- Choose Wayline, NekoDrop Light, or NekoDrop Dark in Settings and refresh the interface to apply it.
+  Launch at sign-in starts background receiving after a Windows sign-in.
+- The transfer cards display transferred and total bytes, smoothed speed, elapsed time, and progress during
   sending and receiving. Animations follow Windows animation settings. Timing includes final
   confirmation and starts when data transfer begins.
 - The history icon at the top of the sharing card opens Recent transfers with up to 200 results.

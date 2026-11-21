@@ -47,6 +47,7 @@ pub fn can_auto_accept(transfer: &IncomingTransfer, trusted: &[TrustedSender]) -
         sender.certificate_sha256 == pin
             && if transfer.urls.is_empty() {
                 !transfer.files.is_empty()
+                    || (transfer.share_text.is_some() && sender.open_web_links)
             } else {
                 sender.open_web_links
             }
@@ -97,7 +98,7 @@ pub struct Transfer {
     pub channel: Option<u16>,
     pub format: Option<TransferFormat>,
     automatically_accepted: bool,
-    web_links_opened: bool,
+    pub(super) web_links_opened: bool,
     approved_web_links: Vec<String>,
     sender_certificate_sha256: Option<[u8; 32]>,
 }
@@ -485,13 +486,20 @@ impl Model {
                         &active.save_dir.display().to_string(),
                     )
                 } else {
-                    format!("{} · {}", active.sender, language.shared_links())
+                    let label = if active.approved_web_links.is_empty() {
+                        language.strings().receive_shared_text
+                    } else {
+                        language.shared_links()
+                    };
+                    format!("{} · {label}", active.sender)
                 };
-                let details = if transfer.urls.is_empty() {
-                    message.clone()
-                } else {
-                    format!("{message}\n{}", active.file_names.join("\n"))
-                };
+                let details = transfer.share_text.clone().unwrap_or_else(|| {
+                    if transfer.urls.is_empty() {
+                        message.clone()
+                    } else {
+                        format!("{message}\n{}", active.file_names.join("\n"))
+                    }
+                });
                 self.finished_elapsed = active.elapsed(now);
                 self.active = None;
                 self.reset_speed();
@@ -503,7 +511,15 @@ impl Model {
                 error,
             } if transfer_id == &active.id => {
                 let text = crate::i18n::current().strings();
+                let web_opened_without_attachment = active.web_links_opened
+                    && active.phase == Phase::Waiting
+                    && matches!(
+                        kind,
+                        wayline_core::TransferFailureKind::Interrupted
+                            | wayline_core::TransferFailureKind::Connection
+                    );
                 let message = match kind {
+                    _ if web_opened_without_attachment => text.receive_web_attachment_missing,
                     wayline_core::TransferFailureKind::Cancelled => text.receive_cancelled,
                     wayline_core::TransferFailureKind::Declined => text.receive_declined_notice,
                     wayline_core::TransferFailureKind::Interrupted => text.receive_interrupted,
@@ -872,8 +888,8 @@ fn run(
         let mut transfer = transfer.clone();
         let offered_links = transfer.urls.len();
         transfer.urls = web_links(&transfer.urls);
-        if transfer.files.is_empty() && transfer.urls.is_empty() {
-            log("incoming ask declined: no supported web links or files");
+        if transfer.files.is_empty() && transfer.urls.is_empty() && transfer.share_text.is_none() {
+            log("incoming ask declined: no displayable share item or file");
             return false;
         }
         log(&format!(
@@ -915,7 +931,7 @@ fn run(
                     transfer_id,
                     error: crate::i18n::current().strings().incoming_expired.into(),
                     kind: wayline_core::TransferFailureKind::Cancelled,
-                })
+                }, None)
                 .timestamped(),
             );
         }
@@ -932,6 +948,15 @@ fn run(
         for event in activity_rx {
             let at = Instant::now();
             let unix_ms = crate::history::unix_time_ms(std::time::SystemTime::now());
+            let image = match &event {
+                ReceiverEvent::WebLinksAccepted(transfer) => {
+                    crate::preview::share_image(transfer.icon.as_deref(), &[])
+                }
+                ReceiverEvent::Received { transfer, files } => {
+                    crate::preview::share_image(transfer.icon.as_deref(), files)
+                }
+                _ => None,
+            };
             match &event {
                 ReceiverEvent::Listening => {
                     log(&format!(
@@ -978,7 +1003,7 @@ fn run(
             }
             if events
                 .send(Event::Timestamped(
-                    Box::new(Event::ReceiverActivity(event)),
+                    Box::new(Event::ReceiverActivity(event, image)),
                     at,
                     unix_ms,
                 ))
@@ -1041,6 +1066,7 @@ mod tests {
             sender_model: None,
             files: vec![],
             urls: vec![],
+            share_text: None,
             icon: None,
             sender_record_data: None,
             sender_certificate_sha256: None,
@@ -1160,6 +1186,18 @@ mod tests {
             model
                 .links_on_completion(&event, std::slice::from_ref(&sender))
                 .is_empty()
+        );
+        assert!(model.apply(&ReceiverEvent::TransferFailed {
+            transfer_id: share.id.clone(),
+            error: "sender closed the connection".into(),
+            kind: wayline_core::TransferFailureKind::Interrupted,
+        }));
+        assert!(model.active.is_none());
+        assert_eq!(
+            model.notice.unwrap().message,
+            crate::i18n::current()
+                .strings()
+                .receive_web_attachment_missing
         );
         share.files.clear();
         assert!(can_auto_accept(&share, std::slice::from_ref(&sender)));

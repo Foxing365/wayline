@@ -499,6 +499,13 @@ impl Model {
         })
     }
 
+    pub fn send_completion_expired(&self, now: Instant, duration: Duration) -> bool {
+        self.phase == Phase::Complete
+            && self
+                .send_finished_at
+                .is_some_and(|(finished, _)| now.saturating_duration_since(finished) >= duration)
+    }
+
     pub fn current_channel(&self) -> Option<u16> {
         self.status
             .as_ref()

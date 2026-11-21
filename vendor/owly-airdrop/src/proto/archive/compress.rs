@@ -15,6 +15,10 @@ pub const DVZIP_PIECE: usize = 0x10000;
 pub enum Error {
     Gzip(&'static str),
     DvZip(&'static str),
+    DvZipChunkLength {
+        after_complete_chunk: bool,
+        reason: &'static str,
+    },
     Deflate(String),
 }
 
@@ -23,6 +27,17 @@ impl fmt::Display for Error {
         match self {
             Error::Gzip(what) => write!(f, "bad gzip stream: {what}"),
             Error::DvZip(what) => write!(f, "bad DVZip stream: {what}"),
+            Error::DvZipChunkLength {
+                after_complete_chunk,
+                reason,
+            } => {
+                let stage = if *after_complete_chunk {
+                    "a later"
+                } else {
+                    "the first"
+                };
+                write!(f, "bad DVZip stream: {reason} in {stage} chunk header")
+            }
             Error::Deflate(e) => write!(f, "bad deflate data: {e}"),
         }
     }
@@ -267,6 +282,7 @@ fn gzip_header_len(buf: &[u8]) -> Result<Option<usize>, Error> {
 #[derive(Debug)]
 pub struct DvZipDecoder {
     max_chunk: u32,
+    completed_chunk: bool,
     state: DvState,
     len: Vec<u8>,
     inflate: Decompress,
@@ -286,6 +302,7 @@ impl DvZipDecoder {
     pub fn new(max_chunk: u32) -> Self {
         DvZipDecoder {
             max_chunk,
+            completed_chunk: false,
             state: DvState::Length,
             len: Vec::with_capacity(4),
             inflate: Decompress::new(true),
@@ -314,11 +331,26 @@ impl DvZipDecoder {
                     let raw = u32::from_be_bytes(self.len[..].try_into().unwrap());
                     self.len.clear();
                     let len = raw & !STORED;
+                    let stored = raw & STORED != 0;
                     // DVZ-3: no empty chunks, none past the limit.
-                    if len == 0 || len > self.max_chunk {
-                        return Err(Error::DvZip("bad chunk length"));
+                    let invalid_length = if len == 0 {
+                        Some("zero chunk length")
+                    } else if len > self.max_chunk {
+                        Some(if stored {
+                            "stored chunk length exceeds the configured limit"
+                        } else {
+                            "compressed chunk length exceeds the configured limit"
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = invalid_length {
+                        return Err(Error::DvZipChunkLength {
+                            after_complete_chunk: self.completed_chunk,
+                            reason,
+                        });
                     }
-                    if raw & STORED != 0 {
+                    if stored {
                         self.state = DvState::Stored { left: len as u64 };
                     } else {
                         self.state = DvState::Chunk { left: len as u64 };
@@ -331,6 +363,7 @@ impl DvZipDecoder {
                     consumed += n;
                     let left = left - n as u64;
                     self.state = if left == 0 {
+                        self.completed_chunk = true;
                         DvState::Length
                     } else {
                         DvState::Stored { left }
@@ -361,6 +394,7 @@ impl DvZipDecoder {
                             return Err(Error::DvZip("data after the chunk's zlib stream"));
                         }
                         self.state = DvState::Length;
+                        self.completed_chunk = true;
                         if produced > 0 {
                             return Ok(Progress { consumed, produced });
                         }
@@ -625,7 +659,19 @@ pub(crate) mod tests {
         assert!(decoder.decode(&stored, &mut [0; 100]).is_err());
         assert_eq!(
             decode_all(Compressor::DvZip, &[0x80, 0, 0, 0]),
-            Err(Error::DvZip("bad chunk length"))
+            Err(Error::DvZipChunkLength {
+                after_complete_chunk: false,
+                reason: "zero chunk length",
+            })
+        );
+        let mut later = good;
+        later.extend((1u32 << 30).to_be_bytes());
+        assert_eq!(
+            decode_all(Compressor::DvZip, &later),
+            Err(Error::DvZipChunkLength {
+                after_complete_chunk: true,
+                reason: "compressed chunk length exceeds the configured limit",
+            })
         );
 
         // Raw deflate, not zlib.
