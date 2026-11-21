@@ -2,19 +2,28 @@
 
 [简体中文](QUICKSTART.zh-CN.md)
 
-You need Windows 10/11 x64, a PC with Bluetooth LE advertising, an M5Stack Cardputer Adv or an 8 MiB ESP32-S3 / ESP32-C5 development board, and its USB data cable.
+Use Windows 10/11 x64 and a PC with Bluetooth LE advertising. To use the dedicated RTL8821CU USB adapter, follow the [adapter setup guide](RTL8821CU.zh-CN.md). To use an ESP32 backend, prepare the supported board, firmware package, and a USB data cable.
 
 ## Install and update
 
-Extract the Windows artifacts and start the desktop or service binaries manually while the Rust installer migration is in progress.
-Desktop opens as a normal user so Explorer drag-and-drop works. Firmware, flashing tools
-and runtime libraries are bundled; no development environment or runtime downloads are needed.
+Download the [Windows host package](https://github.com/Foxing365/wayline/releases/latest).
+Extract it and run `wayline-tools.exe release-verify .` from the extracted directory.
+Move the host files together into an administrator-managed folder such as `C:\Program Files\Wayline`.
+Configure the radio backend, then register the Windows service in an elevated PowerShell window.
 
-Before updating, finish transfers, quit Wayline from the tray, and close CLI commands.
-Automated offline installation is temporarily unavailable during the Rust installer migration.
-Received files, device name and identity settings are preserved.
+```powershell
+Set-Location "$env:ProgramFiles\Wayline"
+.\wayline-tools.exe service-install --binary (Join-Path $PWD.Path 'wayline-desktop.exe')
+```
+
+Start `wayline-desktop.exe` as a normal user so Explorer drag-and-drop works.
+
+Before updating program files, finish transfers, quit Wayline from the tray, and close CLI commands.
+Stop the Wayline service before replacing a running service binary. Device and receive settings are stored separately from the program files.
 
 ## Initialize the Board
+
+For the ESP32 backend, prepare the board image and flashing tools as described in the [packaging guide](PACKAGING.md).
 
 1. Connect the board with a data cable and open Device firmware in Settings.
 2. Select the serial port and matching profile: Cardputer Adv, ESP32-S3 Headless UART0 / Native USB, or ESP32-C5 UART0 / Native USB. UART0 and Native USB profiles must match the USB interface connected to the PC. S3 Headless profiles require 8 MiB flash.

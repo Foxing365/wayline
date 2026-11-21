@@ -17,8 +17,8 @@ Windows 版 omdrop、SwooshDrop 和 HowlDrop 也提供了资料。前者用 ESP3
 
 1. Windows 应枚举到一个 `USB\VID_0BDA&PID_C820&MI_02`。这是 Wi-Fi 接口。电脑的蓝牙用于 AirDrop 发现。
 2. 在管理员权限的 [Zadig](https://zadig.akeo.ie/) 中打开 **Options → List All Devices**，核对 USB ID 为 **0BDA C820、Interface 2 (MI_02)**，将这一接口的驱动替换为 **WinUSB**。详见 [DropBridge 绑定与回退说明](https://github.com/ndpyzwy-0w0/DropBridge/blob/main/docs/BINDING_RUNBOOK.md)。
-3. 构建 Windows 主机程序。在 `wayline-bridge.exe` 旁放置校验过的 `wintun.dll`，并在同目录的 `usb-radio\` 安放 [DropBridge v0.1.0-internal.1](https://github.com/ndpyzwy-0w0/DropBridge/releases/tag/v0.1.0-internal.1) 包内 `backend\airbridge_radio.exe` 和 `backend\libusb-1.0.dll`。无线程序的 SHA-256 应为 `3805ec83369efdcfadbdc1a2680cda41efaecff76b0fa0ae522ebe27a7641b9f`。无线程序需要 [Microsoft Visual C++ v14 x64 运行库](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist#latest-supported-redistributable-version)，许可证见 DropBridge 原包。
-4. 停止 Wayline 后，在 `%ProgramData%\wayline\config.json` 中设置以下字段，保留已有的其他设置，再用项目的服务安装入口注册此构建。服务目录应位于仅管理员可写的目录。前台诊断可在管理员终端运行 `wayline-bridge.exe --rtl8821cu --channel 149`，用 Ctrl+C 停止。
+3. [下载 Windows 主机包](https://github.com/Foxing365/wayline/releases/latest)或从源码构建。在 `wayline-bridge.exe` 旁放置校验过的 `wintun.dll`，并在同目录的 `usb-radio\` 安放 [DropBridge v0.1.0-internal.1](https://github.com/ndpyzwy-0w0/DropBridge/releases/tag/v0.1.0-internal.1) 包内 `backend\airbridge_radio.exe` 和 `backend\libusb-1.0.dll`。无线程序的 SHA-256 应为 `3805ec83369efdcfadbdc1a2680cda41efaecff76b0fa0ae522ebe27a7641b9f`。无线程序需要 [Microsoft Visual C++ v14 x64 运行库](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist#latest-supported-redistributable-version)，许可证见 DropBridge 原包。
+4. 停止 Wayline 后，在 `%ProgramData%\wayline\config.json` 中设置以下字段，保留已有的其他设置，再按[快速开始](QUICKSTART.zh-CN.md#安装与更新)注册 Wayline 服务。服务目录应位于仅管理员可写的目录。前台诊断可在管理员终端运行 `wayline-bridge.exe --rtl8821cu --channel 149`，用 Ctrl+C 停止。
 
 ```json
 {
@@ -35,7 +35,7 @@ Windows 版 omdrop、SwooshDrop 和 HowlDrop 也提供了资料。前者用 ESP3
 
 AWDL 用信道 6（2.4 GHz）、44 和 149（5 GHz）进行发现和同步。Apple 设备可按地区及 Wi-Fi 状态调整监听时隙，也可以在双方有共同可用时隙的其他信道上传数据。目前 RTL8821CU 固定监听所选信道。若手机在 44 上一直未出现，可切回 149。附近 Wi-Fi 扫描只能判断接入点和部分接入点报告的信道占用，发现是否可用要以对端响应为准。[AWDL 信道和同步机制](https://arxiv.org/abs/1808.03156)
 
-在桌面设置中可开启「登录后后台启动 Wayline」。Windows 登录后，Wayline 会在托盘启动服务和接收端。稍后打开分享窗口可复用已初始化的无线进程；从托盘退出仍会按原方式关闭按需服务。
+在桌面设置中可开启「开机自启」。Windows 登录后，Wayline 会在托盘启动服务和接收端。稍后打开分享窗口可复用已初始化的无线进程；从托盘退出仍会按原方式关闭按需服务。
 
 5 GHz 表示无线频段。这个后端目前使用 20 MHz 信道和 12 Mbit/s 的基本发帧速率，实际传输还受空口调度、确认、重传和 USB 写入速度影响。当前组合在信道 149 已完成双向文件传输。RTL8821CU 在 −75 dBm 以上接纳新设备的广播，并在桥接日志记录已接纳设备的信号强度。测速度时可保持两端相邻、使用同一文件和信道，并记录传输历史里的实际字节和耗时。
 

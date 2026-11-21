@@ -2,15 +2,22 @@
 
 [English](QUICKSTART.md)
 
-需要 Windows 10/11 x64、支持蓝牙 LE 广播的电脑、M5Stack Cardputer Adv 或 8 MiB ESP32-S3 / ESP32-C5 开发板，以及对应 USB 数据线。
+需要 Windows 10/11 x64 和支持蓝牙 LE 广播的电脑。用专用 RTL8821CU USB 网卡时按[网卡指南](RTL8821CU.zh-CN.md)准备。用 ESP32 时准备兼容开发板、对应固件和 USB 数据线。
 
 ## 安装与更新
 
-解压 Windows 构建产物，迁移期间手动启动桌面或服务程序。自动离线安装器正在迁移到 Rust。
+从 [GitHub Releases](https://github.com/Foxing365/wayline/releases/latest) 下载并解压 Windows 主机包。在解压目录运行 `wayline-tools.exe release-verify .` 校验文件。把主机程序放在同一个由管理员管理的程序目录，例如 `C:\Program Files\Wayline`。准备好无线后端后，打开管理员 PowerShell 注册服务。
 
-更新前完成传输，从托盘退出 Wayline，并结束 CLI 命令。安装器校验全部文件后替换程序，旧程序保留为备份；接收文件、名称和身份配置不受影响。
+```powershell
+Set-Location "$env:ProgramFiles\Wayline"
+.\wayline-tools.exe service-install --binary (Join-Path $PWD.Path 'wayline-desktop.exe')
+```
+
+用普通权限启动 `wayline-desktop.exe`，以便使用资源管理器拖放。更新前先完成传输，从托盘退出 Wayline 并结束 CLI 命令。替换服务程序前，先停止 Wayline 服务。接收文件和设备设置与程序目录分开保存。
 
 ## 初始化开发板
+
+使用 ESP32 后端时，先按[打包指南](PACKAGING.zh-CN.md)准备固件和烧录工具。
 
 1. 用数据线连接设备，打开「设置 → 设备固件」。
 2. 选择对应串口和固件 profile：Cardputer Adv、ESP32-S3 Headless UART0 / Native USB，或 ESP32-C5 UART0 / Native USB。UART0 与 Native USB 必须匹配实际接入电脑的 USB 接口类型。S3 Headless profile 固定适用于 8 MiB Flash。

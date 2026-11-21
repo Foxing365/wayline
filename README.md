@@ -1,193 +1,40 @@
 # Wayline
 
-For a dedicated Realtek RTL8821CU USB radio (`0BDA:C820`), see the [optional USB setup](docs/RTL8821CU.zh-CN.md). Sending and receiving have been tested at 20 MHz. Monitor widths of 40 and 80 MHz on 5 GHz are experimental.
+Wayline brings AirDrop file, photo, and folder transfers to Windows. A dedicated RTL8821CU USB adapter handles AirDrop while a separate Wi-Fi adapter stays connected to your usual network.
 
-AirDrop between Windows and Apple devices through a USB-attached ESP32. The desktop app,
-service, AirDrop core and firmware use Rust. AWDL and AirDrop use the pinned Owly crates.
+**[Download the latest Windows x64 release](https://github.com/Foxing365/wayline/releases/latest)** · [简体中文](README.zh-CN.md)
 
-The default Rust AWDL backend based on Owly 0.4.0 is included in the Windows host build.
-It uses the existing ESP32 firmware protocol and Wintun and awaits device interoperability testing.
-See the [development guide](docs/DEVELOPMENT.md#rust-awdl-backend).
+## Get started
 
-Supports Windows 10/11 x64 and M5Stack Cardputer Adv (ESP32-S3, native USB Serial/JTAG,
-2.4 GHz channel 6). The PC needs Bluetooth LE advertising; ESP32 handles Wi-Fi traffic.
+Use Windows 10 or 11 x64 with Bluetooth LE advertising. The tested USB Wi-Fi interface has hardware ID `USB\VID_0BDA&PID_C820&MI_02`. Check the ID in Device Manager before setting it up.
 
-A headless firmware build is available for ESP32-S3 and ESP32-C5 boards using UART0 USB-UART
-or native USB Serial/JTAG. Desktop packages can include these profiles and select the matching link.
-It switches at runtime between channel 6 (2.4 GHz) and channels 44 and 149 (5 GHz) on host
-request, and its raw transmit rate is fixed to HE20/MCS0. C5 AirDrop interoperability and
-throughput still need device validation. See the
-[development guide](docs/DEVELOPMENT.md#headless-esp32-c5-build) for building and flashing it.
+1. Download and extract the portable Windows x64 ZIP. Check its SHA-256 against the release page and open the included installation and rollback guide, `安装和回退.md`.
+2. Install WinUSB on **only** the USB adapter’s `MI_02` Wi-Fi interface. Obtain the pinned DropBridge radio helper and libusb DLL separately, then put them in the `usb-radio` directory beside the Wayline bridge. The USB guide covers file verification, the required Microsoft Visual C++ x64 runtime, and driver rollback. [RTL8821CU setup and rollback](docs/RTL8821CU.zh-CN.md)
+3. Follow the package guide to register the Wayline Windows service as an administrator. Start `wayline-desktop.exe` as your normal user. Wait for **RTL8821CU (USB)** to be ready.
+4. Enable Bluetooth on the PC and turn on Wi-Fi and Bluetooth on the iPhone. Set iPhone AirDrop to **Everyone for 10 Minutes**. Send a small file from the iPhone’s Share menu or select a file and recipient in Wayline.
 
-S3 profiles use an 8 MiB image and partition layout on both 8 MiB and 16 MiB boards;
-the extra capacity is unused, and 4 MiB boards are not supported by these profiles.
+M5Stack Cardputer Adv and compatible ESP32-S3/C5 boards are an alternative radio path. Prepare the matching firmware and flashing tools separately, then select the port and profile under **Settings → Device firmware**. [ESP32 quick start](docs/QUICKSTART.md) · [Firmware packaging](docs/PACKAGING.md)
 
-[中文说明](README.zh-CN.md) · [Quick start](docs/QUICKSTART.md) · [Development guide](docs/DEVELOPMENT.md)
+## Daily use
 
-[![Watch on YouTube](https://img.youtube.com/vi/8IJywijJMYU/hqdefault.jpg)](https://www.youtube.com/watch?v=8IJywijJMYU)
+- **Send from Explorer or Wayline.** Drag and drop, use the classic right-click menu, or choose **Send to → Wayline AirDrop**. An optional Windows 11 first-level menu uses a separately installed, signed extension. [Explorer extension setup](docs/EXPLORER.zh-CN.md)
+- **Receive in one window.** The sharing card slides in from the tray without taking focus and shows progress, speed, elapsed time, and **Cancel**. Completion stays in the same card for **10 seconds by default**, adjustable through the 3–30 second options in Settings.
+- **Handle files and text.** Preview images and open, save a copy of, copy, or move received files. The toolbar folder button opens the receive directory, which defaults to `Downloads\Wayline`. Text over 200 characters previews the first 200, with the full text available to copy.
+- **Choose what to trust.** Accept each offer or trust the sender’s verified certificate for future file offers. Browser opening has its own permission. A TXT share from a sender with that permission opens automatically when it contains fewer than 120 characters and exactly one distinct HTTP(S) URL.
+- **Make it yours.** Choose the original Wayline, NekoDrop Light, or NekoDrop Dark layout. Enable launch at Windows sign-in for background receiving. Recent transfers shows the result and details of each transfer.
 
-## Engineering
+## Tested and supported
 
-- **Native desktop and Windows integration**: GPUI transfer UI, tray, Explorer context menus
-  and drag-and-drop, with an unelevated UI separated from the privileged service.
-- **Rust transfer core**: discovery, TLS/HTTP and CPIO/DVZip codecs shared by desktop and CLI,
-  with streaming, archive validation, final confirmation, cancellation and failure cleanup.
-- **Service and firmware maintenance**: named pipes and session leases coordinate clients,
-  radio lifecycle and exclusive serial access. Flashing isolates wireless work and verifies
-  images and device startup before restoring readiness.
-- **Embedded application**: Rust ESP32-S3 application and three-language Cardputer UI,
-  a shared allocation-free CRC/COBS protocol, C/C++ hardware drivers and simultaneous
-  send/receive feedback. A headless ESP32-C5 profile reuses the same protocol layer.
-- **Builds and verification**: pinned Owly sources, adaptations and flashing tools, verified
-  firmware and offline packages, host regression tests, protocol tests and UI previews.
+- **Channel 149.** The `0BDA:C820 MI_02` setup completed transfers with an iPhone in both directions at 20 MHz. Wayline received one live batch of **61 photos** at 40 MHz. A separate TLS regression verified an incoming directory containing **4,100 files**. [Regression test](crates/wayline-core/tests/airdrop_migration.rs)
+- **40 MHz and 80 MHz.** These 5 GHz monitor widths are experimental. DropBridge observed degraded performance over time at 40 MHz and found no iPhone discovery after correcting the 80 MHz center channel. If discovery or transfers are unreliable, try 20 MHz. [40 MHz results](https://github.com/ndpyzwy-0w0/DropBridge/blob/main/docs/STATUS.md#4-关键配置由监管程序固定) · [80 MHz test](https://github.com/ndpyzwy-0w0/DropBridge/blob/main/evidence/airdrop-userspace-width80-attempt.txt)
+- **Contacts Only.** The regular setup uses **Everyone for 10 Minutes**. Sending to a Contacts Only device using a separately obtained AirDrop identity is experimental and needs validation with your devices. [Identity setup](docs/QUICKSTART.md#send-to-a-contacts-only-device)
 
-## Interface and transfer demos
+## Source and credits
 
-Demos use the actual firmware renderer with simulated transfers. Phone and desktop panels
-are illustrative.
+[Build setup](docs/SETUP.md) · [Development and CLI](docs/DEVELOPMENT.md) · [Packaging](docs/PACKAGING.md)
 
-### ESP32 interface
+Thanks to [Owly](https://github.com/t4t5/owly), [OWL](https://github.com/seemoo-lab/owl), [jedbillyb/owl](https://github.com/jedbillyb/owl), [omdrop-owl-windows](https://github.com/dantdarealguy/omdrop-owl-windows), [omdrop](https://github.com/netmojo-systems/omdrop-plugin), [omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl), [OpenDrop](https://github.com/seemoo-lab/opendrop), and [Windfall](https://github.com/UvejsGj/Windfall) for the radio and transfer foundations. The USB setup uses the [DropBridge](https://github.com/ndpyzwy-0w0/DropBridge) helper. [WinAWDL](https://github.com/raph559/winawdl) and [NekoDrop](https://github.com/zheznanohana/nekodrop) informed the Windows work.
 
-![Cardputer Adv interface demo](docs/assets/cardputer-demo.gif)
+The desktop uses [GPUI](https://gpui.rs/) and [Wintun](https://www.wintun.net/). The ESP32 builds use [ESP-IDF](https://github.com/espressif/esp-idf), [esptool](https://github.com/espressif/esptool), [espup](https://github.com/esp-rs/espup), [M5Unified](https://github.com/m5stack/M5Unified), [M5GFX](https://github.com/m5stack/M5GFX), and [Noto CJK](https://github.com/notofonts/noto-cjk). [Firmware font license](firmware/assets/OFL.txt)
 
-Status, sharing guide, preferences, sound settings and three-language switching.
-
-### Apple → Windows
-
-![AirDrop through ESP32 to Wayline](docs/assets/airdrop-esp32-wayline.gif)
-
-### Windows → Apple
-
-![Wayline through ESP32 to iPhone](docs/assets/wayline-esp32-airdrop.gif)
-
-## Install and use
-
-1. Extract the Windows x64 artifacts and start the desktop/service binaries manually; the Rust installer migration is in progress.
-2. Connect Cardputer Adv with a data cable. Open Device firmware in Settings, select its port and board,
-   then install or update the firmware.
-3. Enable Bluetooth on the PC. Enable Wi-Fi and Bluetooth on iPhone and set
-   AirDrop to Everyone for 10 Minutes.
-4. Drop files into Wayline and select a recipient. Accept incoming transfers in Wayline.
-
-The package includes firmware, flashing tools and runtime libraries; no development tools
-or runtime downloads are needed. Run desktop without elevation so Explorer drag-and-drop works.
-Before updating, finish transfers, quit Wayline from the tray, and close CLI commands.
-
-- Received files default to Downloads/Wayline; change the folder in Settings. Desktop and CLI
-  share the device name, identity and save directory.
-- On the first file offer, choose to accept files from your device automatically. Wayline remembers
-  the TLS certificate proved during that connection. Revoke it under Trusted devices in Settings.
-  Open shared HTTP(S) links after approval or grant link-opening permission to a trusted certificate.
-- The sharing card shows live file receive progress and opens from the tray without taking focus.
-  Use Cancel beside the transfer details to stop an active receive.
-  Completion stays in the card for the duration selected in Settings (10 seconds by default), with a picture preview and copyable text when
-  available. A card shown for a background receive returns to the tray afterward.
-- Choose Wayline, NekoDrop Light, or NekoDrop Dark in Settings and refresh the interface to apply it.
-  Launch at sign-in starts background receiving after a Windows sign-in.
-- A TXT share under 120 characters from a device with link permission opens its single HTTP(S) link.
-  Longer TXT shares preview up to 200 characters with the full text available to copy.
-  The result card can open, save, copy, or move received files. The toolbar folder icon opens the receive folder.
-- The transfer cards display transferred and total bytes, smoothed speed, elapsed time, and progress during
-  sending and receiving. Animations follow Windows animation settings. Timing includes final
-  confirmation and starts when data transfer begins.
-- The history icon at the top of the sharing card opens Recent transfers with up to 200 results.
-  The compact list shows device, outcome, file overview, size and time. Details shows the complete
-  file list, transferred bytes, duration, average speed, radio band/channel and transfer mode,
-  and each file's location. Records retain sent source paths and successful receive
-  paths without file contents; older records may have no file details.
-- Delete individual records or clear the history with confirmation every time. Also delete files
-  and Remember this option are initially unchecked. Deleting files permanently removes the sent
-  source files and received files in those records. Remembering updates the file-deletion default,
-  also available in Settings; future deletions still require confirmation.
-- Overflowing pages, lists and long text show a persistent proportional scrollbar, with fixed actions kept visible.
-- Settings shows the identified board and supported radio channels: ESP32-S3 supports 2.4 GHz
-  channel 6; ESP32-C5 also supports 5 GHz channels 44 and 149. CLI commands are `radio status`
-  and `radio set`; see the [development guide](docs/DEVELOPMENT.md#cli-and-radio-diagnostics).
-- The desktop language dropdown supports Simplified Chinese, Traditional Chinese, English,
-  Japanese, Korean, French, German and Spanish. The choice is saved locally and updates the
-  tray, system dialogs and Explorer entries.
-- Uploading to 100% still requires receiver confirmation. Delivered means sending succeeded.
-- Pin keeps the sharing card visible when it loses focus. Settings controls drag activation
-  and opening the received file's location after success; both are enabled by default.
-  Preference errors are shown on the card, and failed saves keep the previous value.
-- × or Esc hides the card while receiving continues. Tray Quit or `Ctrl+Q` ends this client's
-  tasks; the service stays active while another CLI session uses it.
-
-First installation replaces the board's program and partition layout. Preserving settings
-requires recognizable Wayline firmware and an identical layout. See the
-[quick start](docs/QUICKSTART.md) for board controls and troubleshooting.
-CLI arguments, JSON output and exit codes are in the
-[development guide](docs/DEVELOPMENT.md#cli-and-radio-diagnostics).
-
-## Build from source
-
-Follow the [Windows / Linux setup](docs/SETUP.md) to install native tools, then run from the
-repository root:
-
-```sh
-cargo run --locked -p wayline-tools -- host-build --release
-```
-
-This builds the portable host crates. The Windows-only offline package, verified Wintun,
-firmware bundle and service installation remain documented separately in the
-[development guide](docs/DEVELOPMENT.md).
-
-Use the Cargo commands in [unified packaging](docs/PACKAGING.md) to include firmware and flashing tools.
-
-The cross-platform terminal interface provides board selection, host Debug/Release builds,
-packaging, verification and live logs through the same Rust commands:
-
-```sh
-cargo run --locked -p wayline-tools -- tui
-```
-
-Press `L` in the TUI to switch Chinese / English, or add `--lang en-US` to start in English.
-
-Omit `--release` for Debug builds. Host tests do not need ESP-IDF; flashable firmware needs
-ESP-IDF and Rust `esp`, checked with `cargo run --locked -p wayline-tools -- firmware-check`.
-Linux supports shared-library, CLI and firmware development; desktop, Windows services and
-the Wintun bridge are not ported.
-
-## Source layout
-
-| Path | Purpose |
-| --- | --- |
-| `apps/desktop`, `apps/cli` | GPUI desktop and CLI entry points |
-| `apps/bridge`, `crates/wayline-awdl` | Rust AWDL child, ESP32 serial and Wintun integration |
-| `vendor/owly-awdl`, `vendor/owly-airdrop` | Pinned AWDL and AirDrop protocol implementations |
-| `crates/wayline-service` | Service, radio lifecycle, sessions and maintenance |
-| `crates/wayline-core`, `crates/wayline-host`, `crates/wayline-flash` | Transfers, shared preferences and firmware operations |
-| `crates/wayline-tools` | Cross-platform Cargo build and test orchestration |
-| `crates/wayline-proto`, `crates/wayline-board`, `crates/wayline-radio`, `crates/wayline-transport` | Shared protocol, board feedback and transport adapters |
-| `firmware` | Independent Rust/ESP-IDF project; hardware interfaces in `firmware/components/radio` |
-| `scripts`, `assets/branding` | Categorized [asset generators and preview scripts](scripts/README.md), and [branding assets](assets/branding/README.md) |
-
-## Credits
-
-Thanks to the authors, maintainers and contributors of:
-
-- [omdrop-owl-windows](https://github.com/dantdmdarealguy/omdrop-owl-windows) (dantdmdarealguy):
-  implementation foundation for the Windows OWL port, Wintun integration and ESP32 radio bridge.
-- [owly](https://github.com/t4t5/owly) (t4t5): Linux radio backend and fixed-channel approach.
-- [omdrop](https://github.com/netmojo-systems/omdrop-plugin),
-  [omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl) (Brent Kearney and contributors)
-  and [OpenDrop](https://github.com/seemoo-lab/opendrop) (SEEMOO): AirDrop protocol and transfer references.
-- [OWL / Open Wireless Link](https://github.com/seemoo-lab/owl) (Milan Stute, SEEMOO / TU Darmstadt)
-  and [jedbillyb/owl](https://github.com/jedbillyb/owl): userspace AWDL implementation.
-- [Windfall](https://github.com/UvejsGj/Windfall) (UvejsGj): DVZip format research.
-- [GPUI](https://gpui.rs/) (Zed) and [Wintun](https://www.wintun.net/) (WireGuard):
-  desktop UI and virtual network interface.
-- [ESP-IDF](https://github.com/espressif/esp-idf), [esptool](https://github.com/espressif/esptool)
-  (Espressif), [espup](https://github.com/esp-rs/espup) (esp-rs),
-  [M5Unified](https://github.com/m5stack/M5Unified) and [M5GFX](https://github.com/m5stack/M5GFX)
-  (M5Stack): firmware tools and hardware support.
-- [Noto CJK](https://github.com/notofonts/noto-cjk): board fonts; see
-  [font-source.txt](firmware/assets/font-source.txt) and [OFL.txt](firmware/assets/OFL.txt).
-
-## Community links
-
-- [LINUX DO Community](https://linux.do/)
-
-## License
-
-See [LICENSE](LICENSE). Release packages include dependency licenses and notices.
+Wayline is distributed under [GPL-3.0-only](LICENSE). The release ZIP includes dependency licenses and notices.

@@ -1,127 +1,40 @@
 # Wayline
 
-通过 USB 连接的 ESP32，在 Windows 与 Apple 设备之间收发 AirDrop 文件。桌面应用、服务、AirDrop 核心和固件使用 Rust，AWDL 由 Owly Rust 桥接程序提供；AirDrop 协议和状态机统一使用 owly-airdrop。
+Wayline 让 Windows 通过隔空投送与 Apple 设备互传文件、照片和文件夹。专用 RTL8821CU USB 网卡负责隔空投送，电脑的另一张网卡可继续连接平时使用的 Wi‑Fi。
 
-支持 Windows 10/11 x64 和 M5Stack Cardputer Adv（ESP32-S3、原生 USB Serial/JTAG、2.4 GHz 信道 6）。电脑需要蓝牙 LE 广播能力，Wi-Fi 收发由 ESP32 承担。
+**[下载 Windows x64 最新正式版](https://github.com/Foxing365/wayline/releases/latest)** · [English](README.md)
 
-另有可选的 [RTL8821CU USB 后端](docs/RTL8821CU.zh-CN.md)，用于 USB ID 为 `0BDA:C820` 的专用网卡。板载 Wi-Fi 可继续连接路由器。该后端需要准备 WinUSB 和独立的 DropBridge 无线程序。20 MHz 已完成实机双向传输，5 GHz 的 40 和 80 MHz 监听带宽为实验档。
+## 开始使用
 
-同时支持无屏幕 ESP32-S3（8 MiB 镜像布局，可用于 8/16 MiB Flash）和 ESP32-C5 开发板，可分别选择 USB-UART/UART0 或原生 USB Serial/JTAG 固件 profile。桌面离线包可包含这些 profile；固件页按板型和 USB 接口选择。C5 按主机请求在 2.4 GHz 信道 6 与 5 GHz 信道 44、149 之间运行时切换，原始发送速率固定为 HE20/MCS0。C5 的 AirDrop 互通与吞吐仍需实机验证，构建与刷写见[开发指南](docs/DEVELOPMENT.zh-CN.md#无屏幕-esp32-c5-构建)。
+电脑需要 Windows 10 或 11 x64，并支持蓝牙 LE 广播。在设备管理器核对专用 USB 网卡的 Wi‑Fi 接口，已实测的硬件 ID 为 `USB\VID_0BDA&PID_C820&MI_02`。
 
-[English](README.md) · [快速开始](docs/QUICKSTART.zh-CN.md) · [开发指南](docs/DEVELOPMENT.zh-CN.md)
+1. 下载并解压 Windows x64 ZIP。对照发布页核对 SHA-256，打开包内的《安装和回退.md》。
+2. 只给这张 USB 网卡的 **`MI_02` Wi‑Fi 接口**安装 WinUSB。单独下载指定版本的 DropBridge 无线助手和 libusb DLL，放到 Wayline 桥接程序旁的 `usb-radio` 目录。USB 指南包括校验、Microsoft Visual C++ x64 运行库和驱动回退步骤。[RTL8821CU 配置与回退](docs/RTL8821CU.zh-CN.md)
+3. 按包内说明，以管理员权限注册 Wayline 服务。平时用普通权限打开 `wayline-desktop.exe`，等 **RTL8821CU (USB)** 就绪。
+4. 电脑打开蓝牙，iPhone 打开 Wi‑Fi 和蓝牙，并把隔空投送设为「所有人（10 分钟）」。从 iPhone 分享菜单试传小文件，也可在 Wayline 中选文件和接收设备反向发送。
 
-[![视频演示](https://img.youtube.com/vi/8IJywijJMYU/hqdefault.jpg)](https://www.youtube.com/watch?v=8IJywijJMYU)
+也可以用 M5Stack Cardputer Adv 或兼容的 ESP32-S3/C5 开发板。单独准备对应的固件和烧录工具，在「设置 → 设备固件」里选择串口和板型。[ESP32 快速开始](docs/QUICKSTART.zh-CN.md) · [固件打包说明](docs/PACKAGING.zh-CN.md)
 
-## 工程实现
+## 日常使用
 
-- **原生桌面与系统集成**：使用 GPUI 构建收发界面，接入托盘、文件右键与资源管理器拖放；普通权限 UI 与高权限服务分离，兼顾桌面交互和设备管理。
-- **Rust 收发核心**：将设备发现、TLS/HTTP 和 CPIO/DVZip 编解码组织为桌面与 CLI 共用的模块，采用流式处理、归档校验和最终确认，支持取消与失败清理。
-- **服务与固件维护**：通过命名管道和会话租约协调多个客户端，管理无线后端生命周期与串口互斥；烧录期间隔离无线任务，写入后执行镜像校验和启动检查。
-- **嵌入式应用**：使用 Rust 实现 ESP32-S3 应用与 Cardputer 三语言界面，共享无堆分配的 CRC/COBS 协议；C/C++ 层封装硬件驱动，板端显示双向传输状态。无屏幕的 ESP32-C5 构建复用同一协议层。
-- **构建与验证**：固定 Owly 源码、适配和烧录工具版本，校验固件及离线发布包，提供主机回归测试、协议测试和界面预览工具。
+- **从资源管理器或 Wayline 发送。** 支持拖放、经典右键菜单和「发送到 → Wayline AirDrop」。Windows 11 一级右键可通过独立签名扩展安装。[一级右键安装说明](docs/EXPLORER.zh-CN.md)
+- **在同一个窗口接收。** 分享窗口从托盘滑入，保留当前应用的焦点。可以查看进度、速度和耗时，或在文件信息旁点「取消」。完成预览默认保留 **10 秒**，设置里可选 3–30 秒。
+- **处理文件和分享文本。** 接收后可预览图片，打开、另存、复制或移动文件。顶部文件夹按钮打开接收目录，默认是 `Downloads\Wayline`。文本超过 200 字符时先显示前 200 个，仍可复制原文。
+- **自己决定信任谁。** 默认逐次确认，也可信任发送方已验证的证书，之后自动接收该证书发来的文件。自动打开网页需另外授权。经授权设备发送的 TXT 少于 120 字符，且只识别出一个 HTTP(S) 网址时，会自动打开该网页。
+- **调整布局和后台接收。** 可选择 Wayline 原版、NekoDrop 浅色或深色。启用开机自启后，Windows 登录即可在后台接收。「最近传输」可查看结果和传输详情。
 
-## 界面与收发演示
+## 实测与兼容性
 
-演示使用实际固件渲染器和模拟传输数据，手机与桌面面板为界面示意。
+- **信道 149。** `0BDA:C820 MI_02` 在 20 MHz 下与 iPhone 完成过双向传输，Wayline 在 40 MHz 下实测接收 **61 张照片**。另有 TLS 回归测试核对了含 **4,100 个文件**的目录。[回归测试](crates/wayline-core/tests/airdrop_migration.rs)
+- **40 MHz 和 80 MHz。** 两档是 5 GHz 实验监听带宽。DropBridge 测过 40 MHz 长时间运行后降速，80 MHz 校正中心信道后 iPhone 仍未发现设备。遇到发现或传输问题时，可从 20 MHz 开始排查。[40 MHz 记录](https://github.com/ndpyzwy-0w0/DropBridge/blob/main/docs/STATUS.md#4-关键配置由监管程序固定) · [80 MHz 记录](https://github.com/ndpyzwy-0w0/DropBridge/blob/main/evidence/airdrop-userspace-width80-attempt.txt)
+- **仅限联系人。** 常规收发使用「所有人（10 分钟）」。导入已有的隔空投送身份后向「仅限联系人」设备发送仍属实验功能，需要在自己的设备上验证。[身份设置](docs/QUICKSTART.zh-CN.md#向仅限联系人设备发送)
 
-### ESP32 界面
+## 源码与致谢
 
-![Cardputer Adv 界面演示](docs/assets/cardputer-demo.gif)
+[构建环境](docs/SETUP.zh-CN.md) · [开发与命令行](docs/DEVELOPMENT.zh-CN.md) · [打包说明](docs/PACKAGING.zh-CN.md)
 
-状态、分享指南、偏好与声音设置，以及三语言切换。
+感谢 [Owly](https://github.com/t4t5/owly)、[OWL](https://github.com/seemoo-lab/owl)、[jedbillyb/owl](https://github.com/jedbillyb/owl)、[omdrop-owl-windows](https://github.com/dantdarealguy/omdrop-owl-windows)、[omdrop](https://github.com/netmojo-systems/omdrop-plugin)、[omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl)、[OpenDrop](https://github.com/seemoo-lab/opendrop) 和 [Windfall](https://github.com/UvejsGj/Windfall) 提供无线与传输基础。USB 方案使用 [DropBridge](https://github.com/ndpyzwy-0w0/DropBridge) 无线助手，Windows 实现参考了 [WinAWDL](https://github.com/raph559/winawdl) 与 [NekoDrop](https://github.com/zheznanohana/nekodrop)。
 
-### Apple → Windows
+桌面使用 [GPUI](https://gpui.rs/) 与 [Wintun](https://www.wintun.net/)。ESP32 构建依赖 [ESP-IDF](https://github.com/espressif/esp-idf)、[esptool](https://github.com/espressif/esptool)、[espup](https://github.com/esp-rs/espup)、[M5Unified](https://github.com/m5stack/M5Unified)、[M5GFX](https://github.com/m5stack/M5GFX) 与 [Noto CJK](https://github.com/notofonts/noto-cjk)。[固件字体许可](firmware/assets/OFL.txt)
 
-![AirDrop 经 ESP32 桥接到 Wayline](docs/assets/airdrop-esp32-wayline.gif)
-
-### Windows → Apple
-
-![Wayline 经 ESP32 发送到 iPhone](docs/assets/wayline-esp32-airdrop.gif)
-
-## 安装与使用
-
-1. 解压 Windows x64 构建产物，手动启动桌面或服务程序；Rust 安装器仍在迁移中。
-2. 用数据线连接 Cardputer Adv，在「设置 → 设备固件」选择串口和板型，完成安装或更新。
-3. 电脑打开蓝牙；iPhone 打开 Wi-Fi 和蓝牙，将 AirDrop 设为“所有人（10 分钟）”。
-4. 拖入文件并选择接收设备；接收时在 Wayline 中确认接受。
-
-安装包包含固件、烧录工具和运行库，无需安装开发工具或临时下载依赖。桌面请以普通权限运行，确保资源管理器拖放可用。更新前先完成传输，从托盘退出 Wayline，并结束 CLI 命令。
-
-- Windows 11 可选装 [一级右键菜单](docs/EXPLORER.zh-CN.md)，也可使用经典右键菜单和「发送到」。
-- 接收文件默认保存到下载目录的 `Wayline` 文件夹，可在设置中更改；桌面与 CLI 共用名称、身份和保存目录。
-- 从自己的设备接收文件时，可在首次确认中勾选“信任此证书，自动接收文件”。同一张 TLS 证书再次通过握手验证时，Wayline 自动接收文件。可在设置的“可信设备”按证书指纹取消信任。证书缺失或更换、分享网页链接时，Wayline 会询问。
-- Wayline 可从分享文本中提取 HTTP(S) 链接。经用户确认，或发送方证书拥有网页权限时，链接交给默认浏览器打开。接收结果显示在分享窗口，可预览收到的图片并复制原文。
-- 当授权设备发来少于 120 字且只有一条 HTTP(S) 链接的 TXT 时，打开该链接。超过 200 字时先显示开头。接收文件后的卡片提供打开、另存、复制和移动，主页顶部的文件夹按钮打开当前接收目录。
-- 开始接收文件时，分享窗口从托盘显示实时进度，保留当前应用的焦点。可用文件信息旁边的「取消」停止接收。完成预览在分享窗口默认保留 10 秒，可在设置里调整时长。原本在后台的接收窗口随后可自动收回。
-- 可选 Wayline 原版、NekoDrop 浅色或 NekoDrop 深色，点「刷新界面」立即应用。设置中的「开机自启」在 Windows 登录后启动后台接收。
-- 实时传输卡片显示传输量、总量、平滑速度、耗时及进度。动画遵循 Windows 的动画效果设置。耗时从实际传输开始算起，包含最终确认，排除准备和等待接受。
-- 分享卡片顶部的历史图标可打开“最近传输”，保留最多 200 条结果。列表显示设备、结果、文件概览、大小和时间；点击“详情”查看完整文件清单、传输量、耗时、平均速度、无线频段、信道和传输模式，并打开各文件所在位置。记录保留发送源路径和成功接收文件路径，不保存文件内容；旧记录可能没有文件明细或无线信息。
-- 可删除单条记录或清空记录，每次均需确认。“同时删除文件”和“记住此选项”初始均不勾选；同时删除会永久删除记录中的发送源文件和接收文件。记住后会更新“同时删除文件”的默认值，也可在设置中修改，之后删除仍须确认。
-- 页面、列表和长文本超出可视区时显示常驻比例滚动条，底部固定操作保持可见。
-- 设置页可查看已识别板型并切换受支持的频段和信道；ESP32-S3 支持 2.4 GHz 信道 6，ESP32-C5 另支持 5 GHz 信道 44、149。CLI 可用 `radio status` 和 `radio set`，详见[开发指南](docs/DEVELOPMENT.zh-CN.md#cli-与串口诊断)。
-- 桌面界面提供语言下拉框，支持简体中文、繁體中文、English、日本語、한국어、Français、Deutsch 和 Español；选择保存在本机，托盘、系统对话框和资源管理器入口随之更新。
-- 上传达到 100% 后仍需等待接收端确认，“已送达”才代表发送成功。
-- 置顶可让分享卡片在失去焦点后保持显示；设置中可关闭拖动文件时自动唤起，以及接收成功后自动打开文件位置，两项默认开启。设置读写失败会在卡片中提示，保存失败保留原值。
-- 分享窗口从屏幕右侧滑入，点击 ×、按 Esc 或未置顶时失去焦点会滑出。隐藏后仍可接收。动画遵循 Windows 系统设置。托盘“退出 Wayline”或 `Ctrl+Q` 结束本客户端任务。其他 CLI 会话仍在使用时，后台继续运行。
-
-首次烧录、保留设置更新、板载按键和常见问题见[快速开始](docs/QUICKSTART.zh-CN.md)。CLI 参数、JSON 输出与退出码见[开发指南](docs/DEVELOPMENT.zh-CN.md#cli-与串口诊断)。
-
-## 从源码构建
-
-按 [Windows / Linux 环境配置](docs/SETUP.zh-CN.md)准备本机工具链后，从仓库根目录执行：
-
-```sh
-cargo run --locked -p wayline-tools -- host-build --release
-```
-
-该命令构建可移植的主机 crate。Windows 专用的离线包、Wintun 校验、固件打包和服务安装仍见[开发指南](docs/DEVELOPMENT.zh-CN.md)。
-包含固件和烧录工具的目录包使用[统一构建与打包](docs/PACKAGING.zh-CN.md)中的 Cargo 命令。
-
-也可以用相同入口打开跨平台终端界面，在菜单中选择板型、主机 Debug/Release、构建、打包与校验，并查看实时日志：
-
-```sh
-cargo run --locked -p wayline-tools -- tui
-```
-
-在 TUI 中按 `L` 切换中英文，或添加 `--lang en-US` 直接以英文启动。
-
-去掉 `--release` 构建 Debug 版本。主机测试无需 ESP-IDF；可烧录固件需要 ESP-IDF 和 Rust `esp` 工具链，可用 `cargo run --locked -p wayline-tools -- firmware-check` 检查。Linux 支持共用库、CLI 和固件开发，桌面、Windows 服务与 Wintun 桥接尚未移植。
-
-Windows 主机构建已包含 Rust AWDL 后端。它使用现有 ESP32 固件协议和 Wintun，
-已设为源码及发布包默认，尚待设备互通验收。
-构建及运行方式见[开发指南](docs/DEVELOPMENT.zh-CN.md#rust-awdl-后端)。
-
-## 目录结构
-
-| 路径 | 内容 |
-| --- | --- |
-| `apps/desktop`、`apps/cli` | GPUI 桌面与命令行入口 |
-| `apps/bridge`、`crates/wayline-awdl` | Rust AWDL 子进程、ESP32 串口与 Wintun 适配 |
-| `vendor/owly-awdl`、`vendor/owly-airdrop` | 固定版本的 AWDL 与 AirDrop 协议实现 |
-| `crates/wayline-service` | 服务、无线后端管理、会话与维护 |
-| `crates/wayline-core`、`crates/wayline-host`、`crates/wayline-flash` | 文件收发、共用设置与固件操作 |
-| `crates/wayline-tools` | 跨平台 Cargo 构建与测试编排 |
-| `crates/wayline-proto`、`crates/wayline-board`、`crates/wayline-radio`、`crates/wayline-transport` | 共享协议、板端反馈与通信适配 |
-| `firmware` | 独立 Rust/ESP-IDF 固件项目，硬件接口位于 `firmware/components/radio` |
-| `scripts`、`assets/branding` | 按用途分类的[资源生成与预览脚本](scripts/README.md)，以及[品牌资源](assets/branding/README.md) |
-
-## 鸣谢
-
-感谢以下项目的作者、维护者与贡献者：
-
-- [omdrop-owl-windows](https://github.com/dantdmdarealguy/omdrop-owl-windows)（dantdmdarealguy）：Windows 端 OWL 移植、Wintun 集成与 ESP32 无线桥接的实现基础。
-- [owly](https://github.com/t4t5/owly)（t4t5）：Linux 无线后端与固定信道方案。
-- [omdrop](https://github.com/netmojo-systems/omdrop-plugin)、[omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl)（Brent Kearney 及贡献者）与 [OpenDrop](https://github.com/seemoo-lab/opendrop)（SEEMOO）：AirDrop 协议与收发实现参考。
-- [OWL / Open Wireless Link](https://github.com/seemoo-lab/owl)（Milan Stute、SEEMOO / TU Darmstadt）与 [jedbillyb/owl](https://github.com/jedbillyb/owl)：用户态 AWDL 实现。
-- [Windfall](https://github.com/UvejsGj/Windfall)（UvejsGj）：DVZip 格式研究。
-- [GPUI](https://gpui.rs/)（Zed）与 [Wintun](https://www.wintun.net/)（WireGuard）：桌面界面与虚拟网络接口。
-- [ESP-IDF](https://github.com/espressif/esp-idf)、[esptool](https://github.com/espressif/esptool)（Espressif）、[espup](https://github.com/esp-rs/espup)（esp-rs）、[M5Unified](https://github.com/m5stack/M5Unified) 与 [M5GFX](https://github.com/m5stack/M5GFX)（M5Stack）：固件工具链与硬件支持。
-- [Noto CJK](https://github.com/notofonts/noto-cjk)：板载字体，来源与许可证见 [font-source.txt](firmware/assets/font-source.txt) 和 [OFL.txt](firmware/assets/OFL.txt)。
-
-## 友情链接
-
-- [LINUX DO 社区](https://linux.do/)
-
-## 许可证
-
-许可证见 [LICENSE](LICENSE)；发布包包含所用依赖的许可证与声明。
+Wayline 使用 [GPL-3.0-only](LICENSE) 许可证。发布 ZIP 附依赖许可证及声明。
