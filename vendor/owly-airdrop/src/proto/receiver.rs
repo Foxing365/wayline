@@ -54,7 +54,9 @@ impl Default for Limits {
             plist: plist::Limits::default(),
             max_upload_body: 16 << 30,
             extract: extract::Limits::default(),
-            max_dvzip_chunk: 4 << 20,
+            // Chunks are streamed through a fixed buffer. Keep a per-chunk
+            // bound independent of the HTTP body and extracted archive limits.
+            max_dvzip_chunk: 64 << 20,
             max_buffered: 1 << 20,
         }
     }
@@ -291,6 +293,17 @@ impl Connection {
 
     pub fn decline(&mut self) {
         self.answer(Answer::Decline);
+    }
+
+    /// Reject an active upload using the same connection that accepted it.
+    /// Once the final response has been queued, the outcome is fixed.
+    pub fn cancel_upload(&mut self) -> bool {
+        if !matches!(self.state, State::Upload(_) | State::Finishing { .. }) {
+            return false;
+        }
+        self.events.clear();
+        self.fail(403);
+        true
     }
 
     /// The timer from the last [`Event::SetTimer`] fired.

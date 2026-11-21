@@ -1,7 +1,8 @@
 //! Small Windows shell adapter. Networking and rendering remain in Rust/GPUI.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
+    cell::Cell,
     mem::size_of,
     os::windows::ffi::OsStrExt,
     path::PathBuf,
@@ -15,7 +16,6 @@ use std::{
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::Gdi::*,
         System::{
             DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW, Threading::CreateMutexW,
         },
@@ -29,11 +29,15 @@ use windows::{
     core::{HSTRING, PCWSTR, w},
 };
 
+#[path = "native_slide.rs"]
+mod slide;
+
 pub enum Action {
     Toggle,
     Show,
     Close,
     Deactivate,
+    PanelHidden(usize),
     Choose,
     Files(Vec<PathBuf>),
     FilesDropped(Vec<PathBuf>),
@@ -43,6 +47,7 @@ pub enum Action {
     AppleIdentityDirectoryChosen(Result<Option<PathBuf>, String>),
     FilesOpened(u64, Result<(), String>),
     HistoryFolderOpened(Result<(), String>),
+    TransferFolderOpened(Result<(), String>),
     HistoryFileOpened(Result<(), String>),
     FileDrag(bool),
     ShellError(String),
@@ -51,21 +56,15 @@ pub enum Action {
     RestoreTray,
 }
 static ACTIONS: OnceLock<Sender<Action>> = OnceLock::new();
+
+enum FolderToOpen {
+    History(PathBuf),
+    ReceiveDirectory,
+}
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 const TRAY_MESSAGE: u32 = WM_APP + 41;
 const SHOW_MESSAGE: u32 = WM_APP + 42;
 const PLACE_MESSAGE: u32 = WM_APP + 43;
-const PLACE_NOTIFICATION_MESSAGE: u32 = WM_APP + 44;
-const NOTIFICATION_SUBCLASS_ID: usize = 2;
-
-struct NotificationPlacement {
-    owner: HWND,
-    position: crate::settings::NotificationPosition,
-    width: f32,
-    height: f32,
-    title: String,
-    message: String,
-}
 
 pub struct Instance(HANDLE);
 impl Instance {
@@ -199,7 +198,15 @@ pub struct Shell {
     tray: TrayState,
     tray_error_reported: bool,
     stop_drag_monitor: Arc<AtomicBool>,
+    placement: Cell<PlacementRequest>,
 }
+
+#[derive(Clone, Copy, Default)]
+struct PlacementRequest {
+    size_visibility: usize,
+    transition: usize,
+}
+
 impl Shell {
     pub fn new(window: &gpui::Window, tx: Sender<Action>) -> Result<Self> {
         let hwnd = hwnd(window).context("获取桌面窗口句柄失败")?;
@@ -265,6 +272,7 @@ impl Shell {
             tray: TrayState::default(),
             tray_error_reported: false,
             stop_drag_monitor: stop_drag_monitor.clone(),
+            placement: Cell::default(),
         };
         // SAFETY: Shell owns both icons and lives on the window's GPUI thread.
         // GPUI 0.2.2 sends WM_SETICON straight to DefWindowProcW, so this does not
@@ -400,10 +408,6 @@ impl Shell {
         notify_icon(&mut data, title, message);
     }
 
-    pub fn notification_owner(&self) -> usize {
-        self.hwnd.0 as usize
-    }
-
     pub fn choose_files(&self) -> Result<()> {
         let owner = self.hwnd.0 as usize;
         let tx = ACTIONS.get().unwrap().clone();
@@ -484,14 +488,37 @@ impl Shell {
     }
 
     pub fn open_history_folder(&self, path: PathBuf) -> Result<()> {
+        self.open_folder(FolderToOpen::History(path))
+    }
+
+    pub fn open_transfer_folder(&self) -> Result<()> {
+        self.open_folder(FolderToOpen::ReceiveDirectory)
+    }
+
+    fn open_folder(&self, target: FolderToOpen) -> Result<()> {
         let owner = self.hwnd.0 as usize;
         let tx = ACTIONS.get().unwrap().clone();
         std::thread::Builder::new()
-            .name("wayline-history-folder".into())
+            .name("wayline-open-folder".into())
             .spawn(move || {
+                let receive_directory = matches!(target, FolderToOpen::ReceiveDirectory);
                 let result = (|| -> Result<()> {
+                    let path = match target {
+                        FolderToOpen::History(path) => path,
+                        FolderToOpen::ReceiveDirectory => {
+                            let path = wayline_host::download_dir()?;
+                            // The default folder can be missing before the first receive.
+                            std::fs::create_dir_all(&path).with_context(|| {
+                                format!("无法准备接收文件夹 {}", path.display())
+                            })?;
+                            path
+                        }
+                    };
                     let metadata = std::fs::metadata(&path)
                         .with_context(|| format!("无法访问文件位置 {}", path.display()))?;
+                    if receive_directory && !metadata.is_dir() {
+                        bail!("接收位置已不是文件夹 {}", path.display());
+                    }
                     if metadata.is_file() {
                         use windows::Win32::System::Com::{
                             COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -545,7 +572,11 @@ impl Shell {
                     Ok(())
                 })()
                 .map_err(|error| format!("{error:#}"));
-                let _ = tx.send(Action::HistoryFolderOpened(result));
+                let _ = tx.send(if receive_directory {
+                    Action::TransferFolderOpened(result)
+                } else {
+                    Action::HistoryFolderOpened(result)
+                });
             })?;
         Ok(())
     }
@@ -578,72 +609,31 @@ impl Shell {
     }
 
     pub fn place(&self, expanded: bool, visible: bool, activate: bool) {
+        let size_visibility = usize::from(expanded) | (usize::from(visible) << 1);
+        let previous = self.placement.get();
+        let transition = previous
+            .transition
+            .wrapping_add(usize::from(previous.size_visibility != size_visibility));
+        self.placement.set(PlacementRequest {
+            size_visibility,
+            transition,
+        });
         // Do not synchronously dispatch WM_SIZE while GPUI holds its App borrow.
         unsafe {
             let _ = PostMessageW(
                 Some(self.hwnd),
                 PLACE_MESSAGE,
-                WPARAM(
-                    usize::from(expanded)
-                        | (usize::from(visible) << 1)
-                        | (usize::from(activate) << 2),
-                ),
-                LPARAM(0),
+                WPARAM(size_visibility | (usize::from(activate) << 2)),
+                LPARAM(transition as isize),
             );
         }
     }
-    fn position(hwnd: HWND, expanded: bool, visible: bool, activate: bool) {
-        unsafe {
-            if !visible {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
-            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-                return;
-            }
-            let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-            let (width, height) = if expanded {
-                (356.0, 476.0)
-            } else {
-                (200.0, 56.0)
-            };
-            let (width, height, margin) = (
-                (width * scale).round() as i32,
-                (height * scale).round() as i32,
-                (12.0 * scale).round() as i32,
-            );
-            crate::window_frame::configure(hwnd, width, height);
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                (info.rcWork.right - width - margin).max(info.rcWork.left),
-                (info.rcWork.bottom - height - margin).max(info.rcWork.top),
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
-            if visible && !IsWindowVisible(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            }
-            if visible && activate {
-                let _ = SetForegroundWindow(hwnd);
-            }
-        }
-    }
-}
 
-pub fn notify_owner(owner: usize, title: &str, message: &str) {
-    let mut data = NOTIFYICONDATAW {
-        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: HWND(owner as *mut _),
-        uID: 1,
-        ..Default::default()
-    };
-    notify_icon(&mut data, title, message);
+    /// A prior hide may have finished while the UI was already showing again.
+    pub fn is_current_hidden(&self, transition: usize) -> bool {
+        let placement = self.placement.get();
+        placement.size_visibility & 2 == 0 && placement.transition == transition
+    }
 }
 
 fn notify_icon(data: &mut NOTIFYICONDATAW, title: &str, message: &str) {
@@ -665,146 +655,11 @@ fn notify_icon(data: &mut NOTIFYICONDATAW, title: &str, message: &str) {
     }
 }
 
-pub fn queue_notification_position(
-    owner: usize,
-    window: &gpui::Window,
-    position: crate::settings::NotificationPosition,
-    width: f32,
-    height: f32,
-    title: &str,
-    message: &str,
-) -> Result<()> {
-    let hwnd = hwnd(window)?;
-    let request = Box::new(NotificationPlacement {
-        owner: HWND(owner as *mut _),
-        position,
-        width,
-        height,
-        title: title.to_owned(),
-        message: message.to_owned(),
-    });
-    let request = Box::into_raw(request);
-    // SAFETY: both HWNDs belong to this UI thread; all Win32 structures remain
-    // live for their synchronous calls. The boxed placement request remains alive
-    // until the subclass handles WM_NCDESTROY.
-    unsafe {
-        if !SetWindowSubclass(
-            hwnd,
-            Some(notification_subclass),
-            NOTIFICATION_SUBCLASS_ID,
-            request as usize,
-        )
-        .as_bool()
-        {
-            drop(Box::from_raw(request));
-            bail!("注册桌面通知窗口回调失败");
-        }
-        if let Err(error) =
-            PostMessageW(Some(hwnd), PLACE_NOTIFICATION_MESSAGE, WPARAM(0), LPARAM(0))
-        {
-            let _ =
-                RemoveWindowSubclass(hwnd, Some(notification_subclass), NOTIFICATION_SUBCLASS_ID);
-            drop(Box::from_raw(request));
-            return Err(error).context("提交桌面通知定位消息失败");
-        }
-    }
-    Ok(())
-}
-
-unsafe extern "system" fn notification_subclass(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    subclass_id: usize,
-    reference_data: usize,
-) -> LRESULT {
-    if message == PLACE_NOTIFICATION_MESSAGE {
-        let placement = unsafe { &*(reference_data as *const NotificationPlacement) };
-        if let Err(error) = position_notification(hwnd, placement) {
-            eprintln!("无法定位 Windows 桌面通知：{error:#}");
-            notify_owner(
-                placement.owner.0 as usize,
-                &placement.title,
-                &placement.message,
-            );
-        }
-        return LRESULT(0);
-    }
-    if message == WM_NCDESTROY {
-        unsafe {
-            let _ = RemoveWindowSubclass(hwnd, Some(notification_subclass), subclass_id);
-            drop(Box::from_raw(reference_data as *mut NotificationPlacement));
-        }
-    }
-    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
-}
-
-fn position_notification(hwnd: HWND, placement: &NotificationPlacement) -> Result<()> {
-    // SAFETY: the notification HWND and its owner HWND are live window handles;
-    // all Win32 structures remain on the stack for their synchronous calls.
-    unsafe {
-        let monitor_window = if IsWindow(Some(placement.owner)).as_bool() {
-            placement.owner
-        } else {
-            hwnd
-        };
-        let monitor = MonitorFromWindow(monitor_window, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        ensure!(
-            GetMonitorInfoW(monitor, &mut info).as_bool(),
-            "无法读取桌面通知所在显示器"
-        );
-        let scale = GetDpiForWindow(monitor_window).max(96) as f32 / 96.0;
-        let (width, height, margin) = (
-            (placement.width * scale).round() as i32,
-            (placement.height * scale).round() as i32,
-            (12.0 * scale).round() as i32,
-        );
-        crate::window_frame::configure_with_radius(hwnd, width, height, 16.0);
-        let work = info.rcWork;
-        let x = match placement.position {
-            crate::settings::NotificationPosition::TopLeft
-            | crate::settings::NotificationPosition::BottomLeft => work.left + margin,
-            crate::settings::NotificationPosition::TopRight
-            | crate::settings::NotificationPosition::BottomRight => work.right - width - margin,
-            crate::settings::NotificationPosition::TopCenter
-            | crate::settings::NotificationPosition::BottomCenter => {
-                work.left + (work.right - work.left - width) / 2
-            }
-        }
-        .max(work.left);
-        let y = match placement.position {
-            crate::settings::NotificationPosition::TopLeft
-            | crate::settings::NotificationPosition::TopRight => work.top + margin,
-            crate::settings::NotificationPosition::BottomLeft
-            | crate::settings::NotificationPosition::BottomRight => work.bottom - height - margin,
-            crate::settings::NotificationPosition::TopCenter => work.top + margin,
-            crate::settings::NotificationPosition::BottomCenter => work.bottom - height - margin,
-        }
-        .max(work.top);
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )
-        .context("定位 Windows 桌面通知失败")?;
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-    Ok(())
-}
-
 impl Drop for Shell {
     fn drop(&mut self) {
         self.stop_drag_monitor.store(true, Ordering::Relaxed);
         crate::file_drop::unregister(self.hwnd);
+        slide::stop(self.hwnd);
         unsafe {
             let _ = RemovePropW(self.hwnd, w!("WaylineDesktop.Ready"));
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.tray_data());
@@ -829,7 +684,7 @@ impl Drop for Shell {
     }
 }
 
-fn hwnd(window: &gpui::Window) -> Result<HWND> {
+pub(crate) fn hwnd(window: &gpui::Window) -> Result<HWND> {
     match HasWindowHandle::window_handle(window)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .as_raw()
@@ -865,7 +720,8 @@ unsafe extern "system" fn subclass(
     if message == WM_LBUTTONDOWN {
         let x = lp.0 as u16 as i16 as i32;
         let y = (lp.0 as u32 >> 16) as u16 as i16 as i32;
-        if crate::window_frame::draggable_client_point(hwnd, x, y) {
+        if !slide::is_closing() && crate::window_frame::draggable_client_point(hwnd, x, y) {
+            slide::begin_drag(hwnd);
             // SAFETY: this is the live window handle and the message parameters are
             // the standard Win32 caption-drag command. ReleaseCapture prevents the
             // client hitbox from retaining the mouse while Windows starts the move.
@@ -881,7 +737,9 @@ unsafe extern "system" fn subclass(
             return LRESULT(0);
         }
     }
-    if message == WM_NCHITTEST && crate::window_frame::transparent_corner(hwnd, lp) {
+    if message == WM_NCHITTEST
+        && (slide::is_closing() || crate::window_frame::transparent_corner(hwnd, lp))
+    {
         return LRESULT(HTTRANSPARENT as isize);
     }
     if message == WM_NCHITTEST && crate::window_frame::draggable_header(hwnd, lp) {
@@ -890,8 +748,29 @@ unsafe extern "system" fn subclass(
         return LRESULT(HTCLIENT as isize);
     }
     if message == PLACE_MESSAGE {
-        Shell::position(hwnd, wp.0 & 1 != 0, wp.0 & 2 != 0, wp.0 & 4 != 0);
+        let transition = lp.0 as usize;
+        if slide::place(
+            hwnd,
+            wp.0 & 1 != 0,
+            wp.0 & 2 != 0,
+            wp.0 & 4 != 0,
+            transition,
+        ) && let Some(tx) = ACTIONS.get()
+        {
+            let _ = tx.send(Action::PanelHidden(transition));
+        }
         return LRESULT(0);
+    }
+    if message == WM_TIMER && wp.0 == slide::TIMER_ID {
+        if let Some(transition) = slide::tick(hwnd)
+            && let Some(tx) = ACTIONS.get()
+        {
+            let _ = tx.send(Action::PanelHidden(transition));
+        }
+        return LRESULT(0);
+    }
+    if message == WM_NCDESTROY {
+        slide::stop(hwnd);
     }
     if message == WM_CLOSE {
         if let Some(tx) = ACTIONS.get() {
@@ -1058,6 +937,7 @@ unsafe extern "system" fn find_drag_image(hwnd: HWND, lp: LPARAM) -> windows::co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Gdi::*;
 
     #[test]
     fn tray_starts_disconnected_and_only_reapplies_changed_or_failed_updates() {

@@ -87,6 +87,10 @@ pub fn choose_apple_identity_directory(
     )
 }
 
+pub(crate) fn choose_transfer_destination(owner: usize, label: &str) -> Result<Option<PathBuf>> {
+    choose_directory_with_labels(owner, label, label, 0xa154faf4_1065_4198_9322_e1004be86129)
+}
+
 fn choose_directory_with_labels(
     owner: usize,
     title: &str,

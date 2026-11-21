@@ -63,7 +63,7 @@ Status, sharing guide, preferences, sound settings and three-language switching.
 ## Install and use
 
 1. Extract the Windows x64 artifacts and start the desktop/service binaries manually; the Rust installer migration is in progress.
-2. Connect Cardputer Adv with a data cable. Click the Device firmware icon at the top of the sharing card, select its port and board,
+2. Connect Cardputer Adv with a data cable. Open Device firmware in Settings, select its port and board,
    then install or update the firmware.
 3. Enable Bluetooth on the PC. Enable Wi-Fi and Bluetooth on iPhone and set
    AirDrop to Everyone for 10 Minutes.
@@ -78,11 +78,15 @@ Before updating, finish transfers, quit Wayline from the tray, and close CLI com
 - On the first file offer, choose to accept files from your device automatically. Wayline remembers
   the TLS certificate proved during that connection. Revoke it under Trusted devices in Settings.
   Open shared HTTP(S) links after approval or grant link-opening permission to a trusted certificate.
-- When desktop notifications are enabled, a file receive starts with a bottom-right notice.
-  Completion appears in the sharing card for 10 seconds. Incoming shares can show a picture and
-  copyable original text.
+- The sharing card shows live file receive progress and opens from the tray without taking focus.
+  Use Cancel beside the transfer details to stop an active receive.
+  Completion stays in the card for the duration selected in Settings (10 seconds by default), with a picture preview and copyable text when
+  available. A card shown for a background receive returns to the tray afterward.
 - Choose Wayline, NekoDrop Light, or NekoDrop Dark in Settings and refresh the interface to apply it.
   Launch at sign-in starts background receiving after a Windows sign-in.
+- A TXT share under 120 characters from a device with link permission opens its single HTTP(S) link.
+  Longer TXT shares preview up to 200 characters with the full text available to copy.
+  The result card can open, save, copy, or move received files. The toolbar folder icon opens the receive folder.
 - The transfer cards display transferred and total bytes, smoothed speed, elapsed time, and progress during
   sending and receiving. Animations follow Windows animation settings. Timing includes final
   confirmation and starts when data transfer begins.

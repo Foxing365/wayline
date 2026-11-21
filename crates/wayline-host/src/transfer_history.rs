@@ -66,6 +66,17 @@ pub struct TransferHistoryRecord {
     pub file_names: Vec<String>,
     #[serde(default)]
     pub file_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_destinations: Vec<PathBuf>,
+}
+
+impl TransferHistoryRecord {
+    fn receive_directory_for(&self, index: usize) -> Option<&Path> {
+        self.file_destinations
+            .get(index)
+            .or(self.destination.as_ref())
+            .map(PathBuf::as_path)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,6 +102,56 @@ pub fn clear_transfer_history() -> Result<()> {
     let path = transfer_history_path()?;
     let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
     write_to(&path, &[])
+}
+
+/// Updates the exact receipt after Wayline relocates its saved files.
+pub fn relocate_received_transfer(
+    receipt: &TransferHistoryRecord,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<TransferHistoryRecord>> {
+    let path = transfer_history_path()?;
+    let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
+    relocate_received_from(&path, receipt, paths)
+}
+
+fn relocate_received_from(
+    path: &Path,
+    receipt: &TransferHistoryRecord,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<TransferHistoryRecord>> {
+    let mut entries = load_from(path)?;
+    if paths.len() == receipt.file_paths.len()
+        && paths != receipt.file_paths
+        && let Some(entry) = entries.iter_mut().find(|entry| {
+            entry.direction == TransferDirection::Receive
+                && entry.started_at_unix_ms == receipt.started_at_unix_ms
+                && entry.finished_at_unix_ms == receipt.finished_at_unix_ms
+                && entry.peer == receipt.peer
+                && entry.file_paths == receipt.file_paths
+        })
+    {
+        let directories: Vec<_> = paths
+            .iter()
+            .map(|file| {
+                file.parent()
+                    .context("传输文件没有可用的保存目录")
+                    .map(Path::to_path_buf)
+            })
+            .collect::<Result<_>>()?;
+        if let Some(first) = directories
+            .first()
+            .filter(|first| directories.iter().all(|directory| directory == *first))
+        {
+            entry.destination = Some(first.clone());
+            entry.file_destinations.clear();
+        } else {
+            entry.file_destinations = directories;
+        }
+        entry.file_paths = paths;
+        validate_record(entry)?;
+        write_to(path, &entries)?;
+    }
+    Ok(entries)
 }
 
 /// Delete only records in the caller's snapshot, leaving concurrently appended transfers intact.
@@ -183,9 +244,13 @@ fn validate_deletion_target(record: &TransferHistoryRecord, file: &Path) -> Resu
         }
     }
     if record.direction == TransferDirection::Receive {
+        let index = record
+            .file_paths
+            .iter()
+            .position(|path| path == file)
+            .context("传输文件不在记录中")?;
         let destination = record
-            .destination
-            .as_ref()
+            .receive_directory_for(index)
             .context("接收记录缺少保存目录")?;
         let resolved_destination = fs::canonicalize(destination)
             .with_context(|| format!("无法检查接收目录 {}", destination.display()))?;
@@ -333,7 +398,13 @@ fn validate_record(record: &TransferHistoryRecord) -> Result<()> {
     if let Some(channel) = record.channel {
         ensure!(matches!(channel, 6 | 44 | 149), "传输历史信道不受支持");
     }
-    if let Some(destination) = &record.destination {
+    ensure!(
+        record.file_destinations.is_empty()
+            || (record.direction == TransferDirection::Receive
+                && record.file_destinations.len() == record.file_paths.len()),
+        "传输历史保存目录与文件数量不符"
+    );
+    for destination in record.destination.iter().chain(&record.file_destinations) {
         ensure!(destination.is_absolute(), "传输历史保存目录必须是绝对路径");
         let text = destination.to_string_lossy();
         ensure!(text.chars().count() <= 4096, "传输历史保存目录过长");
@@ -361,7 +432,7 @@ fn validate_record(record: &TransferHistoryRecord) -> Result<()> {
             "传输历史文件名称包含控制字符"
         );
     }
-    for path in &record.file_paths {
+    for (index, path) in record.file_paths.iter().enumerate() {
         validate_file_path(path)?;
         if record.direction == TransferDirection::Receive {
             ensure!(
@@ -369,8 +440,7 @@ fn validate_record(record: &TransferHistoryRecord) -> Result<()> {
                 "未完成的接收记录不能包含文件路径"
             );
             let destination = record
-                .destination
-                .as_ref()
+                .receive_directory_for(index)
                 .context("接收记录缺少保存目录")?;
             ensure!(
                 path.starts_with(destination) && path != destination,
@@ -432,7 +502,36 @@ mod tests {
             format: None,
             file_names: Vec::new(),
             file_paths: Vec::new(),
+            file_destinations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn partial_relocation_keeps_history_readable_and_checks_each_saved_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let history = workspace.path().join("transfer-history.json");
+        let original_dir = workspace.path().join("incoming");
+        let target_dir = workspace.path().join("chosen");
+        fs::create_dir(&original_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let first = target_dir.join("a.txt");
+        let second = original_dir.join("b.txt");
+        fs::write(&first, b"moved").unwrap();
+        fs::write(&second, b"retained").unwrap();
+        let mut receipt = record(1);
+        receipt.direction = TransferDirection::Receive;
+        receipt.destination = Some(original_dir.clone());
+        receipt.file_paths = vec![original_dir.join("a.txt"), second.clone()];
+        append_to(&history, receipt.clone()).unwrap();
+
+        let paths = vec![first.clone(), second.clone()];
+        let changed = relocate_received_from(&history, &receipt, paths.clone()).unwrap();
+        assert_eq!(load_from(&history).unwrap(), changed);
+        assert_eq!(changed[0].file_paths, paths);
+        assert_eq!(changed[0].file_destinations, vec![target_dir, original_dir]);
+        assert!(validate_deletion_target(&changed[0], &first).unwrap());
+        assert!(validate_deletion_target(&changed[0], &second).unwrap());
+        assert_eq!(append_to(&history, record(2)).unwrap().len(), 2);
     }
 
     fn record_with_encoded_size(index: usize, bytes: usize) -> TransferHistoryRecord {

@@ -15,9 +15,10 @@ use compact_send::SendLayout;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use share_result::ShareResult;
+pub(crate) use share_result::{ShareFileActionResult, ShareFileDestination};
 use std::{
     path::PathBuf,
-    sync::{Arc, mpsc},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 use wayline_core::SendCancellation;
@@ -26,7 +27,6 @@ const BLUE: u32 = 0x0a84ff;
 const INK: u32 = 0xf5f5f7;
 const MUTED: u32 = 0xa0a0a8;
 const SURFACE: u32 = 0x27272b;
-const SHARE_RESULT_DURATION: Duration = Duration::from_secs(10);
 enum ExitState {
     Stopping,
     FlushingHistory(bool),
@@ -50,6 +50,7 @@ pub struct Capsule {
     orb: crate::orb::ConnectionOrb,
     language: Language,
     visibility: Visibility,
+    slide_out_panel: bool,
     shell: Option<Shell>,
     focus: FocusHandle,
     tx: mpsc::Sender<Event>,
@@ -80,12 +81,9 @@ pub struct Capsule {
     history_preference_pending: bool,
     history_worker: Option<crate::history::StoreWorker>,
     notification_position: crate::settings::NotificationPosition,
-    notification_duration_seconds: u64,
-    desktop_notifications_enabled: bool,
-    notification_window: Option<WindowHandle<crate::notification::DesktopNotification>>,
+    completion_duration_seconds: u64,
     language_menu_open: bool,
     notification_position_menu_open: bool,
-    notification_duration_menu_open: bool,
     settings_error: Option<String>,
     radio_change_pending: bool,
     radio_draft: Option<RadioChange>,
@@ -96,6 +94,7 @@ pub struct Capsule {
     exit_state: Option<ExitState>,
     receiver_status: Result<(), String>,
     receive: crate::receiving::Model,
+    receive_revealed: bool,
     share_result: Option<ShareResult>,
     download_directory: Option<PathBuf>,
     receiver_declined_until: Option<Instant>,
@@ -157,24 +156,6 @@ impl Capsule {
                 crate::settings::NotificationPosition::DEFAULT
             }
         };
-        let notification_duration_seconds =
-            match crate::settings::load_notification_duration_seconds() {
-                Ok(seconds) => seconds,
-                Err(error) => {
-                    settings_error =
-                        Some(format!("{}{error:#}", text.err_notification_duration_load));
-                    crate::settings::DEFAULT_NOTIFICATION_DURATION_SECONDS
-                }
-            };
-        let desktop_notifications_enabled =
-            match crate::settings::load_desktop_notifications_enabled() {
-                Ok(enabled) => enabled,
-                Err(error) => {
-                    settings_error =
-                        Some(format!("{}{error:#}", text.err_notification_enabled_load));
-                    true
-                }
-            };
         let download_directory = match crate::receiving::save_directory() {
             Ok(directory) => Some(directory),
             Err(error) => {
@@ -216,6 +197,11 @@ impl Capsule {
             report_preference_error(error, text.send_layout_title);
             (false, false)
         });
+        let completion_duration_seconds = wayline_host::load_completion_duration_seconds()
+            .unwrap_or_else(|error| {
+                report_preference_error(error, text.completion_duration_title);
+                wayline_host::DEFAULT_COMPLETION_DURATION_SECONDS
+            });
         let send_layout = match (compact, dark) {
             (false, _) => SendLayout::Classic,
             (true, false) => SendLayout::NekoLight,
@@ -266,6 +252,7 @@ impl Capsule {
             orb: crate::orb::ConnectionOrb::default(),
             language,
             visibility: Visibility::Hidden,
+            slide_out_panel: false,
             shell,
             focus: cx.focus_handle(),
             tx,
@@ -296,12 +283,9 @@ impl Capsule {
             history_preference_pending: false,
             history_worker: Some(history_worker),
             notification_position,
-            notification_duration_seconds,
-            desktop_notifications_enabled,
-            notification_window: None,
+            completion_duration_seconds,
             language_menu_open: false,
             notification_position_menu_open: false,
-            notification_duration_menu_open: false,
             settings_error,
             radio_change_pending: false,
             radio_draft: None,
@@ -312,6 +296,7 @@ impl Capsule {
             exit_state: None,
             receiver_status: Err(text.receiver_starting.into()),
             receive: crate::receiving::Model::default(),
+            receive_revealed: false,
             share_result: None,
             download_directory,
             receiver_declined_until: None,
@@ -385,7 +370,7 @@ impl Capsule {
                             event_unix_ms,
                         );
                     }
-                    Event::ReceiverActivity(event, _) => {
+                    Event::ReceiverActivity(event, _, _) => {
                         let record =
                             self.receive
                                 .history_record_for_event(&event, event_at, event_unix_ms);
@@ -400,6 +385,7 @@ impl Capsule {
                             worker.append(record, received_files.clone());
                         }
                     }
+                    Event::ShareFileAction(outcome) => self.finish_share_file_action(outcome, cx),
                     Event::HistoryUpdated(Err(error)) => {
                         self.history_error = Some(format!(
                             "{}{error}",
@@ -457,6 +443,14 @@ impl Capsule {
                 Event::ShellError(error) => {
                     self.model.error = Some(error);
                     changed = true;
+                    continue;
+                }
+                Event::ShareFileAction(outcome) => {
+                    self.finish_share_file_action(outcome, cx);
+                    continue;
+                }
+                Event::ShareFileDestination(selection) => {
+                    self.apply_share_file_destination(selection, cx);
                     continue;
                 }
                 Event::Firmware(event) => {
@@ -545,10 +539,13 @@ impl Capsule {
                 }
                 Event::ReceiverStatus(status) => {
                     if let Err(error) = &status {
-                        self.receive.interrupt_with_details(
+                        let interrupted = self.receive.interrupt_with_details(
                             self.language.strings().receive_interrupted.into(),
                             error.clone(),
                         );
+                        if interrupted && self.share_result.is_none() {
+                            self.reveal_receive_window(window);
+                        }
                     }
                     self.receiver_status = status;
                     changed = true;
@@ -656,24 +653,35 @@ impl Capsule {
                     changed = true;
                     continue;
                 }
-                Event::ReceiverActivity(event, image) => {
+                Event::ReceiverActivity(event, image, received_text) => {
                     if let wayline_core::ReceiverEvent::WebLinksAccepted(transfer) = &event {
                         let urls = self
                             .receive
                             .links_after_acceptance(transfer, &self.trusted_senders);
-                        changed |= !urls.is_empty();
-                        if !urls.is_empty() {
+                        let preview_text = self
+                            .receive
+                            .has_accepted_multi_link_text(transfer, &self.trusted_senders);
+                        changed |= !urls.is_empty() || preview_text;
+                        if !urls.is_empty() || preview_text {
                             let original = transfer
                                 .share_text
                                 .clone()
-                                .unwrap_or_else(|| urls.join("\n"));
-                            self.show_share_result(
-                                self.language.strings().receive_web_opened.into(),
+                                .unwrap_or_else(|| transfer.urls.join("\n"));
+                            let labels = self.language.strings();
+                            let title = if preview_text {
+                                labels.receive_shared_text
+                            } else {
+                                labels.receive_web_opened
+                            };
+                            let result = ShareResult::new(
+                                title.into(),
                                 transfer.sender_name.clone(),
-                                Some(original),
+                                crate::shared_text::classify_text(original),
                                 image,
-                                window,
+                                Vec::new(),
+                                None,
                             );
+                            self.show_share_result(result, window);
                         }
                         Self::open_received_web_links(urls, cx);
                         continue;
@@ -690,39 +698,45 @@ impl Capsule {
                         wayline_core::ReceiverEvent::Received { files, .. } => files.clone(),
                         _ => Vec::new(),
                     };
-                    let web_links = self
-                        .receive
-                        .links_on_completion(&event, &self.trusted_senders);
+                    let web_links = if let Some(content) = &received_text {
+                        let mut urls = self.receive.text_link_on_completion(
+                            &event,
+                            content,
+                            &self.trusted_senders,
+                        );
+                        if let wayline_core::ReceiverEvent::Received { transfer, .. } = &event
+                            && wayline_core::airdrop::web_links(&transfer.urls)
+                                .iter()
+                                .any(|url| !urls.contains(url))
+                        {
+                            urls.clear();
+                        }
+                        urls
+                    } else {
+                        self.receive
+                            .links_on_completion(&event, &self.trusted_senders)
+                    };
                     let opened_early = self
                         .receive
                         .active
                         .as_ref()
                         .is_some_and(|active| active.web_links_opened);
-                    let receive_start = self.receive.starting_receive(&event).map(|active| {
-                        let count = self.language.file_count(active.files);
-                        format!("{} · {count}", active.sender)
-                    });
+                    let receive_start = self.receive.starting_receive(&event).is_some();
                     let applied = self.receive.apply_at(&event, event_at, event_unix_ms);
-                    if applied && let Some(message) = receive_start {
-                        self.show_desktop_notification(
-                            self.language.strings().receiving_title,
-                            message.clone(),
-                            message,
-                            crate::settings::NotificationPosition::BottomRight,
-                            cx,
-                        );
+                    if applied && receive_start {
+                        self.reveal_receive_window(window);
                     }
                     let open_location = crate::receiving::auto_open_location(
                         &event,
                         applied,
-                        self.auto_open_download_dir,
+                        self.auto_open_download_dir && received_text.is_none(),
                         self.download_directory.as_deref(),
                     );
                     if applied
-                        && let Some(record) = record
+                        && let Some(record) = &record
                         && let Some(worker) = &self.history_worker
                     {
-                        worker.append(record, received_files);
+                        worker.append(record.clone(), received_files);
                     }
                     if applied && let Some(notice) = &self.receive.notice {
                         match &event {
@@ -739,25 +753,32 @@ impl Capsule {
                                 } else {
                                     self.language.shared_links()
                                 };
-                                self.show_share_result(
+                                let original = received_text.or_else(|| {
+                                    transfer
+                                        .share_text
+                                        .clone()
+                                        .or_else(|| {
+                                            (!transfer.urls.is_empty())
+                                                .then(|| transfer.urls.join("\n"))
+                                        })
+                                        .and_then(crate::shared_text::classify_text)
+                                });
+                                let result = ShareResult::new(
                                     title.into(),
                                     notice.message.clone(),
-                                    transfer.share_text.clone(),
+                                    original,
                                     image,
-                                    window,
+                                    files.clone(),
+                                    record,
                                 );
+                                self.show_share_result(result, window);
                                 self.receive.notice = None;
                             }
-                            wayline_core::ReceiverEvent::TransferFailed {
-                                kind: wayline_core::TransferFailureKind::Connection,
-                                ..
-                            } if !opened_early => self.show_desktop_notification(
-                                "Wayline",
-                                notice.message.clone(),
-                                notice.full_text.clone(),
-                                self.notification_position,
-                                cx,
-                            ),
+                            wayline_core::ReceiverEvent::TransferFailed { .. }
+                                if !opened_early || self.share_result.is_none() =>
+                            {
+                                self.reveal_receive_window(window);
+                            }
                             _ => {}
                         }
                     }
@@ -783,9 +804,13 @@ impl Capsule {
                         );
                     }
                     if !ready {
-                        changed |= self
+                        let interrupted = self
                             .receive
                             .interrupt(self.language.strings().connection_lost_receive.into());
+                        if interrupted && self.share_result.is_none() {
+                            self.reveal_receive_window(window);
+                        }
+                        changed |= interrupted;
                     }
                 }
                 _ => {}
@@ -828,11 +853,14 @@ impl Capsule {
                     let interacting = self.picker_open
                         || self.share_result.is_some()
                         || self.incoming.is_some()
+                        || self.receive.active.is_some()
+                        || self.receive_revealed
                         || self.firmware.busy
                         || self.drag_active
                         || self.drop_hovered;
                     if self.visibility.hide_on_deactivate(self.pinned, interacting) {
                         self.last_deactivate_at = Some(Instant::now());
+                        self.slide_out_panel = true;
                         self.expand(false, window, cx);
                     }
                 }
@@ -881,6 +909,12 @@ impl Capsule {
                     }
                     changed = true;
                 }
+                Action::TransferFolderOpened(result) => {
+                    if let Err(error) = result {
+                        self.show_transfer_folder_error(&error);
+                        changed = true;
+                    }
+                }
                 Action::HistoryFileOpened(result) => {
                     if let Err(error) = result {
                         self.history_error =
@@ -916,6 +950,11 @@ impl Capsule {
                         || !active
                     {
                         self.visibility.file_drag(active, self.drag_activate);
+                        if self.visibility == Visibility::DropTarget
+                            && std::mem::take(&mut self.slide_out_panel)
+                        {
+                            self.clear_share_result(window);
+                        }
                         self.place();
                         changed = true;
                     }
@@ -934,6 +973,17 @@ impl Capsule {
                     changed |= self.animate_send_view != animate;
                     self.animate_send_view = animate;
                     self.place();
+                }
+                Action::PanelHidden(transition) => {
+                    if self
+                        .shell
+                        .as_ref()
+                        .is_some_and(|shell| shell.is_current_hidden(transition))
+                        && std::mem::take(&mut self.slide_out_panel)
+                    {
+                        self.clear_share_result(window);
+                        changed = true;
+                    }
                 }
                 Action::RestoreTray => {
                     if let Some(shell) = self.shell.as_mut() {
@@ -955,21 +1005,26 @@ impl Capsule {
             changed = true;
         }
         let now = Instant::now();
-        if self
-            .share_result
-            .as_ref()
-            .is_some_and(|result| now >= result.deadline)
+        if !self.slide_out_panel
+            && self
+                .share_result
+                .as_ref()
+                .is_some_and(|result| result.can_dismiss(now))
         {
             self.finish_share_result(window, cx);
         }
         if self
             .model
-            .send_completion_expired(now, SHARE_RESULT_DURATION)
+            .send_completion_expired(now, Duration::from_secs(self.completion_duration_seconds))
             && self.queued_at.is_none()
         {
             self.reset(window, cx);
         }
         changed |= self.receive.expire_notice(now);
+        if self.receive_revealed && self.receive.active.is_none() && self.receive.notice.is_none() {
+            self.receive_revealed = false;
+            changed |= self.hide_temporary_share_window();
+        }
         changed |= self.model.expire_speed(now);
         changed |= self.receive.expire_speed(now);
         changed |= self.model.phase.busy() && self.model.send_elapsed(now).is_some();
@@ -1097,6 +1152,9 @@ impl Capsule {
 
     fn toggle_pinned(&mut self, cx: &mut Context<Self>) {
         let result = crate::settings::toggle(&mut self.pinned, crate::settings::save_pinned);
+        if result.is_ok() && self.pinned {
+            self.keep_share_window_open();
+        }
         let text = self.language.strings();
         self.settings_error = result.err().map(|error| {
             format!(
@@ -1175,8 +1233,18 @@ impl Capsule {
     }
 
     fn expand(&mut self, expanded: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !expanded {
-            self.clear_share_result(window);
+        if expanded {
+            if self.slide_out_panel {
+                self.clear_share_result(window);
+            }
+            self.slide_out_panel = false;
+            self.keep_share_window_open();
+        } else {
+            self.slide_out_panel |= self.visibility == Visibility::Share;
+            self.receive_revealed = false;
+            if !self.slide_out_panel {
+                self.clear_share_result(window);
+            }
             self.receive.reset_notice_hover();
             self.answer_incoming(IncomingAnswer::Decline, cx);
         }
@@ -1461,12 +1529,12 @@ impl Capsule {
         if !self.settings_open && !self.radio_change_pending {
             self.radio_draft = None;
         }
+        self.keep_share_window_open();
         self.settings_open = true;
         self.pending_send_layout = None;
         self.history_open = false;
         self.language_menu_open = false;
         self.notification_position_menu_open = false;
-        self.notification_duration_menu_open = false;
         self.firmware.open = false;
         self.name_saved = false;
         self.focus.focus(window);
@@ -1476,7 +1544,9 @@ impl Capsule {
         if self.pending_send_layout.is_some() {
             self.dismiss_send_layout_refresh(cx);
         } else if self.firmware.open {
-            self.firmware.open = false;
+            if !self.firmware.busy {
+                self.firmware.open = false;
+            }
             self.firmware.confirm_exit = false;
             cx.notify();
         } else if self.history_open && self.history_deletion.is_some() {
@@ -1492,7 +1562,6 @@ impl Capsule {
             self.settings_open = false;
             self.language_menu_open = false;
             self.notification_position_menu_open = false;
-            self.notification_duration_menu_open = false;
             self.finish_name_edit(window);
             self.name_saved = false;
             self.focus.focus(window);
@@ -1591,6 +1660,7 @@ impl Capsule {
 
     fn open_history(&mut self, cx: &mut Context<Self>) {
         if self.can_open_history() {
+            self.keep_share_window_open();
             self.history_open = true;
             self.history_detail = None;
             self.language_menu_open = false;
@@ -1674,6 +1744,23 @@ impl Capsule {
             ));
         }
         cx.notify();
+    }
+
+    fn open_transfer_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(shell) = &self.shell else {
+            return;
+        };
+        if let Err(error) = shell.open_transfer_folder() {
+            self.show_transfer_folder_error(&format!("{error:#}"));
+            cx.notify();
+        }
+    }
+
+    fn show_transfer_folder_error(&mut self, error: &str) {
+        self.receive.show_notice(
+            format!("{}{error}", self.language.strings().history_open_error),
+            crate::receiving::NoticeKind::Error,
+        );
     }
 
     fn open_history_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1849,7 +1936,6 @@ impl Capsule {
             && !self.settings_open
             && !self.history_open
             && !self.firmware.open
-            && self.share_result.is_none()
             && self.incoming.is_none();
         let neko_dark = self.send_layout == SendLayout::NekoDark;
         let backdrop = if compact_theme {
@@ -1927,7 +2013,7 @@ impl Capsule {
                                 |controls| {
                                     controls.child(
                                         div()
-                                            .id("open-firmware")
+                                            .id("open-transfer-folder")
                                             .size(px(28.))
                                             .flex_shrink_0()
                                             .rounded_full()
@@ -1938,20 +2024,14 @@ impl Capsule {
                                             .text_size(px(11.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(rgb(muted))
-                                            .child(firmware_icon())
+                                            .child(folder_icon())
                                             .tooltip(move |window, cx| {
-                                                icon_tooltip(text.firmware_title, window, cx)
+                                                icon_tooltip(text.open_transfer_folder, window, cx)
                                             })
-                                            .when(self.can_open_firmware(), |control| {
-                                                control.cursor_pointer().hover(move |s| {
-                                                    s.bg(rgb(hover)).text_color(rgb(ink))
-                                                })
-                                            })
-                                            .when(!self.can_open_firmware(), |control| {
-                                                control.opacity(0.4)
-                                            })
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.open_firmware(window, cx)
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(rgb(hover)).text_color(rgb(ink)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_transfer_folder(cx)
                                             })),
                                     )
                                 },
@@ -2131,7 +2211,9 @@ impl Capsule {
                                         .text_color(rgb(muted))
                                         .child(back_chevron())
                                         .child(div().text_size(px(11.)).line_height(px(14.)).child(
-                                            if self.history_open {
+                                            if self.history_open
+                                                || (self.firmware.open && self.settings_open)
+                                            {
                                                 text.back
                                             } else if self.settings_open || self.firmware.open {
                                                 text.back_to_share
@@ -2139,11 +2221,19 @@ impl Capsule {
                                                 text.back
                                             },
                                         ))
-                                        .hover(move |s| s.bg(rgb(surface)).text_color(rgb(ink)))
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.back(window, cx)
-                                            }),
+                                        .when_else(
+                                            self.firmware.open
+                                                && self.firmware.busy
+                                                && !self.firmware.confirm_exit,
+                                            |back| back.opacity(0.4).cursor_default(),
+                                            |back| {
+                                                back.hover(move |s| {
+                                                    s.bg(rgb(surface)).text_color(rgb(ink))
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.back(window, cx)
+                                                }))
+                                            },
                                         ),
                                 )
                                 .when(
@@ -2191,7 +2281,7 @@ impl Capsule {
                         && self.receive.active.is_some()
                         && self.model.files.is_empty()
                     {
-                        self.receiving_view(false)
+                        self.receiving_view(false, cx)
                     } else {
                         self.send_page(cx)
                     }),
@@ -2205,7 +2295,7 @@ impl Capsule {
                                 || self.settings_open
                                 || self.history_open
                                 || self.firmware.open),
-                        |panel| panel.child(self.receiving_view(true)),
+                        |panel| panel.child(self.receiving_view(true, cx)),
                     )
                     .when(self.receiver_declined_until.is_some(), |panel| {
                         panel.child(
@@ -2267,7 +2357,10 @@ impl Capsule {
     }
 
     fn can_open_firmware(&self) -> bool {
-        !self.model.phase.busy()
+        self.settings_open
+            && !self.firmware.open
+            && !self.firmware.busy
+            && !self.model.phase.busy()
             && !self.picker_open
             && self.name_input.is_none()
             && self.incoming.is_none()
@@ -2277,13 +2370,14 @@ impl Capsule {
         if !self.can_open_firmware() {
             return;
         }
+        self.keep_share_window_open();
         self.finish_name_edit(window);
-        self.settings_open = false;
         self.pending_send_layout = None;
         self.history_open = false;
         self.language_menu_open = false;
+        self.notification_position_menu_open = false;
         self.firmware.open = true;
-        if !self.firmware.busy && !self.firmware.loading {
+        if !self.firmware.loading {
             self.firmware.loading = true;
             crate::firmware::refresh(self.tx.clone());
         }
@@ -3200,50 +3294,6 @@ impl Capsule {
         cx.notify();
     }
 
-    fn set_notification_duration(&mut self, seconds: u64, cx: &mut Context<Self>) {
-        if self.notification_duration_seconds == seconds {
-            self.notification_duration_menu_open = false;
-            cx.notify();
-            return;
-        }
-        let result = crate::settings::path().and_then(|path| {
-            crate::settings::save_notification_duration_seconds_to(&path, seconds)
-        });
-        match result {
-            Ok(seconds) => {
-                self.notification_duration_seconds = seconds;
-                self.settings_error = None;
-            }
-            Err(error) => {
-                self.settings_error = Some(format!(
-                    "{}{error:#}",
-                    self.language.strings().err_notification_duration_save
-                ));
-            }
-        }
-        self.notification_duration_menu_open = false;
-        cx.notify();
-    }
-
-    fn set_desktop_notifications_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let result = crate::settings::path().and_then(|path| {
-            crate::settings::save_desktop_notifications_enabled_to(&path, enabled)
-        });
-        match result {
-            Ok(enabled) => {
-                self.desktop_notifications_enabled = enabled;
-                self.settings_error = None;
-            }
-            Err(error) => {
-                self.settings_error = Some(format!(
-                    "{}{error:#}",
-                    self.language.strings().err_notification_enabled_save
-                ));
-            }
-        }
-        cx.notify();
-    }
-
     fn notification_position_label(&self) -> &'static str {
         let text = self.language.strings();
         match self.notification_position {
@@ -3256,6 +3306,52 @@ impl Capsule {
             }
             crate::settings::NotificationPosition::BottomRight => text.notice_position_bottom_right,
         }
+    }
+
+    fn completion_duration_select(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .gap(px(5.))
+            .children(wayline_host::NOTIFICATION_DURATION_OPTIONS.map(|seconds| {
+                let selected = self.completion_duration_seconds == seconds;
+                div()
+                    .id(SharedString::from(format!("completion-duration-{seconds}")))
+                    .flex_1()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.))
+                    .bg(rgb(if selected { 0x173e69 } else { 0x303038 }))
+                    .text_color(rgb(if selected { 0xa6d2ff } else { INK }))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .child(format!("{seconds} s"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.completion_duration_seconds == seconds {
+                            return;
+                        }
+                        this.settings_error =
+                            match wayline_host::save_completion_duration_seconds(seconds) {
+                                Ok(saved) => {
+                                    this.completion_duration_seconds = saved;
+                                    if let Some(result) = &mut this.share_result {
+                                        result.renew_deadline(saved);
+                                    }
+                                    None
+                                }
+                                Err(error) => {
+                                    let text = this.language.strings();
+                                    Some(format!(
+                                        "{}{}: {error:#}",
+                                        text.err_behavior_setting_save,
+                                        text.completion_duration_title
+                                    ))
+                                }
+                            };
+                        cx.notify();
+                    }))
+            }))
     }
 
     fn notification_position_select(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3318,7 +3414,6 @@ impl Capsule {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.notification_position_menu_open =
                             !this.notification_position_menu_open;
-                        this.notification_duration_menu_open = false;
                         cx.notify();
                     })),
             )
@@ -3367,111 +3462,39 @@ impl Capsule {
             .into_any_element()
     }
 
-    fn notification_duration_select(&self, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.notification_duration_menu_open;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                if this.notification_duration_menu_open {
-                    this.notification_duration_menu_open = false;
-                    cx.notify();
-                }
-            }))
-            .child(
-                div()
-                    .id("notification-duration-select")
-                    .h(px(36.))
-                    .w_full()
-                    .px(px(12.))
-                    .rounded(px(9.))
-                    .border_1()
-                    .border_color(rgb(if open { BLUE } else { 0x3a3a40 }))
-                    .bg(rgb(0x202024))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .hover(|style| style.bg(rgb(0x2a2a31)))
-                    .child(
-                        self.language
-                            .notification_duration(self.notification_duration_seconds),
-                    )
-                    .child(dropdown_chevron(open))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.notification_duration_menu_open =
-                            !this.notification_duration_menu_open;
-                        this.notification_position_menu_open = false;
-                        cx.notify();
-                    })),
-            )
-            .when(open, |field| {
-                field.child(
-                    div()
-                        .id("notification-duration-menu")
-                        .w_full()
-                        .rounded(px(10.))
-                        .border_1()
-                        .border_color(rgba(0xffffff18))
-                        .bg(rgb(0x1c1c1f))
-                        .p(px(4.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .children(
-                            crate::settings::NOTIFICATION_DURATION_OPTIONS
-                                .into_iter()
-                                .map(|seconds| {
-                                    let selected = self.notification_duration_seconds == seconds;
-                                    div()
-                                        .id(("notification-duration-option", seconds as usize))
-                                        .h(px(30.))
-                                        .flex_shrink_0()
-                                        .px(px(8.))
-                                        .rounded(px(6.))
-                                        .bg(rgb(if selected { 0x163353 } else { 0x1c1c1f }))
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .cursor_pointer()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(if selected { INK } else { MUTED }))
-                                        .hover(|style| style.bg(rgb(0x2f2f36)))
-                                        .child(self.language.notification_duration(seconds))
-                                        .when(selected, |row| {
-                                            row.child(div().text_color(rgb(BLUE)).child("✓"))
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_notification_duration(seconds, cx)
-                                        }))
-                                }),
-                        ),
-                )
-            })
-            .into_any_element()
+    fn reveal_receive_window(&mut self, window: &mut Window) {
+        // An early link result may already have revealed the card for a share
+        // whose attachments are now streaming. Replace it with live progress.
+        let previous = self.clear_share_result(window).unwrap_or(self.visibility);
+        self.receive_revealed |=
+            self.visibility == Visibility::Hidden || previous == Visibility::Hidden;
+        if self.visibility == Visibility::Hidden {
+            self.slide_out_panel = false;
+            self.visibility = Visibility::Share;
+            self.place();
+        }
     }
 
-    fn show_share_result(
-        &mut self,
-        title: String,
-        message: String,
-        original: Option<String>,
-        image: Option<Arc<RenderImage>>,
-        window: &mut Window,
-    ) {
-        let previous_visibility = self.clear_share_result(window).unwrap_or(self.visibility);
-        self.share_result = Some(ShareResult {
-            title,
-            message,
-            original,
-            image,
-            copied: false,
-            deadline: Instant::now() + SHARE_RESULT_DURATION,
-            previous_visibility,
-        });
+    fn keep_share_window_open(&mut self) {
+        self.receive_revealed = false;
+        if let Some(result) = &mut self.share_result {
+            result.previous_visibility = Visibility::Share;
+        }
+    }
+
+    fn show_share_result(&mut self, mut result: ShareResult, window: &mut Window) {
+        let previous_result = self.clear_share_result(window);
+        let receive_revealed = std::mem::take(&mut self.receive_revealed);
+        let previous_visibility = if receive_revealed || self.visibility == Visibility::Hidden {
+            Visibility::Hidden
+        } else {
+            previous_result.unwrap_or(self.visibility)
+        };
+        result.previous_visibility = previous_visibility;
+        result.renew_deadline(self.completion_duration_seconds);
+        self.share_result = Some(result);
         if self.visibility != Visibility::Share {
+            self.slide_out_panel = false;
             self.visibility = Visibility::Share;
             self.place();
         }
@@ -3486,8 +3509,18 @@ impl Capsule {
     }
 
     fn finish_share_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clear_share_result(window) == Some(Visibility::Hidden)
-            && self.visibility == Visibility::Share
+        let temporary_card = self
+            .share_result
+            .as_ref()
+            .is_some_and(|result| result.previous_visibility == Visibility::Hidden);
+        if !temporary_card || !self.hide_temporary_share_window() {
+            self.clear_share_result(window);
+        }
+        cx.notify();
+    }
+
+    fn hide_temporary_share_window(&mut self) -> bool {
+        if self.visibility == Visibility::Share
             && self.incoming.is_none()
             && !self.picker_open
             && !self.settings_open
@@ -3496,102 +3529,12 @@ impl Capsule {
             && !self.model.phase.busy()
             && self.model.files.is_empty()
         {
+            self.slide_out_panel = true;
             self.visibility = Visibility::Hidden;
             self.place();
+            return true;
         }
-        cx.notify();
-    }
-
-    fn show_desktop_notification(
-        &mut self,
-        title: &'static str,
-        message: String,
-        full_text: String,
-        position: crate::settings::NotificationPosition,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.desktop_notifications_enabled {
-            return;
-        }
-        if let Some(previous) = self.notification_window.take() {
-            let _ = previous.update(cx, |_, window, _| window.remove_window());
-        }
-        let Some(owner) = self.shell.as_ref().map(Shell::notification_owner) else {
-            return;
-        };
-        let text = self.language.strings();
-        let copy = text.copy;
-        let copied = text.copied;
-        let duration_seconds = self.notification_duration_seconds;
-        let fallback_title = title;
-        let fallback_message = message.clone();
-        let positioning_fallback_message = message.clone();
-        let height = crate::notification::DesktopNotification::height();
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                point(px(0.), px(0.)),
-                size(
-                    px(crate::notification::DesktopNotification::width()),
-                    px(height),
-                ),
-            ))),
-            titlebar: None,
-            kind: WindowKind::PopUp,
-            focus: false,
-            show: true,
-            is_movable: false,
-            is_resizable: false,
-            is_minimizable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        };
-        match cx.open_window(options, move |window, cx| {
-            cx.new(|cx| {
-                crate::notification::DesktopNotification::new(
-                    window,
-                    cx,
-                    crate::notification::NotificationContent {
-                        title: title.into(),
-                        message: message.clone(),
-                        full_text,
-                        copy_label: copy,
-                        copied_label: copied,
-                        duration_seconds,
-                    },
-                )
-            })
-        }) {
-            Ok(notification) => {
-                let positioned = notification;
-                cx.defer(move |cx| {
-                    let position_result = positioned
-                        .update(cx, |_, window, _| {
-                            crate::native::queue_notification_position(
-                                owner,
-                                window,
-                                position,
-                                crate::notification::DesktopNotification::width(),
-                                height,
-                                fallback_title,
-                                &positioning_fallback_message,
-                            )
-                        })
-                        .and_then(|result| result);
-                    if let Err(error) = position_result {
-                        eprintln!("无法定位 Windows 桌面通知：{error:#}");
-                        let _ = positioned.update(cx, |_, window, _| window.remove_window());
-                        crate::native::notify_owner(owner, fallback_title, &fallback_message);
-                    }
-                });
-                self.notification_window = Some(notification);
-            }
-            Err(error) => {
-                eprintln!("无法打开 Windows 桌面通知：{error:#}");
-                if let Some(shell) = &self.shell {
-                    shell.notify(title, &fallback_message);
-                }
-            }
-        }
+        false
     }
 
     fn receive_notice_view(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3691,19 +3634,6 @@ impl Capsule {
                     )
                     .child(
                         checkbox(
-                            "desktop-notifications-enabled",
-                            text.notice_enabled,
-                            self.desktop_notifications_enabled,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.set_desktop_notifications_enabled(
-                                !this.desktop_notifications_enabled,
-                                cx,
-                            )
-                        })),
-                    )
-                    .child(
-                        checkbox(
                             "drag-activate-enabled",
                             text.drag_activate,
                             self.drag_activate,
@@ -3714,10 +3644,48 @@ impl Capsule {
                     )
                     .child(div().text_size(px(13.)).child(text.notice_position_title))
                     .child(self.notification_position_select(cx))
-                    .child(div().text_size(px(13.)).child(text.notice_duration_title))
-                    .child(self.notification_duration_select(cx)),
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .child(text.completion_duration_title),
+                    )
+                    .child(self.completion_duration_select(cx)),
             )
             .child(self.radio_settings_view(cx))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .rounded(px(16.))
+                    .bg(rgb(SURFACE))
+                    .p(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(13.))
+                            .child(firmware_icon())
+                            .child(text.firmware_title),
+                    )
+                    .child(
+                        button("open-firmware", text.firmware_install, false)
+                            .h(px(32.))
+                            .px(px(12.))
+                            .when_else(
+                                self.can_open_firmware(),
+                                |button| {
+                                    button.on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_firmware(window, cx)
+                                    }))
+                                },
+                                |button| button.opacity(0.4).cursor_default(),
+                            ),
+                    ),
+            )
             .child(self.apple_identity_view(cx))
             .child(self.trusted_senders_view(cx))
             .child(
@@ -4852,9 +4820,9 @@ impl Capsule {
             .child(
                 button(
                     "accept-incoming",
-                    if is_link_share && has_files {
+                    if request.transfer.urls.len() == 1 && has_files {
                         text.accept_files_and_open_links
-                    } else if is_link_share {
+                    } else if request.transfer.urls.len() == 1 {
                         self.language.open_shared_links()
                     } else {
                         text.accept
@@ -5430,10 +5398,9 @@ impl Render for Capsule {
                     cx.notify();
                     return;
                 }
-                if this.notification_position_menu_open || this.notification_duration_menu_open {
+                if this.notification_position_menu_open {
                     if event.keystroke.key == "escape" {
                         this.notification_position_menu_open = false;
-                        this.notification_duration_menu_open = false;
                         cx.notify();
                     }
                     return;
@@ -5457,7 +5424,7 @@ impl Render for Capsule {
             }))
             .child(if self.exit_state.is_some() {
                 self.exit_panel(cx)
-            } else if self.visibility == Visibility::Share {
+            } else if self.visibility == Visibility::Share || self.slide_out_panel {
                 self.panel(cx)
             } else {
                 self.pill(cx)
@@ -5511,6 +5478,28 @@ fn checkbox(id: impl Into<ElementId>, label: &'static str, checked: bool) -> Sta
                 .child(if checked { "✓" } else { "" }),
         )
         .child(div().text_size(px(11.)).whitespace_normal().child(label))
+}
+
+fn folder_icon() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let at = |x, y| bounds.origin + point(px(x), px(y));
+            let mut folder = PathBuilder::stroke(px(1.25));
+            folder.move_to(at(1.5, 13.));
+            folder.line_to(at(1.5, 3.5));
+            folder.line_to(at(6., 3.5));
+            folder.line_to(at(7.5, 5.5));
+            folder.line_to(at(14.5, 5.5));
+            folder.line_to(at(14.5, 13.));
+            folder.close();
+            if let Ok(path) = folder.build() {
+                window.paint_path(path, window.text_style().color);
+            }
+        },
+    )
+    .size(px(16.))
+    .flex_shrink_0()
 }
 
 fn firmware_icon() -> impl IntoElement {

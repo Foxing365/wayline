@@ -11,6 +11,7 @@ use wayline_host::{
 
 enum Command {
     Append(TransferHistoryRecord, Vec<PathBuf>),
+    Relocate(TransferHistoryRecord, Vec<PathBuf>),
     Delete(Vec<TransferHistoryRecord>, bool, bool),
     SaveDeletePreference(bool),
     Flush(Sender<()>),
@@ -33,6 +34,11 @@ impl StoreWorker {
                                 record.file_bytes = Some(bytes);
                             }
                             let result = append_transfer_history(record)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = events.send(Event::HistoryUpdated(result));
+                        }
+                        Command::Relocate(record, paths) => {
+                            let result = wayline_host::relocate_received_transfer(&record, paths)
                                 .map_err(|error| format!("{error:#}"));
                             let _ = events.send(Event::HistoryUpdated(result));
                         }
@@ -63,6 +69,10 @@ impl StoreWorker {
 
     pub fn append(&self, record: TransferHistoryRecord, received_files: Vec<PathBuf>) {
         let _ = self.0.send(Command::Append(record, received_files));
+    }
+
+    pub fn relocate_received(&self, record: TransferHistoryRecord, paths: Vec<PathBuf>) {
+        let _ = self.0.send(Command::Relocate(record, paths));
     }
 
     pub fn delete(&self, records: Vec<TransferHistoryRecord>, delete_files: bool, remember: bool) {
@@ -165,6 +175,7 @@ mod tests {
             format: None,
             file_names: Vec::new(),
             file_paths: Vec::new(),
+            file_destinations: Vec::new(),
         }
     }
 

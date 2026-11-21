@@ -474,6 +474,7 @@ impl Model {
                 })
                 .collect(),
             file_paths: self.send_file_paths.clone(),
+            file_destinations: Vec::new(),
             channel: self.send_channel,
             format: self.send_format,
             file_bytes: Some(self.send_file_bytes),

@@ -159,15 +159,15 @@ cargo run --locked -p wayline-radio -- COM4 hello
 | `--unregister-shell` | 退出后移除当前用户的文件右键和“发送到”入口 |
 | `--version` | 输出版本，不初始化 GPUI 或服务 |
 
-名称、接收目录、界面语言和身份保存在 `%LOCALAPPDATA%\wayline`。`desktop.json` 在进程锁下原子写入并保留未知设置；身份创建和 `receiver-services.json` 中的广播更名记录也受锁保护。`download_directory` 默认指向 Downloads/Wayline，更改时不移动已有文件，接收期间禁止更改。`language` 保存 `zh-CN`、`zh-TW`、`en-US`、`ja-JP`、`ko-KR`、`fr-FR`、`de-DE` 或 `es-ES`；缺少该字段时按 Windows 界面语言选择，不支持的系统语言回退到 English。`desktop_notifications_enabled` 控制是否显示独立桌面接收通知，默认开启；`notification_position` 支持左上、上中、右上、左下、下中、右下，默认 `top-right`；`notification_duration_seconds` 允许 3、5、8、10、15 或 30 秒，默认 8 秒。通知使用淡入淡出过渡。切换语言会立即更新窗口、托盘、系统对话框和通知，并重新注册资源管理器入口。界面文案位于 `apps/desktop/locales/*.toml`（当前 8 种语言），`apps/desktop/build.rs` 在构建时校验所有语言的键集合与占位符并生成静态文案表；新增语言时需要同时添加 TOML、`Language` 枚举项和 `build.rs` 构建列表，并保持全部翻译完整。共享模块（传输、烧录和本地设置校验）的底层错误详情仍按原文显示。完整接收错误写入 `desktop-receiver.log`。
+名称、接收目录、界面语言和身份保存在 `%LOCALAPPDATA%\wayline`。`desktop.json` 在进程锁下原子写入并保留未知设置；身份创建和 `receiver-services.json` 中的广播更名记录也受锁保护。`download_directory` 默认指向 Downloads/Wayline，更改时不移动已有文件，接收期间禁止更改。`language` 保存 `zh-CN`、`zh-TW`、`en-US`、`ja-JP`、`ko-KR`、`fr-FR`、`de-DE` 或 `es-ES`；缺少该字段时按 Windows 界面语言选择，不支持的系统语言回退到 English。`notification_position` 指定接收提示在分享窗口内的位置，默认 `top-right`。切换语言会立即更新窗口、托盘、系统对话框和通知，并重新注册资源管理器入口。界面文案位于 `apps/desktop/locales/*.toml`（当前 8 种语言），`apps/desktop/build.rs` 在构建时校验所有语言的键集合与占位符并生成静态文案表；新增语言时需要同时添加 TOML、`Language` 枚举项和 `build.rs` 构建列表，并保持全部翻译完整。共享模块（传输、烧录和本地设置校验）的底层错误详情仍按原文显示。完整接收错误写入 `desktop-receiver.log`。
 
 `pinned` 默认 `false`，开启后分享卡片失去焦点时仍保持显示。`drag_activate` 和 `auto_open_download_dir` 默认 `true`，分别控制拖动时显示投放入口、确认接收成功后打开第一个文件的位置。缺失或 `null` 使用默认值，其他非布尔值报错；读取失败会在卡片中提示，保存失败保留内存中的原值。
 
 在设置选择 Wayline 原版、NekoDrop 浅色或 NekoDrop 深色，点「刷新界面」后保存偏好并在当前窗口应用。点取消会保留当前界面。外观使用 `compact_send_view` 和 `compact_send_dark` 原子保存，旧版设置缺少深色选项时沿用原来的外观。「开机自启」管理当前用户启动文件夹中的快捷方式。
 
-启用桌面通知时，接收第一个上传进度事件后在屏幕右下角显示一次提示。成功收发结果在分享窗口显示 10 秒。接收结果可以预览收到的图片、复制分享文字。
+首次收到上传进度事件时，分享窗口从托盘显示，并保持当前应用的焦点。接收进度和失败信息显示在同一个窗口。成功收发结果默认显示 10 秒，显示时长保存在 `completion_duration_seconds`。可以预览收到的图片和复制分享文字。为后台接收临时显示的窗口在预览或失败提示结束后收回，用户主动打开时可继续停留。
 
-活动发送与接收卡片按进度事件显示平滑速度，进度停滞一秒后速度归零。耗时从首个 `Uploading` 或 `Receiving` 事件（包括零字节事件）开始计算，持续到最终确认，排除准备和等待接受的时间。历史平均速度使用传输流字节数除以这一耗时。分享卡片顶部提供设备固件和最近传输图标入口。
+活动发送与接收卡片按进度事件显示平滑速度，进度停滞一秒后速度归零。耗时从首个 `Uploading` 或 `Receiving` 事件（包括零字节事件）开始计算，持续到最终确认，排除准备和等待接受的时间。历史平均速度使用传输流字节数除以这一耗时。分享卡片顶部提供接收文件夹和最近传输入口。设备固件位于设置页。
 
 页面、列表和长文本使用共用滚动区域。内容超出可视区时显示常驻比例滚动条，支持滚轮、拖动滑块和点击轨道。鼠标滚轮分格滚动时，列表平滑移动到目标位置。触控板连续输入和 Windows 关闭动画效果时保持直接滚动。嵌套区域优先滚动内部内容，到达边界后再滚动外层。底部操作保持固定，包括历史删除确认的确认与取消按钮。
 
@@ -202,6 +202,8 @@ cargo run -p wayline-desktop --example scroll_preview --locked
 按钮或快捷键 1/2/3 分别选择长列表、短列表和嵌套内容，Esc 关闭预览。可检查溢出时的滚动条显示、滚轮、滑块拖动、轨道点击和底部固定操作。
 
 `orb_geometry.rs` 负责有界投影和连接过渡，`orb.rs` 在隐藏页面暂停动画。`window_frame.rs` 保留逐像素透明度，并排除透明角落的鼠标命中。托盘独立于卡片可见性更新无线状态，资源管理器重启后恢复图标。
+
+`native_slide.rs` 在窗口消息循环中移动现有 HWND，并把滑动区域裁剪在当前显示器边缘。接收时自动滑入保留前台焦点，拖放小胶囊立即定位。关闭和失焦后的滑出期间保留面板内容，Windows 关闭动画效果时直接显示或隐藏。
 
 [品牌母版](../assets/branding/README.md)通过 Node.js 和 `sharp` 生成纳入版本控制的资源，可用 `WAYLINE_SHARP_MODULE` 指定已安装的包：
 

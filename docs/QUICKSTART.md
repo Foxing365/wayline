@@ -16,7 +16,7 @@ Received files, device name and identity settings are preserved.
 
 ## Initialize the Board
 
-1. Connect the board with a data cable and open Device firmware at the top of the sharing card.
+1. Connect the board with a data cable and open Device firmware in Settings.
 2. Select the serial port and matching profile: Cardputer Adv, ESP32-S3 Headless UART0 / Native USB, or ESP32-C5 UART0 / Native USB. UART0 and Native USB profiles must match the USB interface connected to the PC. S3 Headless profiles require 8 MiB flash.
 3. For first use, choose First install / Reinstall. This replaces the program and partition
    layout and may erase data from other firmware. For Wayline updates, choose Preserve settings;

@@ -19,6 +19,10 @@ The receiver validates that shape and saves each file under the name shown for
 consent, following [Owly ASK-5 and UP-2a](https://github.com/t4t5/owly/blob/main/docs/SPEC.md#64-post-ask).
 When distinct offered paths share a filename, each is staged separately and
 published with the same collision suffixes as other received files.
+Unlisted AppleDouble members associated with an offered file or its wrapper
+count toward archive limits and are discarded before staging.
+DVZip blocks are decoded through a fixed buffer with an independent chunk
+limit and the existing upload and extracted-size limits.
 Accepted responses requesting connection closure reconnect before upload;
 transport failure/timeout remains distinct from an explicit refusal. Windows
 regressions live in `crates/wayline-core/tests/airdrop_migration.rs`; upstream

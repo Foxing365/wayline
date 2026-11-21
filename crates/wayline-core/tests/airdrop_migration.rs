@@ -167,6 +167,72 @@ fn protocol_upload(kind: Compressor, chunked: bool) -> (tempfile::TempDir, Vec<u
     wire.extend(if chunked { http::chunk(&body) } else { body });
     (root, ask, wire)
 }
+
+#[test]
+fn tls_receiver_cancels_an_active_upload_with_a_rejection() {
+    let (root, offer, wire) = protocol_upload(Compressor::DvZip, true);
+    let id = identity(root.path());
+    let dest = root.path().join("received");
+    fs::create_dir(&dest).unwrap();
+    let core = Arc::new(ReceiverCore::new(
+        ReceiverOptions::new("receiver", "Windows", &dest).with_accept_all(),
+    ));
+    let listener = TcpListener::bind("[::1]:0").unwrap();
+    let SocketAddr::V6(address) = listener.local_addr().unwrap() else {
+        panic!();
+    };
+    let config = server_config(&id).unwrap();
+    let receiver = core.clone();
+    let worker = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let mut events = Vec::new();
+        let result = ReceiverCore::serve_tls_connection_with_events(
+            socket,
+            config,
+            receiver.clone(),
+            |event| {
+                if let ReceiverEvent::Receiving {
+                    transfer_id,
+                    received,
+                    ..
+                } = &event
+                {
+                    if *received > 0 {
+                        assert!(!receiver.cancel_transfer("unrelated-id"));
+                        assert!(receiver.cancel_transfer(transfer_id));
+                        assert!(!receiver.cancel_transfer(transfer_id));
+                    }
+                }
+                events.push(event);
+            },
+        );
+        (result, events)
+    });
+    let mut tls = client(address);
+    tls.write_all(&offer).unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 200);
+    assert!(!core.cancel_transfer("TEST-ID"));
+    // The sender waits for the reply with the upload still open.
+    tls.write_all(&wire).unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 403);
+    let (result, events) = worker.join().unwrap();
+    assert_eq!(result.unwrap_err().kind(), TransferFailureKind::Cancelled);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ReceiverEvent::TransferFailed {
+            kind: TransferFailureKind::Cancelled,
+            ..
+        }
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ReceiverEvent::Received { .. })));
+    assert!(!core.has_active_transfers());
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+}
+
 fn ask(connection: &mut Connection, bytes: &[u8]) {
     connection.receive(bytes);
     let mut asked = false;
@@ -740,22 +806,22 @@ fn tls_receive_publishes_both_top_level_files_from_one_offer() {
 }
 
 #[test]
-fn tls_batch_of_59_photos_with_nested_wrappers_publishes_all_files() {
+fn tls_batch_of_61_converted_photos_skips_unoffered_appledouble_metadata() {
     use owly_airdrop::proto::{
         archive::{compress::Encoder, cpio},
         messages::{AskFile, Offer},
     };
 
-    const PHOTO_COUNT: u8 = 59;
+    const PHOTO_COUNT: u8 = 61;
     let root = tempfile::tempdir().unwrap();
     let id = identity(root.path());
     let destination = root.path().join("received");
-    let header = |name: &str, mode, size| {
+    let header = |name: &str, mode, size, nlink| {
         cpio::odc_header(&cpio::Entry {
             name: name.into(),
             mode,
             size,
-            nlink: 1,
+            nlink,
             ino: 1,
             uid: 501,
             gid: 20,
@@ -763,23 +829,32 @@ fn tls_batch_of_59_photos_with_nested_wrappers_publishes_all_files() {
         })
     };
     let mut archive = Vec::new();
-    for directory in [".", "./Photos", "./Photos/Export"] {
-        archive.extend(header(directory, cpio::MODE_DIR | 0o755, 0));
+    let prefix = "./Containers/Data/PluginKitPlugin/Photos/tmp/NSIRD_隔空投送_test";
+    for directory in [".", "./Containers", "./Containers/Data", prefix] {
+        archive.extend(header(directory, cpio::MODE_DIR | 0o755, 0, 1));
     }
     let mut photos = Vec::new();
     for index in 0..PHOTO_COUNT {
-        let wrapper = format!("./Photos/Export/{index}");
-        let name = format!("IMG_{index:03}.HEIC");
+        let wrapper = format!("{prefix}/{index}");
+        let name = format!("Converted_{index:03}.JPG");
         let bom_path = format!("{wrapper}/{name}");
         // Apple can include the prefix directories or omit them.
         if index % 2 == 0 {
-            archive.extend(header(&wrapper, cpio::MODE_DIR | 0o755, 0));
+            archive.extend(header(&wrapper, cpio::MODE_DIR | 0o755, 0, 1));
         }
-        archive.extend(header(&bom_path, cpio::MODE_FILE | 0o644, 1));
+        let sidecar = format!("{wrapper}/._Original_{index:03}.pvt");
+        let metadata_mode = if index % 2 == 0 {
+            cpio::MODE_DIR | 0o755
+        } else {
+            cpio::MODE_FILE | 0o644
+        };
+        archive.extend(header(&sidecar, metadata_mode, 4, 2));
+        archive.extend_from_slice(&[0, 5, 22, 7]);
+        archive.extend(header(&bom_path, cpio::MODE_FILE | 0o644, 1, 1));
         archive.push(index);
         photos.push(AskFile {
             name,
-            file_type: "public.heic".into(),
+            file_type: "public.jpeg".into(),
             size: Some(1),
             bom_path,
             is_directory: false,
@@ -794,7 +869,7 @@ fn tls_batch_of_59_photos_with_nested_wrappers_publishes_all_files() {
     let core = ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", &destination))
         .with_decision(|offer| {
             assert_eq!(offer.files.len(), usize::from(PHOTO_COUNT));
-            assert_eq!(offer.files[58].name, "IMG_058.HEIC");
+            assert_eq!(offer.files[60].name, "Converted_060.JPG");
             true
         });
     let (peer, worker) = start(Arc::new(core), &id);
@@ -836,7 +911,7 @@ fn tls_batch_of_59_photos_with_nested_wrappers_publishes_all_files() {
     );
     for index in 0..PHOTO_COUNT {
         assert_eq!(
-            fs::read(destination.join(format!("IMG_{index:03}.HEIC"))).unwrap(),
+            fs::read(destination.join(format!("Converted_{index:03}.JPG"))).unwrap(),
             [index]
         );
     }

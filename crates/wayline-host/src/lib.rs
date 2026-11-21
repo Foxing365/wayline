@@ -22,7 +22,7 @@ use std::{
 pub use transfer_history::{
     TransferDirection, TransferFailureReason, TransferFormat, TransferHistoryRecord,
     TransferOutcome, append_transfer_history, clear_transfer_history, delete_transfer_history,
-    load_transfer_history,
+    load_transfer_history, relocate_received_transfer,
 };
 use wayline_core::{Identity, NetworkInterface};
 
@@ -32,6 +32,7 @@ const MAX_LANGUAGE_CODE_CHARS: usize = 16;
 const DEFAULT_DESKTOP_NOTIFICATIONS_ENABLED: bool = true;
 pub const NOTIFICATION_DURATION_OPTIONS: [u64; 6] = [3, 5, 8, 10, 15, 30];
 pub const DEFAULT_NOTIFICATION_DURATION_SECONDS: u64 = 8;
+pub const DEFAULT_COMPLETION_DURATION_SECONDS: u64 = 10;
 
 /// Screen position used for the desktop receive notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +349,28 @@ pub fn save_notification_duration_seconds_to(path: &Path, seconds: u64) -> Resul
         Value::Number(seconds.into()),
     );
     write_settings(path, &settings)?;
+    Ok(seconds)
+}
+
+pub fn load_completion_duration_seconds() -> Result<u64> {
+    match read_settings(&settings_path()?)?.get("completion_duration_seconds") {
+        None | Some(Value::Null) => Ok(DEFAULT_COMPLETION_DURATION_SECONDS),
+        Some(value) => validate_notification_duration_seconds(
+            value.as_u64().context("完成提示显示时长设置格式不正确")?,
+        ),
+    }
+}
+
+pub fn save_completion_duration_seconds(seconds: u64) -> Result<u64> {
+    let seconds = validate_notification_duration_seconds(seconds)?;
+    let path = settings_path()?;
+    let _guard = FileGuard::acquire(&path.with_extension("lock"))?;
+    let mut settings = read_settings(&path)?;
+    settings.insert(
+        "completion_duration_seconds".into(),
+        Value::Number(seconds.into()),
+    );
+    write_settings(&path, &settings)?;
     Ok(seconds)
 }
 

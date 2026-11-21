@@ -12,7 +12,7 @@
 
 ## 初始化开发板
 
-1. 用数据线连接设备，点击分享卡片顶部的“设备固件”。
+1. 用数据线连接设备，打开「设置 → 设备固件」。
 2. 选择对应串口和固件 profile：Cardputer Adv、ESP32-S3 Headless UART0 / Native USB，或 ESP32-C5 UART0 / Native USB。UART0 与 Native USB 必须匹配实际接入电脑的 USB 接口类型。S3 Headless profile 固定适用于 8 MiB Flash。
 3. 首次使用选“首次 / 重新安装”，会替换程序和分区布局，不保证保留其他固件的数据。已有 Wayline 选“保留设置更新”，要求原固件可识别且分区布局一致。
 4. 点击“开始安装”或“开始更新”，等待写入、校验和启动检查完成，显示“设备已就绪”。

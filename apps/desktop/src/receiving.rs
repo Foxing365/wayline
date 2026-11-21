@@ -91,6 +91,7 @@ pub struct Transfer {
     pub file_names: Vec<String>,
     pub save_dir: PathBuf,
     pub phase: Phase,
+    pub cancel_requested: bool,
     pub started_at: Option<Instant>,
     pub started_at_unix_ms: u64,
     pub file_bytes: Option<u64>,
@@ -109,7 +110,7 @@ impl Transfer {
             .map(|started| now.saturating_duration_since(started))
     }
 
-    fn authorized_web_links(
+    fn approved_links_from_offer(
         &self,
         offer: &IncomingTransfer,
         trusted: &[TrustedSender],
@@ -127,6 +128,15 @@ impl Transfer {
         } else {
             Vec::new()
         }
+    }
+
+    fn authorized_web_links(
+        &self,
+        offer: &IncomingTransfer,
+        trusted: &[TrustedSender],
+    ) -> Vec<String> {
+        let urls = self.approved_links_from_offer(offer, trusted);
+        if urls.len() == 1 { urls } else { Vec::new() }
     }
 }
 
@@ -330,6 +340,7 @@ impl Model {
             file_names,
             save_dir,
             phase: Phase::Waiting,
+            cancel_requested: false,
             started_at: None,
             started_at_unix_ms: crate::history::unix_time_ms(std::time::SystemTime::now()),
             file_bytes,
@@ -351,12 +362,31 @@ impl Model {
         }
     }
 
+    pub fn request_cancel(&mut self, transfer_id: &str, cancel: impl FnOnce(&str) -> bool) -> bool {
+        let Some(active) = self.active.as_mut().filter(|transfer| {
+            transfer.id == transfer_id
+                && matches!(transfer.phase, Phase::Receiving { .. })
+                && !transfer.cancel_requested
+        }) else {
+            return false;
+        };
+        active.cancel_requested = cancel(transfer_id);
+        active.cancel_requested
+    }
+
     /// A file share may identify a webpage before the sender uploads an attachment.
     pub fn links_after_acceptance(
         &mut self,
         offer: &IncomingTransfer,
         trusted: &[TrustedSender],
     ) -> Vec<String> {
+        if offer
+            .files
+            .iter()
+            .any(|file| crate::shared_text::is_text_path(std::path::Path::new(&file.name)))
+        {
+            return Vec::new();
+        }
         let Some(active) = self.active.as_mut().or(self.interrupted.as_mut()) else {
             return Vec::new();
         };
@@ -365,6 +395,17 @@ impl Model {
             active.web_links_opened = true;
         }
         urls
+    }
+
+    pub fn has_accepted_multi_link_text(
+        &self,
+        offer: &IncomingTransfer,
+        trusted: &[TrustedSender],
+    ) -> bool {
+        self.active
+            .as_ref()
+            .or(self.interrupted.as_ref())
+            .is_some_and(|active| active.approved_links_from_offer(offer, trusted).len() > 1)
     }
 
     /// Resolve links against the still-active consent before applying the completion.
@@ -376,12 +417,45 @@ impl Model {
         let ReceiverEvent::Received { transfer, .. } = event else {
             return Vec::new();
         };
+        if transfer
+            .files
+            .iter()
+            .any(|offer| crate::shared_text::is_text_path(std::path::Path::new(&offer.name)))
+        {
+            return Vec::new();
+        }
         self.active
             .as_ref()
             .or(self.interrupted.as_ref())
             .map_or_else(Vec::new, |active| {
                 active.authorized_web_links(transfer, trusted)
             })
+    }
+
+    pub fn text_link_on_completion(
+        &self,
+        event: &ReceiverEvent,
+        text: &crate::shared_text::ReceivedText,
+        trusted: &[TrustedSender],
+    ) -> Vec<String> {
+        let ReceiverEvent::Received { transfer, .. } = event else {
+            return Vec::new();
+        };
+        let Some(active) = self.active.as_ref().or(self.interrupted.as_ref()) else {
+            return Vec::new();
+        };
+        if active.id == transfer.id
+            && !active.web_links_opened
+            && text.eligible_for_automatic_open()
+            && let Some(certificate) = transfer.sender_certificate_sha256
+            && active.sender_certificate_sha256 == Some(certificate)
+            && trusted
+                .iter()
+                .any(|sender| sender.open_web_links && sender.certificate_sha256 == certificate)
+        {
+            return text.urls.clone();
+        }
+        Vec::new()
     }
 
     pub fn interrupt(&mut self, message: String) -> bool {
@@ -614,6 +688,7 @@ impl Model {
                 ReceiverEvent::Received { files, .. } => files.clone(),
                 _ => Vec::new(),
             },
+            file_destinations: Vec::new(),
             channel: transfer.channel,
             format: transfer.format,
             file_bytes: transfer.file_bytes,
@@ -711,6 +786,7 @@ pub fn declined_history_record(
         },
         file_names,
         file_paths: Vec::new(),
+        file_destinations: Vec::new(),
         channel: None,
         format: None,
         file_bytes,
@@ -854,6 +930,14 @@ impl ReceiverHost {
                 .is_some_and(|core| core.has_active_transfers())
         })
     }
+
+    pub fn cancel_transfer(&self, transfer_id: &str) -> bool {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| core.upgrade())
+            .is_some_and(|core| core.cancel_transfer(transfer_id))
+    }
 }
 
 impl Drop for ReceiverHost {
@@ -940,7 +1024,7 @@ fn run(
                     transfer_id,
                     error: crate::i18n::current().strings().incoming_expired.into(),
                     kind: wayline_core::TransferFailureKind::Cancelled,
-                }, None)
+                }, None, None)
                 .timestamped(),
             );
         }
@@ -963,6 +1047,12 @@ fn run(
                 }
                 ReceiverEvent::Received { transfer, files } => {
                     crate::preview::share_image(transfer.icon.as_deref(), files)
+                }
+                _ => None,
+            };
+            let shared_text = match &event {
+                ReceiverEvent::Received { files, .. } => {
+                    crate::shared_text::read_single_text(files)
                 }
                 _ => None,
             };
@@ -1012,7 +1102,7 @@ fn run(
             }
             if events
                 .send(Event::Timestamped(
-                    Box::new(Event::ReceiverActivity(event, image)),
+                    Box::new(Event::ReceiverActivity(event, image, shared_text)),
                     at,
                     unix_ms,
                 ))
@@ -1139,6 +1229,61 @@ mod tests {
     }
 
     #[test]
+    fn txt_auto_open_requires_one_short_link_and_permission_for_its_certificate() {
+        let mut share = transfer("text-file");
+        share.sender_certificate_sha256 = Some([7; 32]);
+        share.files.push(wayline_core::IncomingFile {
+            name: "shared.txt".into(),
+            kind: "public.plain-text".into(),
+            size: Some(32),
+        });
+        share.urls = vec!["https://v.douyin.com/abc/".into()];
+        let event = ReceiverEvent::Received {
+            transfer: share.clone(),
+            files: vec!["downloads/shared.txt".into()],
+        };
+        let mut model = Model::default();
+        model.begin(&share, "downloads".into());
+        let sample =
+            crate::shared_text::classify_text("看看 https://v.douyin.com/abc/".into()).unwrap();
+        let mut device = TrustedSender {
+            name: "phone".into(),
+            certificate_sha256: [7; 32],
+            open_web_links: false,
+        };
+        assert!(
+            model
+                .text_link_on_completion(&event, &sample, &[device.clone()])
+                .is_empty()
+        );
+        device.open_web_links = true;
+        assert!(
+            model
+                .links_on_completion(&event, &[device.clone()])
+                .is_empty()
+        );
+        assert_eq!(
+            model.text_link_on_completion(&event, &sample, &[device.clone()]),
+            ["https://v.douyin.com/abc/"]
+        );
+        let multiple = crate::shared_text::classify_text(
+            "https://v.douyin.com/abc/ https://v.douyin.com/def/".into(),
+        )
+        .unwrap();
+        assert!(
+            model
+                .text_link_on_completion(&event, &multiple, &[device.clone()])
+                .is_empty()
+        );
+        device.certificate_sha256 = [8; 32];
+        assert!(
+            model
+                .text_link_on_completion(&event, &sample, &[device])
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn web_link_automation_requires_explicit_permission_for_the_matching_certificate() {
         let mut sender = TrustedSender {
             name: "phone".into(),
@@ -1147,8 +1292,8 @@ mod tests {
         };
         let mut share = transfer("one");
         share.files.push(wayline_core::IncomingFile {
-            name: "one.txt".into(),
-            kind: "public.plain-text".into(),
+            name: "one.jpg".into(),
+            kind: "public.jpeg".into(),
             size: Some(1),
         });
         share.sender_certificate_sha256 = Some([42; 32]);
@@ -1163,7 +1308,7 @@ mod tests {
         model.mark_automatic_acceptance();
         let event = ReceiverEvent::Received {
             transfer: share.clone(),
-            files: vec![PathBuf::from("downloads/one.txt")],
+            files: vec![PathBuf::from("downloads/one.jpg")],
         };
         assert_eq!(
             model.links_on_completion(&event, std::slice::from_ref(&sender)),
@@ -1274,6 +1419,41 @@ mod tests {
         assert!(
             auto_open_location(&failed, model.apply(&failed), true, Some(&directory)).is_none()
         );
+    }
+
+    #[test]
+    fn cancellation_requests_are_bound_to_an_active_upload_until_terminal_confirmation() {
+        let offer = transfer("current");
+        let mut model = Model::default();
+        model.begin(&offer, PathBuf::from("chosen folder"));
+        assert!(!model.request_cancel(&offer.id, |_| panic!("waiting for upload")));
+
+        let progress = |received| ReceiverEvent::Receiving {
+            transfer_id: offer.id.clone(),
+            received,
+            total: Some(1024),
+        };
+        assert!(model.apply(&progress(128)));
+        assert!(!model.request_cancel("old", |_| panic!("stale click")));
+        assert!(!model.request_cancel(&offer.id, |_| false));
+        assert!(!model.active.as_ref().unwrap().cancel_requested);
+
+        assert!(model.request_cancel(&offer.id, |id| id == "current"));
+        assert!(!model.request_cancel(&offer.id, |_| panic!("cancellation already scheduled")));
+        assert!(model.apply(&progress(256)));
+        let active = model.active.as_ref().unwrap();
+        assert!(active.cancel_requested);
+        assert_eq!(active.transferred_bytes, 256);
+
+        let cancelled = |id: &str| ReceiverEvent::TransferFailed {
+            transfer_id: id.into(),
+            error: "cancelled".to_owned(),
+            kind: wayline_core::TransferFailureKind::Cancelled,
+        };
+        assert!(!model.apply(&cancelled("old")));
+        assert!(model.apply(&cancelled(&offer.id)));
+        assert!(model.active.is_none());
+        assert_eq!(model.notice.as_ref().unwrap().kind, NoticeKind::Info);
     }
 
     #[test]

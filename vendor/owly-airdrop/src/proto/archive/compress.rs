@@ -18,6 +18,7 @@ pub enum Error {
     DvZipChunkLength {
         after_complete_chunk: bool,
         reason: &'static str,
+        declared_bytes: u32,
     },
     Deflate(String),
 }
@@ -30,13 +31,17 @@ impl fmt::Display for Error {
             Error::DvZipChunkLength {
                 after_complete_chunk,
                 reason,
+                declared_bytes,
             } => {
                 let stage = if *after_complete_chunk {
                     "a later"
                 } else {
                     "the first"
                 };
-                write!(f, "bad DVZip stream: {reason} in {stage} chunk header")
+                write!(
+                    f,
+                    "bad DVZip stream: {reason} in {stage} chunk header ({declared_bytes} bytes declared)"
+                )
             }
             Error::Deflate(e) => write!(f, "bad deflate data: {e}"),
         }
@@ -348,6 +353,7 @@ impl DvZipDecoder {
                         return Err(Error::DvZipChunkLength {
                             after_complete_chunk: self.completed_chunk,
                             reason,
+                            declared_bytes: len,
                         });
                     }
                     if stored {
@@ -623,6 +629,40 @@ pub(crate) mod tests {
 
     // spec: DVZ-3, DVZ-4
     #[test]
+    fn dvzip_streams_a_large_compressed_chunk_after_a_small_one() {
+        use std::io::Write;
+
+        let mut wire = dvzip_chunk(b"header", Compression::fast());
+        let payload = vec![0x77; 5 << 20];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() > 4 << 20);
+        wire.extend((compressed.len() as u32).to_be_bytes());
+        wire.extend(compressed);
+
+        let limit = crate::proto::receiver::Limits::default().max_dvzip_chunk;
+        let mut decoder = DvZipDecoder::new(limit);
+        let mut scratch = [0; 64 << 10];
+        let mut decoded = 0;
+        let mut input = wire.as_slice();
+        while !input.is_empty() || !decoder.at_boundary() {
+            let step = decoder.decode(input, &mut scratch).unwrap();
+            assert!(step.consumed > 0 || step.produced > 0);
+            input = &input[step.consumed..];
+            let end = decoded + step.produced;
+            for (index, &byte) in scratch[..step.produced].iter().enumerate() {
+                assert_eq!(
+                    byte,
+                    b"header".get(decoded + index).copied().unwrap_or(0x77)
+                );
+            }
+            decoded = end;
+        }
+        assert_eq!(decoded, b"header".len() + payload.len());
+    }
+
+    #[test]
     fn dvzip_rejects_bad_chunks() {
         let good = dvzip_chunk(b"hello", Compression::default());
 
@@ -662,6 +702,7 @@ pub(crate) mod tests {
             Err(Error::DvZipChunkLength {
                 after_complete_chunk: false,
                 reason: "zero chunk length",
+                declared_bytes: 0,
             })
         );
         let mut later = good;
@@ -671,6 +712,7 @@ pub(crate) mod tests {
             Err(Error::DvZipChunkLength {
                 after_complete_chunk: true,
                 reason: "compressed chunk length exceeds the configured limit",
+                declared_bytes: 1 << 30,
             })
         );
 

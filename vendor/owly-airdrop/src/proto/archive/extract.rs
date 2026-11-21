@@ -226,13 +226,13 @@ impl Rules {
             return Ok(Item::Root);
         }
         let path = RelPath::parse(&entry.name)?;
-        let unsupported = || Error::Unsupported(entry.name.clone());
-        // SEC-1: plain files and directories only. A file with other links is
-        // a hard link, whose data may be in another entry.
-        if !(entry.is_file() && entry.nlink <= 1 || entry.is_dir() && entry.size == 0) {
-            return Err(unsupported());
-        }
         let offered = self.allowed.iter().find(|item| item.path == path);
+        let sidecar = offered.is_none() && self.is_sidecar(&path);
+        // AppleDouble entries are consumed without constructing an object on disk.
+        // The type and link checks apply to anything we might extract or traverse.
+        if !sidecar && !(entry.is_file() && entry.nlink <= 1 || entry.is_dir() && entry.size == 0) {
+            return Err(Error::Unsupported(entry.name.clone()));
+        }
         if offered.is_some_and(|item| item.is_directory != entry.is_dir()) {
             return Err(Error::NotAsked(entry.name.clone()));
         }
@@ -246,7 +246,7 @@ impl Rules {
                     && a.path.components().len() > path.components().len()
                     && a.path.starts_with(&path)
             });
-        let item = if wrapper || !listed && entry.is_file() && self.is_sidecar(&path) {
+        let item = if wrapper || sidecar {
             Item::Skip
         } else if listed && entry.is_file() && path.components().len() > 1 {
             Item::WrappedFile(RelPath::file_name(path.last())?)
@@ -293,7 +293,8 @@ impl Rules {
             .any(|a| a.is_directory && path.starts_with(&a.path) && *path != a.path)
     }
 
-    /// `._name` next to an allowed `name`.
+    /// `._name` associated with an offer, including metadata for the original
+    /// resource in a Photos wrapper that also contains converted files.
     fn is_sidecar(&self, path: &RelPath) -> bool {
         let Some(name) = path.last().strip_prefix("._") else {
             return false;
@@ -301,14 +302,20 @@ impl Rules {
         let Ok(mut target) = RelPath::file_name(name) else {
             return false;
         };
-        if let Some(parent) = path.parent() {
-            let mut components = parent.0;
+        let parent = path.parent();
+        if let Some(parent) = &parent {
+            let mut components = parent.0.clone();
             components.push(name.into());
             target = RelPath(components);
         }
-        self.allowed
-            .iter()
-            .any(|a| target == a.path || a.is_directory && target.starts_with(&a.path))
+        self.allowed.iter().any(|a| {
+            target == a.path
+                || a.is_directory && target.starts_with(&a.path)
+                || parent.as_ref().is_some_and(|parent| {
+                    a.path.components().len() > parent.components().len()
+                        && a.path.starts_with(parent)
+                })
+        })
     }
 }
 
@@ -486,6 +493,42 @@ mod tests {
             r.check(&entry("a", MODE_FILE | 0o644, 1)),
             Err(Error::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn discards_unoffered_appledouble_entries_in_photo_wrappers() {
+        let mut r = rules(&[("Photos/Export/Converted.JPG", false)]);
+        // Some sidecars carry a directory mode or a non-single link count.
+        let mut sidecar = entry("./Photos/Export/._Original.pvt", MODE_DIR | 0o755, 24);
+        sidecar.nlink = 2;
+        assert_eq!(r.check(&sidecar), Ok(Item::Skip));
+        assert!(matches!(r.finish(), Err(Error::Missing(_))));
+        assert!(matches!(r.check(&sidecar), Err(Error::Duplicate(_))));
+        assert!(matches!(
+            r.check(&entry("./Elsewhere/._Original.pvt", MODE_FILE | 0o644, 24)),
+            Err(Error::NotAsked(_))
+        ));
+        assert!(matches!(
+            r.check(&entry(
+                "./Photos/Export/Original.pvt",
+                MODE_FILE | 0o644,
+                24
+            )),
+            Err(Error::NotAsked(_))
+        ));
+        assert!(matches!(
+            r.check(&entry("./Photos/Export/Converted.JPG", 0o120777, 3)),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            r.check(&entry(
+                "./Photos/Export/Converted.JPG",
+                MODE_FILE | 0o644,
+                3
+            )),
+            Ok(Item::WrappedFile(_))
+        ));
+        assert!(r.finish().is_ok());
     }
 
     #[test]

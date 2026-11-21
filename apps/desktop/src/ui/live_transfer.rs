@@ -108,10 +108,11 @@ impl Capsule {
                 active: model.phase.busy(),
             },
             false,
+            None,
         )
     }
 
-    pub(super) fn receiving_view(&self, mini: bool) -> AnyElement {
+    pub(super) fn receiving_view(&self, mini: bool, cx: &mut Context<Self>) -> AnyElement {
         let text = self.language.strings();
         let transfer = self.receive.active.as_ref().unwrap();
         let (title, bytes, total, note) = match transfer.phase {
@@ -160,6 +161,8 @@ impl Capsule {
                 active: true,
             },
             mini,
+            matches!(transfer.phase, ReceivePhase::Receiving { .. })
+                .then(|| self.receive_cancel_button(transfer, cx)),
         );
         if mini {
             return card;
@@ -200,7 +203,58 @@ impl Capsule {
             .into_any_element()
     }
 
-    fn transfer_readout(&self, data: Readout, mini: bool) -> AnyElement {
+    fn receive_cancel_button(
+        &self,
+        transfer: &crate::receiving::Transfer,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text = self.language.strings();
+        let (background, hover, foreground) = if self.send_layout == SendLayout::NekoLight {
+            (0xe6eef9, 0xd7e6f7, 0x283f58)
+        } else {
+            (0x394554, 0x485a70, 0xf2f6fc)
+        };
+        let transfer_id = transfer.id.clone();
+        div()
+            .id("cancel-receive")
+            .h(px(24.))
+            .flex_shrink_0()
+            .rounded(px(7.))
+            .px(px(9.))
+            .flex()
+            .items_center()
+            .bg(rgb(background))
+            .text_color(rgb(foreground))
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .child(if transfer.cancel_requested {
+                text.cancelling
+            } else {
+                text.cancel
+            })
+            .when(!transfer.cancel_requested, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let receiver = &this.receiver;
+                        if this
+                            .receive
+                            .request_cancel(&transfer_id, |id| receiver.cancel_transfer(id))
+                        {
+                            cx.notify();
+                        }
+                    }))
+            })
+            .into_any_element()
+    }
+
+    fn transfer_readout(
+        &self,
+        data: Readout,
+        mini: bool,
+        action: Option<AnyElement>,
+    ) -> AnyElement {
         let light = self.send_layout == SendLayout::NekoLight;
         let compact = self.send_layout != SendLayout::Classic;
         let (surface, border, ink, muted, track) = match self.send_layout {
@@ -303,7 +357,7 @@ impl Capsule {
                 _ => source_size
                     .map(|bytes| format!("{}  {}", text.transfer_source_size, file_size(bytes))),
             };
-            if compact_amount.is_some() || rate.is_some() {
+            if compact_amount.is_some() || rate.is_some() || action.is_some() {
                 card = card.child(
                     div()
                         .flex()
@@ -319,7 +373,8 @@ impl Capsule {
                             div()
                                 .text_color(rgb(accent))
                                 .child(format!("{} · {mbps}", self.language.transfer_speed(&mib)))
-                        })),
+                        }))
+                        .children(action),
                 );
             }
             return card.into_any_element();
@@ -403,7 +458,7 @@ impl Capsule {
             .border_color(rgb(border))
             .px(px(padding))
             .py(px(10.));
-        if data.files.is_some() || source_size.is_some() {
+        if data.files.is_some() || source_size.is_some() || action.is_some() {
             footer = footer.child(
                 div()
                     .flex()
@@ -421,7 +476,8 @@ impl Capsule {
                             text.transfer_source_size,
                             file_size(bytes)
                         ))
-                    })),
+                    }))
+                    .children(action),
             );
         }
         card.child(

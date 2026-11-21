@@ -63,7 +63,10 @@ pub enum Event {
     ReceiverActivity(
         wayline_core::ReceiverEvent,
         Option<std::sync::Arc<gpui::RenderImage>>,
+        Option<crate::shared_text::ReceivedText>,
     ),
+    ShareFileAction(crate::ui::ShareFileActionResult),
+    ShareFileDestination(crate::ui::ShareFileDestination),
     HistoryLoaded(Result<Vec<wayline_host::TransferHistoryRecord>, String>),
     HistoryUpdated(Result<Vec<wayline_host::TransferHistoryRecord>, String>),
     HistoryDeleted(Result<Vec<wayline_host::TransferHistoryRecord>, String>),

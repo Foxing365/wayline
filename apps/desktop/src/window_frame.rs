@@ -20,10 +20,6 @@ fn is_draggable_header(x: f32, y: f32, width: f32, scale: f32) -> bool {
 
 /// Called on the owning UI thread before a frame-changing SetWindowPos.
 pub fn configure(hwnd: HWND, width: i32, height: i32) {
-    configure_with_radius(hwnd, width, height, CORNER_RADIUS);
-}
-
-pub fn configure_with_radius(hwnd: HWND, width: i32, height: i32, radius: f32) {
     // SAFETY: callers pass their live GPUI HWND on its owning thread. No driver
     // buffers or borrowed pointers survive any of these synchronous API calls.
     unsafe {
@@ -54,21 +50,39 @@ pub fn configure_with_radius(hwnd: HWND, width: i32, height: i32, radius: f32) {
             &border as *const _ as _,
             size_of_val(&border) as u32,
         );
+    }
+    clip_right(hwnd, width, height, width);
+}
+
+/// Clip a translating window at its original monitor's edge so another monitor
+/// to its right cannot briefly show a second copy of the panel.
+pub fn clip_right(hwnd: HWND, width: i32, height: i32, visible_width: i32) {
+    // SAFETY: the window is owned by this thread. A successful SetWindowRgn
+    // transfers the created region to Win32; temporary regions are freed here.
+    unsafe {
         let composited =
             GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_NOREDIRECTIONBITMAP.0 != 0;
-        if composited {
-            // GPUI's DirectComposition swapchain already supplies per-pixel
-            // alpha. An HRGN would discard its antialiased corner pixels.
+        if composited && visible_width >= width {
+            // DirectComposition provides the per-pixel antialiasing.
             let _ = SetWindowRgn(hwnd, None, true);
+            return;
+        }
+        let region = if composited {
+            CreateRectRgn(0, 0, visible_width.max(0), height)
         } else {
-            // Preserve a usable shape if GPUI DirectComposition was explicitly
-            // disabled: its opaque fallback cannot show transparent corners.
+            // The opaque GPUI fallback retains rounded corners while clipped.
             let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.;
-            let diameter = (radius * 2. * scale).round() as i32;
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-            if SetWindowRgn(hwnd, Some(region), true) == 0 {
-                let _ = DeleteObject(region.into());
+            let diameter = (CORNER_RADIUS * 2. * scale).round() as i32;
+            let shape = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+            if visible_width < width {
+                let clip = CreateRectRgn(0, 0, visible_width.max(0), height);
+                let _ = CombineRgn(Some(shape), Some(shape), Some(clip), RGN_AND);
+                let _ = DeleteObject(clip.into());
             }
+            shape
+        };
+        if SetWindowRgn(hwnd, Some(region), true) == 0 {
+            let _ = DeleteObject(region.into());
         }
     }
 }

@@ -12,13 +12,14 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    collections::{hash_map::Entry, HashMap},
     io::{self, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         mpsc::Sender,
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -123,15 +124,28 @@ impl std::fmt::Display for ReceiverError {
 }
 impl std::error::Error for ReceiverError {}
 type DecisionHandler = dyn Fn(&IncomingTransfer) -> bool + Send + Sync;
+const RECEIVE_WAITING: u8 = 0;
+const RECEIVE_UPLOADING: u8 = 1;
+const RECEIVE_CANCEL_REQUESTED: u8 = 2;
+const RECEIVE_CONFIRMING: u8 = 3;
+
 pub struct ReceiverCore {
     options: ReceiverOptions,
     active: AtomicUsize,
+    uploads: Mutex<HashMap<String, Arc<AtomicU8>>>,
     decide: Option<Arc<DecisionHandler>>,
 }
-struct Active<'a>(&'a AtomicUsize);
+struct Active<'a> {
+    core: &'a ReceiverCore,
+    id: String,
+    state: Arc<AtomicU8>,
+}
 impl Drop for Active<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        if let Ok(mut uploads) = self.core.uploads.lock() {
+            uploads.remove(&self.id);
+        }
+        self.core.active.fetch_sub(1, Ordering::Release);
     }
 }
 struct Published {
@@ -150,6 +164,7 @@ impl ReceiverCore {
         Self {
             options,
             active: AtomicUsize::new(0),
+            uploads: Mutex::new(HashMap::new()),
             decide: None,
         }
     }
@@ -165,6 +180,34 @@ impl ReceiverCore {
     }
     pub fn has_active_transfers(&self) -> bool {
         self.active.load(Ordering::Acquire) > 0
+    }
+    pub fn cancel_transfer(&self, transfer_id: &str) -> bool {
+        self.uploads.lock().is_ok_and(|uploads| {
+            uploads.get(transfer_id).is_some_and(|state| {
+                state
+                    .compare_exchange(
+                        RECEIVE_UPLOADING,
+                        RECEIVE_CANCEL_REQUESTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            })
+        })
+    }
+    fn begin_transfer(&self, id: &str) -> Option<Active<'_>> {
+        let mut uploads = self.uploads.lock().ok()?;
+        let Entry::Vacant(entry) = uploads.entry(id.to_owned()) else {
+            return None;
+        };
+        let state = Arc::new(AtomicU8::new(RECEIVE_WAITING));
+        entry.insert(state.clone());
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Some(Active {
+            core: self,
+            id: id.to_owned(),
+            state,
+        })
     }
     pub fn serve_tls_connection(
         stream: TcpStream,
@@ -208,7 +251,7 @@ impl ReceiverCore {
         let mut connection = Connection::new(Arc::new(config));
         let mut incoming: Option<IncomingTransfer> = None;
         let mut board: Option<Tracker> = None;
-        let mut active = None;
+        let mut active: Option<Active<'_>> = None;
         let mut staging: Option<Staging> = None;
         let mut published = Published {
             paths: Vec::new(),
@@ -232,7 +275,23 @@ impl ReceiverCore {
                         "receiver stopped",
                     ));
                 }
-                while let Some(event) = connection.poll() {
+                loop {
+                    if active.as_ref().is_some_and(|active| {
+                        active.state.load(Ordering::Acquire) == RECEIVE_CANCEL_REQUESTED
+                    }) && connection.cancel_upload()
+                    {
+                        terminal_kind = Some(TransferFailureKind::Cancelled);
+                        failure = Some(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "receiver cancelled the upload",
+                        ));
+                    }
+                    let Some(event) = connection.poll() else {
+                        break;
+                    };
+                    if let (Event::UploadStarted { .. }, Some(active)) = (&event, &active) {
+                        active.state.store(RECEIVE_UPLOADING, Ordering::Release);
+                    }
                     if let (Some(transfer), Some(progress)) =
                         (&incoming, connection.upload_progress())
                     {
@@ -334,8 +393,16 @@ impl ReceiverCore {
                                 .peer_certificates()
                                 .and_then(|certificates| certificates.first())
                                 .map(|certificate| Sha256::digest(certificate.as_ref()).into());
-                            core.active.fetch_add(1, Ordering::AcqRel);
-                            active = Some(Active(&core.active));
+                            active = core.begin_transfer(&transfer.id);
+                            if active.is_none() {
+                                connection.decline();
+                                notify(ReceiverEvent::Rejected {
+                                    path: "/Ask".into(),
+                                    status: 403,
+                                    reason: "transfer is already active".into(),
+                                });
+                                continue;
+                            }
                             board = Some(Tracker::begin(
                                 crate::board_feedback_enabled(),
                                 1,
@@ -417,6 +484,16 @@ impl ReceiverCore {
                         }
                         Event::EndFile => runtime.block_on(staging.as_mut().unwrap().end_file())?,
                         Event::UploadComplete => {
+                            if active.as_ref().is_some_and(|active| {
+                                active.state.compare_exchange(
+                                    RECEIVE_UPLOADING,
+                                    RECEIVE_CONFIRMING,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                ) == Err(RECEIVE_CANCEL_REQUESTED)
+                            }) {
+                                continue;
+                            }
                             let id = incoming.as_ref().unwrap().id.clone();
                             if connection.archive_boundary() {
                                 notify(ReceiverEvent::ArchiveBoundary {
@@ -509,6 +586,10 @@ impl ReceiverCore {
         })();
         if let Some(mut stage) = staging {
             let _ = runtime.block_on(stage.end_file());
+        }
+        if terminal_kind == Some(TransferFailureKind::Cancelled) && !stop.load(Ordering::Acquire) {
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
         }
         if let Err(e) = result {
             let kind = match terminal_kind {

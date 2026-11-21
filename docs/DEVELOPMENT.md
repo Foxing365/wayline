@@ -214,15 +214,15 @@ Identity creation and advertisement rename history in `receiver-services.json` a
 `download_directory` defaults to Downloads/Wayline; changing it leaves existing files in place
 and is blocked during receiving. `language` stores `zh-CN`, `zh-TW`, `en-US`, `ja-JP`, `ko-KR`,
 `fr-FR`, `de-DE` or `es-ES`; when absent, Windows UI language selects it and unsupported locales
-fall back to English. `desktop_notifications_enabled` controls separate notifications for file
-receive starts and connection failures and defaults to `true`. The start notice appears once at
-the bottom right when upload progress first arrives.
-Successful transfers show their result in the sharing card for 10 seconds. The appearance flags
+fall back to English. The first upload progress event reveals the existing sharing card without
+taking focus. File receive progress and failures are displayed within that card. Successful
+transfers show their result for the configured duration, 10 seconds by default. If a receive revealed the card from the tray, it
+returns there when the preview or terminal notice ends unless the user keeps it open.
+The appearance flags
 `compact_send_view` and `compact_send_dark` are written together. With no dark preference,
 an existing compact layout remains light. Launch at sign-in uses the current user's Startup folder.
-`notification_position` stores one of six screen positions and
-defaults to `top-right`; `notification_duration_seconds` stores an allowed delay of 3, 5, 8, 10,
-15 or 30 seconds and defaults to 8. The notification fades in and out. Switching
+`notification_position` stores one of six positions within the sharing card and
+defaults to `top-right`. Switching
 language updates the window, tray, system dialogs and notifications immediately and re-registers Explorer entries. UI copy lives in
 `apps/desktop/locales/*.toml` (eight locales currently). `apps/desktop/build.rs` checks that every
 locale has the same keys and placeholders and generates the static copy table at build time.
@@ -240,7 +240,8 @@ Active send and receive cards show a smoothed speed from progress events; it ret
 after one second without progress. Elapsed time starts at the first `Uploading` or `Receiving`
 event, including a zero-byte event, and runs through final confirmation. Preparation and waiting
 for acceptance are excluded. History average speed divides transfer-stream bytes by this duration.
-The sharing card header provides Device firmware and Recent transfers icons.
+The sharing card header provides Open transfer folder and Recent transfers icons.
+Device firmware is available in Settings.
 
 Pages, lists and long text use a shared scroll area. Mouse-wheel notches move content smoothly
 to the target offset. Precision input and Windows reduced-motion settings use direct scrolling.
@@ -305,6 +306,11 @@ to check overflow visibility, wheel scrolling, thumb dragging, track clicks and 
 animation on hidden pages. `window_frame.rs` preserves per-pixel alpha and excludes transparent
 corners from hit testing. Tray state follows bridge readiness independently of card visibility
 and is restored after Explorer restarts.
+
+`native_slide.rs` moves the existing HWND from the window message loop and clips the slide at
+the current monitor edge. Background receive reveals keep the current app focused, and the drag
+target is positioned immediately. When Windows animation effects are disabled, the panel opens
+and hides immediately.
 
 [Branding masters](../assets/branding/README.md) generate checked-in assets with Node.js and
 `sharp`; `WAYLINE_SHARP_MODULE` can select an installed package:

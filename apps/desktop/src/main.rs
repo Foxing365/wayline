@@ -21,7 +21,6 @@ mod name_input;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-mod notification;
 #[cfg(windows)]
 mod orb;
 #[cfg(windows)]
@@ -30,6 +29,7 @@ mod orb_geometry;
 mod picker;
 #[cfg(windows)]
 mod preview;
+mod received_files;
 #[cfg(windows)]
 mod receiving;
 #[cfg(windows)]
@@ -38,6 +38,7 @@ mod scroll_area;
 mod settings;
 #[cfg(windows)]
 mod share_layout;
+mod shared_text;
 #[cfg(windows)]
 mod transfer_speed;
 #[cfg(windows)]
