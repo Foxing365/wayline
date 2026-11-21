@@ -110,6 +110,11 @@ pub enum Event {
     AskWithdrawn,
     /// An accepted URL share. Offer them; don't open them unasked (SEC-4).
     Urls(Vec<String>),
+    /// The upload headers did not match an accepted file offer.
+    UploadRejected {
+        status: u16,
+        reason: &'static str,
+    },
     /// An accepted upload began: create a fresh staging directory.
     UploadStarted {
         compressor: Compressor,
@@ -615,14 +620,20 @@ impl Connection {
         self.state = State::Prompting(request);
     }
 
+    fn reject_upload(&mut self, status: u16, reason: &'static str) {
+        self.events
+            .push_back(Event::UploadRejected { status, reason });
+        self.fail(status);
+    }
+
     fn start_upload(&mut self, head: RequestHead) {
         // UP-6: only after an accepted `/Ask` on this connection, once.
         let Some(Offer::Files(files)) = self.slots.ask.as_ref().map(|a| &a.offer) else {
-            self.fail(400);
+            self.reject_upload(400, "no accepted file offer on this connection");
             return;
         };
         if self.slots.upload {
-            self.fail(400);
+            self.reject_upload(400, "duplicate upload on this connection");
             return;
         }
         // UP-1, UP-4.
@@ -631,7 +642,7 @@ impl Connection {
             .get("content-type")
             .and_then(Compressor::from_content_type)
         else {
-            self.fail(406);
+            self.reject_upload(406, "unsupported upload content type");
             return;
         };
         // UP-9: an iOS 18 `/Ask` names the upload that belongs to it.
@@ -640,7 +651,7 @@ impl Connection {
             match head.headers.get("transferid") {
                 Some(header) if header.eq_ignore_ascii_case(id) => {}
                 _ => {
-                    self.fail(400);
+                    self.reject_upload(400, "upload TransferID does not match accepted offer");
                     return;
                 }
             }
@@ -657,11 +668,14 @@ impl Connection {
         let decoder = match BodyDecoder::new(head.body, limits.max_upload_body, &limits.http) {
             Ok(decoder) => decoder,
             Err(e) => {
-                self.fail(if e == http::Error::BodyTooLarge {
-                    413
-                } else {
-                    e.status()
-                });
+                self.reject_upload(
+                    if e == http::Error::BodyTooLarge {
+                        413
+                    } else {
+                        e.status()
+                    },
+                    "invalid upload body framing or size",
+                );
                 return;
             }
         };

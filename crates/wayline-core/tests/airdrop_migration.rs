@@ -931,6 +931,13 @@ fn tls_file_share_with_a_web_link_requires_consent_and_uploads_the_attachment() 
         let _ = tls.flush();
         drop(tls);
         let events = worker.join().unwrap().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ReceiverEvent::WebLinksAccepted(_)))
+                .count(),
+            usize::from(status == 200 && has_link)
+        );
         if status == 200 {
             let saved = destination.join("a.txt");
             assert_eq!(fs::read(&saved).unwrap(), b"verified");
@@ -947,6 +954,73 @@ fn tls_file_share_with_a_web_link_requires_consent_and_uploads_the_attachment() 
             ));
         }
     }
+}
+
+#[test]
+fn tls_publishes_web_links_before_a_file_upload_and_reports_the_sender_interrupting() {
+    use owly_airdrop::proto::plist::{self, Value};
+
+    let (root, ask, _) = protocol_upload(Compressor::DvZip, false);
+    let id = identity(root.path());
+    let destination = root.path().join("received");
+    let server = server_config(&id).unwrap();
+    let listener = TcpListener::bind("[::1]:0").unwrap();
+    let SocketAddr::V6(address) = listener.local_addr().unwrap() else {
+        panic!()
+    };
+    let (events, activity) = mpsc::channel();
+    let core = ReceiverCore::new(ReceiverOptions::new("receiver", "Windows", &destination))
+        .with_decision(|_| true);
+    let worker = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        ReceiverCore::serve_tls_connection_with_events(socket, server, Arc::new(core), |event| {
+            let _ = events.send(event);
+        })
+    });
+    let (_, body) = read_request(&mut ask.as_slice());
+    let Value::Dict(mut offer) = plist::from_bytes(&body, &plist::Limits::default()).unwrap()
+    else {
+        panic!("expected an offer dictionary");
+    };
+    let url = "https://b23.tv/wayline-test";
+    offer.insert("Items".into(), Value::Array(vec![url.into()]));
+    let body = plist::to_bytes(&Value::Dict(offer));
+    let head = http::post_head("/Ask", &[("Content-Length", &body.len().to_string())]);
+    let mut tls = client(address);
+    tls.write_all(&head).unwrap();
+    tls.write_all(&body).unwrap();
+    tls.flush().unwrap();
+    assert_eq!(response(&mut tls).status, 200);
+    let wait = Duration::from_secs(3);
+    assert_eq!(
+        activity.recv_timeout(wait).unwrap(),
+        ReceiverEvent::AskStarted
+    );
+    assert!(matches!(
+        activity.recv_timeout(wait).unwrap(),
+        ReceiverEvent::Asked(_)
+    ));
+    assert!(
+        matches!(activity.recv_timeout(wait).unwrap(), ReceiverEvent::WebLinksAccepted(transfer) if transfer.urls == [url] && transfer.files.len() == 1)
+    );
+    assert!(!destination.exists());
+
+    tls.conn.send_close_notify();
+    tls.flush().unwrap();
+    drop(tls);
+    assert_eq!(
+        worker.join().unwrap().unwrap_err().kind(),
+        TransferFailureKind::Interrupted
+    );
+    assert!(matches!(
+        activity.recv_timeout(wait).unwrap(),
+        ReceiverEvent::TransferFailed {
+            kind: TransferFailureKind::Interrupted,
+            ..
+        }
+    ));
+    assert!(activity.try_recv().is_err());
+    assert!(!destination.exists());
 }
 
 #[test]

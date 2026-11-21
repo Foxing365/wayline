@@ -644,6 +644,13 @@ impl Capsule {
                     continue;
                 }
                 Event::ReceiverActivity(event) => {
+                    if let wayline_core::ReceiverEvent::WebLinksAccepted(transfer) = &event {
+                        let urls = self
+                            .receive
+                            .links_after_acceptance(transfer, &self.trusted_senders);
+                        Self::open_received_web_links(urls, cx);
+                        continue;
+                    }
                     if let wayline_core::ReceiverEvent::ModeSelected(_) = &event {
                         let _ = self.receive.apply_at(&event, event_at, event_unix_ms);
                         changed = true;
@@ -673,7 +680,15 @@ impl Capsule {
                         worker.append(record, received_files);
                     }
                     if applied
-                        && matches!(event, wayline_core::ReceiverEvent::Received { .. })
+                        && matches!(
+                            event,
+                            wayline_core::ReceiverEvent::Received { .. }
+                                | wayline_core::ReceiverEvent::TransferFailed {
+                                    kind: wayline_core::TransferFailureKind::Interrupted
+                                        | wayline_core::TransferFailureKind::Connection,
+                                    ..
+                                }
+                        )
                         && let Some(notice) = &self.receive.notice
                     {
                         self.show_desktop_notification(
@@ -686,9 +701,7 @@ impl Capsule {
                         self.open_history_folder(target, cx);
                     }
                     if applied {
-                        for url in web_links {
-                            cx.open_url(&url);
-                        }
+                        Self::open_received_web_links(web_links, cx);
                     }
                     changed |= applied;
                     continue;
@@ -4566,6 +4579,18 @@ impl Capsule {
                 worker.append(record, Vec::new());
             }
             cx.notify();
+        }
+    }
+
+    fn open_received_web_links(urls: Vec<String>, cx: &mut Context<Self>) {
+        if !urls.is_empty() {
+            crate::receiving::log(&format!(
+                "opening {} accepted web links in the default browser",
+                urls.len()
+            ));
+            for url in urls {
+                cx.open_url(&url);
+            }
         }
     }
 

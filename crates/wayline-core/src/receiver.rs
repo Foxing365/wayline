@@ -1,6 +1,6 @@
 //! Application lifecycle and blocking Windows workers around Owly's receiver.
 use crate::{
-    airdrop::links_in_item,
+    airdrop::{links_in_item, web_links},
     mdns::{MdnsResponder, NetworkInterface},
     IncomingTransfer, TransferFailureKind,
 };
@@ -68,6 +68,8 @@ pub enum ReceiverEvent {
         kind: TransferFailureKind,
     },
     Asked(IncomingTransfer),
+    /// The successful Ask response reached the transport for a file share carrying web links.
+    WebLinksAccepted(IncomingTransfer),
     ModeSelected(TransferFormat),
     Receiving {
         transfer_id: String,
@@ -215,6 +217,7 @@ impl ReceiverCore {
         let mut failure = None;
         let mut terminal_kind = None;
         let mut awaiting_ask_body = false;
+        let mut awaiting_link_acceptance = false;
         let mut deadline = None;
         let mut last_progress = None;
         let mut last_update = Instant::now();
@@ -270,16 +273,25 @@ impl ReceiverCore {
                                     &mut terminal_kind,
                                 ));
                             }
-                            if !published.paths.is_empty() && bytes.starts_with(b"HTTP/1.1 200") {
-                                published.confirmed = true;
-                                if let Some(b) = &mut board {
-                                    b.phase(Phase::Complete);
+                            if bytes.starts_with(b"HTTP/1.1 200") {
+                                if std::mem::take(&mut awaiting_link_acceptance) {
+                                    let mut transfer = incoming.clone().unwrap();
+                                    transfer.urls = web_links(&transfer.urls);
+                                    if !transfer.urls.is_empty() {
+                                        notify(ReceiverEvent::WebLinksAccepted(transfer));
+                                    }
                                 }
-                                notify(ReceiverEvent::Received {
-                                    transfer: incoming.clone().unwrap(),
-                                    files: published.paths.clone(),
-                                });
-                                active = None;
+                                if !published.paths.is_empty() {
+                                    published.confirmed = true;
+                                    if let Some(b) = &mut board {
+                                        b.phase(Phase::Complete);
+                                    }
+                                    notify(ReceiverEvent::Received {
+                                        transfer: incoming.clone().unwrap(),
+                                        files: published.paths.clone(),
+                                    });
+                                    active = None;
+                                }
                             }
                         }
                         Event::SetTimer(after) => deadline = after.map(|d| Instant::now() + d),
@@ -294,6 +306,13 @@ impl ReceiverCore {
                                 path: "/Ask".into(),
                                 status,
                                 reason,
+                            });
+                        }
+                        Event::UploadRejected { status, reason } => {
+                            notify(ReceiverEvent::Rejected {
+                                path: "/Upload".into(),
+                                status,
+                                reason: reason.into(),
                             });
                         }
                         Event::Ask(ask) => {
@@ -327,8 +346,9 @@ impl ReceiverCore {
                                         |decide| decide(&transfer),
                                     )
                                     && before.elapsed() < core.options.decision_timeout;
-                            incoming = Some(transfer.clone());
                             if accepted {
+                                incoming = Some(transfer.clone());
+                                awaiting_link_acceptance = !ask.file_share_items.is_empty();
                                 connection.accept();
                                 if let Some(b) = &mut board {
                                     b.phase(Phase::Waiting);

@@ -580,6 +580,7 @@ fn receiver_event(event: ReceiverEvent, output: Output) {
         ReceiverEvent::AskStarted => output.event("askStarted", json!({"direction":"receive"})),
         ReceiverEvent::ConnectionFailed { peer, error, kind } => output.event("transferFailed", json!({"direction":"receive","peer":peer.to_string(),"category":kind.as_str(),"message":error})),
         ReceiverEvent::Asked(transfer) => output.event("transferAccepted", json!({"sender":transfer.sender_name,"transferId":transfer.id,"files":transfer.files.iter().map(|f| json!({"name":f.name,"size":f.size})).collect::<Vec<_>>()})),
+        ReceiverEvent::WebLinksAccepted(transfer) => output.event("webLinksAccepted", json!({"transferId":transfer.id,"urls":transfer.urls})),
         ReceiverEvent::ModeSelected(format) => output.event("modeSelected", json!({"direction":"receive","format":format!("{format:?}")})),
         ReceiverEvent::Receiving { transfer_id, received, total } => output.event("receiving", json!({"transferId":transfer_id,"received":received,"total":total})),
         ReceiverEvent::ArchiveBoundary { transfer_id } => output.event("uploadArchiveBoundary", json!({"direction":"receive","transferId":transfer_id})),

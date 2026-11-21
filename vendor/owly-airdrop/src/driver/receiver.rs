@@ -319,6 +319,9 @@ impl Task {
                     Event::AskRejected { status, reason } => {
                         tracing::debug!(status, reason = %reason, "rejected /Ask before consent");
                     }
+                    Event::UploadRejected { status, reason } => {
+                        tracing::debug!(status, reason, "rejected upload headers");
+                    }
                     Event::Ask(ask) => {
                         tracing::debug!(
                             peer = %self.peer,

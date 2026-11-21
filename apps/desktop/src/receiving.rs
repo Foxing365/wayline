@@ -97,12 +97,35 @@ pub struct Transfer {
     pub channel: Option<u16>,
     pub format: Option<TransferFormat>,
     automatically_accepted: bool,
+    web_links_opened: bool,
+    approved_web_links: Vec<String>,
+    sender_certificate_sha256: Option<[u8; 32]>,
 }
 
 impl Transfer {
     pub fn elapsed(&self, now: Instant) -> Option<Duration> {
         self.started_at
             .map(|started| now.saturating_duration_since(started))
+    }
+
+    fn authorized_web_links(
+        &self,
+        offer: &IncomingTransfer,
+        trusted: &[TrustedSender],
+    ) -> Vec<String> {
+        if self.id != offer.id
+            || self.web_links_opened
+            || self.sender_certificate_sha256 != offer.sender_certificate_sha256
+            || (self.automatically_accepted && !can_auto_accept(offer, trusted))
+        {
+            return Vec::new();
+        }
+        let urls = web_links(&offer.urls);
+        if urls == self.approved_web_links {
+            urls
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -304,6 +327,9 @@ impl Model {
             channel: self.channel,
             format: None,
             automatically_accepted: false,
+            web_links_opened: false,
+            approved_web_links: web_links(&transfer.urls),
+            sender_certificate_sha256: transfer.sender_certificate_sha256,
         });
         self.reset_speed();
         self.notice = None;
@@ -315,6 +341,22 @@ impl Model {
         }
     }
 
+    /// A file share may identify a webpage before the sender uploads an attachment.
+    pub fn links_after_acceptance(
+        &mut self,
+        offer: &IncomingTransfer,
+        trusted: &[TrustedSender],
+    ) -> Vec<String> {
+        let Some(active) = self.active.as_mut().or(self.interrupted.as_mut()) else {
+            return Vec::new();
+        };
+        let urls = active.authorized_web_links(offer, trusted);
+        if !urls.is_empty() {
+            active.web_links_opened = true;
+        }
+        urls
+    }
+
     /// Resolve links against the still-active consent before applying the completion.
     pub fn links_on_completion(
         &self,
@@ -324,19 +366,12 @@ impl Model {
         let ReceiverEvent::Received { transfer, .. } = event else {
             return Vec::new();
         };
-        let approved = self
-            .active
+        self.active
             .as_ref()
             .or(self.interrupted.as_ref())
-            .is_some_and(|active| {
-                active.id == transfer.id
-                    && (!active.automatically_accepted || can_auto_accept(transfer, trusted))
-            });
-        if approved {
-            web_links(&transfer.urls)
-        } else {
-            Vec::new()
-        }
+            .map_or_else(Vec::new, |active| {
+                active.authorized_web_links(transfer, trusted)
+            })
     }
 
     pub fn interrupt(&mut self, message: String) -> bool {
@@ -842,11 +877,14 @@ fn run(
             return false;
         }
         log(&format!(
-            "incoming ask preview: {} files, {} web links from {} link items, client certificate: {}",
+            "incoming ask preview: {} files, {} web links from {} link items, client certificate: {}, request: {}",
             transfer.files.len(),
             transfer.urls.len(),
             offered_links,
-            transfer.sender_certificate_sha256.is_some()
+            transfer.sender_certificate_sha256.is_some(),
+            transfer.id.split_once('-').map(|(prefix, _)| prefix)
+                .filter(|prefix| prefix.len() == 8 && prefix.bytes().all(|b| b.is_ascii_hexdigit()))
+                .unwrap_or("legacy")
         ));
         let transfer_id = transfer.id.clone();
         let (decision, answer) = mpsc::channel();
@@ -907,6 +945,10 @@ fn run(
                     log(&format!("connection from {peer} failed: {error}"))
                 }
                 ReceiverEvent::Asked(_) => log("incoming offer accepted"),
+                ReceiverEvent::WebLinksAccepted(transfer) => log(&format!(
+                    "incoming offer acknowledged with {} web links and an attachment awaiting upload",
+                    transfer.urls.len()
+                )),
                 ReceiverEvent::ModeSelected(_) => log("transfer mode selected"),
                 ReceiverEvent::Receiving { .. } => {}
                 ReceiverEvent::ArchiveBoundary { transfer_id } => log(&format!(
@@ -1099,7 +1141,26 @@ mod tests {
                 .is_empty()
         );
         assert!(model.links_on_completion(&event, &[]).is_empty());
+        assert!(
+            model
+                .links_after_acceptance(&share, std::slice::from_ref(&sender))
+                .is_empty()
+        );
         sender.open_web_links = true;
+        assert_eq!(
+            model.links_after_acceptance(&share, std::slice::from_ref(&sender)),
+            ["https://b23.tv/short"]
+        );
+        assert!(
+            model
+                .links_after_acceptance(&share, std::slice::from_ref(&sender))
+                .is_empty()
+        );
+        assert!(
+            model
+                .links_on_completion(&event, std::slice::from_ref(&sender))
+                .is_empty()
+        );
         share.files.clear();
         assert!(can_auto_accept(&share, std::slice::from_ref(&sender)));
 
